@@ -126,11 +126,13 @@ pub const FailureThreshold = enum {
 pub const FindingSource = enum {
     workspace_file,
     git_staged_diff,
+    git_history,
 
     pub fn toString(self: FindingSource) []const u8 {
         return switch (self) {
             .workspace_file => "workspace_file",
             .git_staged_diff => "git_staged_diff",
+            .git_history => "git_history",
         };
     }
 };
@@ -139,6 +141,8 @@ pub const Options = struct {
     workspace_dir: []const u8,
     json: bool = false,
     staged: bool = false,
+    commit: ?[]const u8 = null,
+    range: ?[]const u8 = null,
     fail_on: FailureThreshold = .high,
     only_secrets: bool = false,
     exclude_patterns: []const []const u8 = &.{},
@@ -188,6 +192,7 @@ pub const AuditError = error{
     NotGitRepository,
     GitUnavailable,
     GitDiffFailed,
+    InvalidHistoryTarget,
 };
 
 const DetectedRule = struct {
@@ -235,7 +240,15 @@ pub fn buildReport(allocator: Allocator, workspace_dir: []const u8, options: Opt
         if (repo_root) |root| allocator.free(root);
     }
 
-    if (options.staged) {
+    if (options.commit) |commit| {
+        const diff = try readCommitDiff(allocator, workspace_dir, commit);
+        defer allocator.free(diff);
+        try scanGitHistoryDiff(allocator, diff, options, &findings);
+    } else if (options.range) |range| {
+        const diff = try readRangeDiff(allocator, workspace_dir, range);
+        defer allocator.free(diff);
+        try scanGitHistoryDiff(allocator, diff, options, &findings);
+    } else if (options.staged) {
         const diff = try readStagedDiff(allocator, workspace_dir);
         defer allocator.free(diff);
         try scanStagedDiff(allocator, diff, options, &findings);
@@ -247,7 +260,12 @@ pub fn buildReport(allocator: Allocator, workspace_dir: []const u8, options: Opt
         .workspace_dir = workspace_dir,
         .repo_root = repo_root,
         .findings = try findings.toOwnedSlice(allocator),
-        .scanned_source = if (options.staged) .git_staged_diff else .workspace_file,
+        .scanned_source = if (options.commit != null or options.range != null)
+            .git_history
+        else if (options.staged)
+            .git_staged_diff
+        else
+            .workspace_file,
     };
 
     for (report.findings) |finding| {
@@ -296,6 +314,66 @@ fn readStagedDiff(allocator: Allocator, cwd: []const u8) ![]u8 {
     if (!version.success) return AuditError.GitUnavailable;
 
     const result = process_util.run(allocator, &.{ "git", "diff", "--cached", "--unified=0", "--no-color", "--", "." }, .{
+        .cwd = cwd,
+        .max_output_bytes = MAX_DIFF_BYTES,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return AuditError.GitUnavailable,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+
+    if (!result.success) {
+        defer allocator.free(result.stdout);
+        if (containsText(result.stderr, "not a git repository")) return AuditError.NotGitRepository;
+        return AuditError.GitDiffFailed;
+    }
+
+    return result.stdout;
+}
+
+fn readCommitDiff(allocator: Allocator, cwd: []const u8, commit: []const u8) ![]u8 {
+    if (commit.len == 0) return AuditError.InvalidHistoryTarget;
+    const version = process_util.run(allocator, &.{ "git", "--version" }, .{
+        .cwd = cwd,
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return AuditError.GitUnavailable,
+        else => return err,
+    };
+    defer version.deinit(allocator);
+    if (!version.success) return AuditError.GitUnavailable;
+
+    const result = process_util.run(allocator, &.{ "git", "show", "--format=", "--unified=0", "--no-color", commit, "--", "." }, .{
+        .cwd = cwd,
+        .max_output_bytes = MAX_DIFF_BYTES,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return AuditError.GitUnavailable,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+
+    if (!result.success) {
+        defer allocator.free(result.stdout);
+        if (containsText(result.stderr, "not a git repository")) return AuditError.NotGitRepository;
+        return AuditError.GitDiffFailed;
+    }
+
+    return result.stdout;
+}
+
+fn readRangeDiff(allocator: Allocator, cwd: []const u8, range: []const u8) ![]u8 {
+    if (range.len == 0 or std.mem.indexOf(u8, range, "..") == null) return AuditError.InvalidHistoryTarget;
+    const version = process_util.run(allocator, &.{ "git", "--version" }, .{
+        .cwd = cwd,
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return AuditError.GitUnavailable,
+        else => return err,
+    };
+    defer version.deinit(allocator);
+    if (!version.success) return AuditError.GitUnavailable;
+
+    const result = process_util.run(allocator, &.{ "git", "diff", "--unified=0", "--no-color", range, "--", "." }, .{
         .cwd = cwd,
         .max_output_bytes = MAX_DIFF_BYTES,
     }) catch |err| switch (err) {
@@ -397,6 +475,42 @@ fn scanStagedDiff(
     }
 }
 
+fn scanGitHistoryDiff(
+    allocator: Allocator,
+    diff: []const u8,
+    options: Options,
+    findings: *std.ArrayListUnmanaged(Finding),
+) !void {
+    var current_file: ?[]const u8 = null;
+    var current_line: ?usize = null;
+
+    var it = std.mem.splitScalar(u8, diff, '\n');
+    while (it.next()) |raw_line| {
+        const line = std_compat.mem.trimRight(u8, raw_line, "\r");
+        if (std.mem.startsWith(u8, line, "+++ ")) {
+            current_file = parseDiffPath(line);
+            current_line = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "@@")) {
+            current_line = parseAddedHunkStart(line);
+            continue;
+        }
+        if (current_file == null or current_line == null) continue;
+        if (line.len == 0) continue;
+
+        switch (line[0]) {
+            '+' => {
+                if (std.mem.startsWith(u8, line, "+++")) continue;
+                try scanHistoryLine(allocator, current_file.?, current_line.?, line[1..], options, findings);
+                current_line.? += 1;
+            },
+            ' ' => current_line.? += 1,
+            else => {},
+        }
+    }
+}
+
 fn scanDiffLine(
     allocator: Allocator,
     path: []const u8,
@@ -408,6 +522,20 @@ fn scanDiffLine(
     if (shouldIgnorePath(path, options.exclude_patterns)) return;
     if (detectLine(path, line, .git_staged_diff)) |rule| {
         try appendFinding(allocator, findings, options, rule, path, line_no, .git_staged_diff, line);
+    }
+}
+
+fn scanHistoryLine(
+    allocator: Allocator,
+    path: []const u8,
+    line_no: usize,
+    line: []const u8,
+    options: Options,
+    findings: *std.ArrayListUnmanaged(Finding),
+) !void {
+    if (shouldIgnorePath(path, options.exclude_patterns)) return;
+    if (detectLine(path, line, .git_history)) |rule| {
+        try appendFinding(allocator, findings, options, rule, path, line_no, .git_history, line);
     }
 }
 
@@ -453,7 +581,7 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
         return classifySecretAssignment(path, line, path_category, assignment);
     }
 
-    if (source == .git_staged_diff and hasTokenPrefix(line) and !looksPlaceholder(line)) {
+    if ((source == .git_staged_diff or source == .git_history) and hasTokenPrefix(line) and !looksPlaceholder(line)) {
         return .{ .severity = .high, .confidence = .high, .rule = "hardcoded_token" };
     }
 
@@ -1094,6 +1222,81 @@ test "workspace audit staged diff finds raw token in added line" {
 
     try std.testing.expect(report.findings.len >= 1);
     try std.testing.expectEqual(FindingSource.git_staged_diff, report.findings[0].source);
+}
+
+test "workspace audit commit scan finds token in history diff" {
+    if (!gitAvailable(std.testing.allocator)) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    {
+        const init = try process_util.run(std.testing.allocator, &.{ "git", "init" }, .{
+            .cwd = workspace,
+            .max_output_bytes = 64 * 1024,
+        });
+        defer init.deinit(std.testing.allocator);
+        if (!init.success) return error.SkipZigTest;
+    }
+
+    {
+        const email = try process_util.run(std.testing.allocator, &.{ "git", "config", "user.email", "audit-demo@example.test" }, .{
+            .cwd = workspace,
+            .max_output_bytes = 64 * 1024,
+        });
+        defer email.deinit(std.testing.allocator);
+        if (!email.success) return error.SkipZigTest;
+    }
+    {
+        const name = try process_util.run(std.testing.allocator, &.{ "git", "config", "user.name", "Audit Demo" }, .{
+            .cwd = workspace,
+            .max_output_bytes = 64 * 1024,
+        });
+        defer name.deinit(std.testing.allocator);
+        if (!name.success) return error.SkipZigTest;
+    }
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "history.env",
+        .data = "API_KEY=sk-history1234567890abcdefghijklmnop\n",
+    });
+
+    {
+        const add = try process_util.run(std.testing.allocator, &.{ "git", "add", "history.env" }, .{
+            .cwd = workspace,
+            .max_output_bytes = 64 * 1024,
+        });
+        defer add.deinit(std.testing.allocator);
+        if (!add.success) return error.SkipZigTest;
+    }
+    {
+        const commit = try process_util.run(std.testing.allocator, &.{ "git", "commit", "-m", "add history secret fixture" }, .{
+            .cwd = workspace,
+            .max_output_bytes = 64 * 1024,
+        });
+        defer commit.deinit(std.testing.allocator);
+        if (!commit.success) return error.SkipZigTest;
+    }
+
+    const rev = try process_util.run(std.testing.allocator, &.{ "git", "rev-parse", "HEAD" }, .{
+        .cwd = workspace,
+        .max_output_bytes = 64 * 1024,
+    });
+    defer rev.deinit(std.testing.allocator);
+    if (!rev.success) return error.SkipZigTest;
+
+    const commit_sha = std.mem.trim(u8, rev.stdout, " \r\n\t");
+    var report = try buildReport(std.testing.allocator, workspace, .{
+        .workspace_dir = workspace,
+        .commit = commit_sha,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(report.findings.len >= 1);
+    try std.testing.expectEqual(FindingSource.git_history, report.findings[0].source);
 }
 
 test "failure threshold none never fails" {

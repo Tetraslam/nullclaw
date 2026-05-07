@@ -1704,9 +1704,11 @@ fn printWorkspaceUsage() void {
         \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
         \\      --dry-run            Show what would be changed without modifying files
         \\
-        \\  audit [--json] [--staged] [--only-secrets] [--exclude <path-substring>] [--fail-on <none|medium|high|critical>]
-        \\      Scan the workspace or staged Git diff for likely secret leaks.
+        \\  audit [--json] [--staged | --commit <sha> | --range <a>..<b>] [--only-secrets] [--exclude <path-substring>] [--fail-on <none|medium|high|critical>]
+        \\      Scan the workspace, staged Git diff, or Git history for likely secret leaks.
         \\      --staged             Audit only the staged diff (git diff --cached)
+        \\      --commit             Audit a single historical commit via git show
+        \\      --range              Audit a git revision range via git diff <a>..<b>
         \\      --json               Emit machine-readable JSON
         \\      --only-secrets       Report only high/critical findings
         \\      --exclude            Repeatable path substring to skip during scanning
@@ -3235,6 +3237,22 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
             options.json = true;
         } else if (std.mem.eql(u8, arg, "--staged")) {
             options.staged = true;
+        } else if (std.mem.eql(u8, arg, "--commit")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --commit\n\n", .{});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            }
+            options.commit = args[i];
+        } else if (std.mem.eql(u8, arg, "--range")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --range\n\n", .{});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            }
+            options.range = args[i];
         } else if (std.mem.eql(u8, arg, "--only-secrets")) {
             options.only_secrets = true;
         } else if (std.mem.eql(u8, arg, "--exclude")) {
@@ -3266,11 +3284,22 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
 
     options.exclude_patterns = exclude_patterns.items;
 
+    var git_modes: usize = 0;
+    if (options.staged) git_modes += 1;
+    if (options.commit != null) git_modes += 1;
+    if (options.range != null) git_modes += 1;
+    if (git_modes > 1) {
+        std.debug.print("Choose only one of --staged, --commit, or --range\n\n", .{});
+        printWorkspaceUsage();
+        std_compat.process.exit(1);
+    }
+
     const exit_code = yc.workspace_audit.run(allocator, options) catch |err| {
         switch (err) {
             error.NotGitRepository => std.debug.print("workspace audit: staged mode requires a Git repository\n", .{}),
             error.GitUnavailable => std.debug.print("workspace audit: git is not available in this environment\n", .{}),
             error.GitDiffFailed => std.debug.print("workspace audit: failed to read staged diff\n", .{}),
+            error.InvalidHistoryTarget => std.debug.print("workspace audit: invalid --commit or --range target\n", .{}),
             else => std.debug.print("workspace audit failed: {s}\n", .{@errorName(err)}),
         }
         std_compat.process.exit(1);
