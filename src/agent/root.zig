@@ -2981,7 +2981,11 @@ pub const Agent = struct {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE.
                 // `var` (not `const`) because unredactJsonValue mutates string
-                // nodes in-place when a Redactor is active.
+                // nodes in-place when a Redactor is active. Note: `parsed`
+                // owns its own arena, so when unredact replaces a `.string`
+                // slice with a fresh allocation on `tool_allocator`, the
+                // parse arena's original slice remains reachable via
+                // `parsed.deinit()` and is still freed normally.
                 var parsed = std.json.parseFromSlice(
                     std.json.Value,
                     tool_allocator,
@@ -3003,10 +3007,15 @@ pub const Agent = struct {
                 // string and any action-style tool (send_email, http_request,
                 // file_write, …) would fail or write meaningless data.
                 if (self.redactor) |r| {
-                    Agent.unredactJsonValue(tool_allocator, r, &parsed.value) catch {
+                    Agent.unredactJsonValue(tool_allocator, r, &parsed.value) catch |err| {
+                        const out_msg = std.fmt.allocPrint(
+                            tool_allocator,
+                            "Failed to rehydrate redacted placeholders in arguments: {s}",
+                            .{@errorName(err)},
+                        ) catch "Failed to rehydrate redacted placeholders in arguments";
                         return .{
                             .name = call.name,
-                            .output = "Failed to rehydrate redacted placeholders in arguments",
+                            .output = out_msg,
                             .success = false,
                             .tool_call_id = call.tool_call_id,
                         };
@@ -3571,19 +3580,47 @@ pub const Agent = struct {
         return out;
     }
 
+    /// Maximum recursion depth for `unredactJsonValue`. `std.json.parseFromSlice`
+    /// already caps nesting (default 256), so this is a defense-in-depth knob
+    /// — set comfortably below the platform call-stack limit so a hostile
+    /// provider response can't blow the stack.
+    const UNREDACT_JSON_MAX_DEPTH: u16 = 64;
+
     /// Recursively walk a parsed JSON value and rehydrate every `[KIND_N]`
-    /// placeholder inside string nodes via `redactor.unredact`. Mutates value
-    /// in place; new strings are allocated on `allocator` (caller passes a
-    /// per-turn arena so cleanup is automatic). Object/array nodes recurse;
-    /// numbers/bools/nulls are passed through. Used to restore real PII into
-    /// tool arguments before invoking the tool — without this, an LLM that
-    /// writes `<tool_call>{"to":"[EMAIL_1]"}</tool_call>` would deliver the
-    /// literal placeholder to the tool implementation.
+    /// placeholder inside string **values** via `redactor.unredact`. Mutates
+    /// value in place; new strings are allocated on `allocator` (caller
+    /// passes a per-turn arena so cleanup is automatic). Object/array nodes
+    /// recurse; numbers/bools/nulls are passed through.
+    ///
+    /// Used to restore real PII into tool arguments before invoking the tool —
+    /// without this, an LLM that writes
+    /// `<tool_call>{"to":"[EMAIL_1]"}</tool_call>` would deliver the literal
+    /// placeholder to the tool implementation.
+    ///
+    /// **Object keys are NOT rehydrated.** Tool schemas use stable, predefined
+    /// JSON keys; an LLM emitting a `[KIND_N]` as a key would already be a
+    /// schema violation and the tool would mishandle it regardless. Walking
+    /// keys would also require re-allocating the ObjectMap because the parse
+    /// arena owns the existing key slices.
+    ///
+    /// Returns `error.JsonTooDeeplyNested` if recursion exceeds
+    /// `UNREDACT_JSON_MAX_DEPTH` so a malformed/hostile JSON tree can't
+    /// crash the agent via stack overflow.
     fn unredactJsonValue(
         allocator: std.mem.Allocator,
         redactor: *redaction.Redactor,
         value: *std.json.Value,
     ) !void {
+        return unredactJsonValueDepth(allocator, redactor, value, 0);
+    }
+
+    fn unredactJsonValueDepth(
+        allocator: std.mem.Allocator,
+        redactor: *redaction.Redactor,
+        value: *std.json.Value,
+        depth: u16,
+    ) !void {
+        if (depth >= UNREDACT_JSON_MAX_DEPTH) return error.JsonTooDeeplyNested;
         switch (value.*) {
             .string => |s| {
                 const new_s = try redactor.unredact(allocator, s);
@@ -3592,12 +3629,12 @@ pub const Agent = struct {
             .object => |*obj| {
                 var it = obj.iterator();
                 while (it.next()) |entry| {
-                    try unredactJsonValue(allocator, redactor, entry.value_ptr);
+                    try unredactJsonValueDepth(allocator, redactor, entry.value_ptr, depth + 1);
                 }
             },
             .array => |*arr| {
                 for (arr.items) |*v| {
-                    try unredactJsonValue(allocator, redactor, v);
+                    try unredactJsonValueDepth(allocator, redactor, v, depth + 1);
                 }
             },
             else => {}, // number_string, integer, float, bool, null
@@ -11228,6 +11265,99 @@ test "Agent.executeTool rehydrates redactor placeholders in tool args" {
         "please notify alice@acme.com about the issue",
         record_impl.last_seen.?,
     );
+}
+
+test "Agent.unredactJsonValue rehydrates strings inside nested arrays" {
+    // Coverage gap from review: helper recursion through arrays-of-objects.
+    const allocator = std.testing.allocator;
+
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    const seeded = try redactor.redact(allocator, "alice@acme.com bob@acme.com carol@acme.com");
+    defer allocator.free(seeded);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        \\{"recipients":[{"to":"[EMAIL_1]"},{"to":"[EMAIL_2]"},{"to":"[EMAIL_3]"}]}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try Agent.unredactJsonValue(arena.allocator(), &redactor, &parsed.value);
+
+    const recipients = parsed.value.object.get("recipients").?.array;
+    try std.testing.expectEqual(@as(usize, 3), recipients.items.len);
+    try std.testing.expectEqualStrings("alice@acme.com", recipients.items[0].object.get("to").?.string);
+    try std.testing.expectEqualStrings("bob@acme.com", recipients.items[1].object.get("to").?.string);
+    try std.testing.expectEqualStrings("carol@acme.com", recipients.items[2].object.get("to").?.string);
+}
+
+test "Agent.unredactJsonValue caps recursion depth on hostile input" {
+    // Defense-in-depth: parseFromSlice already bounds nesting (default ~256),
+    // but the walker enforces its own cap so a future loosening of parser
+    // options can't blow the agent's stack.
+    const allocator = std.testing.allocator;
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Build nested array deeper than UNREDACT_JSON_MAX_DEPTH (64).
+    const depth: usize = 80;
+    var sb: std.ArrayListUnmanaged(u8) = .empty;
+    defer sb.deinit(arena_alloc);
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try sb.append(arena_alloc, '[');
+    try sb.appendSlice(arena_alloc, "\"x\"");
+    i = 0;
+    while (i < depth) : (i += 1) try sb.append(arena_alloc, ']');
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, sb.items, .{
+        .max_value_len = 4096,
+    });
+    defer parsed.deinit();
+
+    const result = Agent.unredactJsonValue(arena_alloc, &redactor, &parsed.value);
+    try std.testing.expectError(error.JsonTooDeeplyNested, result);
+}
+
+test "Agent: redactor placeholder from image_url rehydrates in CLI display path" {
+    // Regression: redactMessagesForProvider feeds image_url.url through the
+    // same Redactor as text content, so any token captured from a URL must
+    // round-trip via the same reverse map. Emulate the "image URL captured →
+    // LLM echoed placeholder → display unredact" round-trip directly through
+    // the Redactor (the CLI print path is just `redactor.unredact(response)`).
+    const allocator = std.testing.allocator;
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parts = [_]ContentPart{
+        ContentPart{ .image_url = .{ .url = "https://example.com/p.png?email=user@example.com" } },
+    };
+    const messages = [_]ChatMessage{
+        ChatMessage{ .role = .user, .content = "", .content_parts = &parts },
+    };
+    const out = try Agent.redactMessagesForProvider(arena.allocator(), &messages, &redactor);
+    try std.testing.expect(out[0].content_parts != null);
+    const redacted_url = out[0].content_parts.?[0].image_url.url;
+    try std.testing.expect(std.mem.indexOf(u8, redacted_url, "[EMAIL_1]") != null);
+
+    // Simulate LLM echoing the placeholder it saw in the URL.
+    const llm_reply = "I noticed an email at [EMAIL_1] in the image URL.";
+    const restored = try redactor.unredact(allocator, llm_reply);
+    defer allocator.free(restored);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "user@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "[EMAIL_1]") == null);
 }
 
 // ---- iteration-exhausted summary path ----

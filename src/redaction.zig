@@ -6,9 +6,15 @@
 //! deterministic numbered placeholders like `[EMAIL_1]`, `[CARD_2]`.
 //!
 //! Stateful: same value within or across `redact()` calls reuses the same id.
-//! Raw sensitive values are not stored in the long-lived maps; keys are
-//! per-redactor HMAC-SHA256 fingerprints so reset/deinit do not need to retain
-//! plaintext PII.
+//! Identity maps (`email_map`, …) key plaintext fingerprints by HMAC-SHA256
+//! and never store the original value, so the default mode is one-way.
+//!
+//! `Config.record_originals = true` opts the redactor into a parallel
+//! `placeholder_to_original` reverse map that retains plaintext PII for the
+//! lifetime of the Redactor. This unlocks `unredact()` for callers that need
+//! to rehydrate placeholders back to originals (e.g. tool-arg restoration,
+//! console rendering). Originals stay in process RAM; on-disk surfaces
+//! (memory backend, history persistence) are not affected.
 
 const std = @import("std");
 const std_compat = @import("compat");
@@ -227,10 +233,19 @@ pub const Redactor = struct {
     }
 
     /// Cache the original PII slice under "[KIND_<id>]" so unredact() can
-    /// restore it. No-op when `config.record_originals` is false. Idempotent —
-    /// once an id is recorded, subsequent calls for the same id are skipped
-    /// (intern() guarantees the same fingerprint maps to the same id, so the
-    /// original is identical anyway).
+    /// restore it. No-op when `config.record_originals` is false.
+    ///
+    /// Idempotency rests on intern()'s contract: the same fingerprint
+    /// (HMAC-SHA256 of the value, full 32-byte digest hex) maps to the same
+    /// id, so a get-hit on the reverse map means the original we'd dup is
+    /// byte-identical to the cached one. If a future change ever truncates
+    /// the fingerprint or swaps the hash, this assumption breaks and the
+    /// first-seen value would silently shadow later values for the same id —
+    /// keep recordOriginal in lockstep with intern().
+    ///
+    /// On OOM after the placeholder has been written into `out` by the
+    /// caller, errdefers free both dups; the next redact() retry finds the
+    /// id already interned (same fingerprint) and re-records the original.
     fn recordOriginal(self: *Redactor, kind: []const u8, id: u32, original: []const u8) !void {
         if (!self.config.record_originals) return;
 
@@ -243,6 +258,14 @@ pub const Redactor = struct {
         const value_dup = try self.allocator.dupe(u8, original);
         errdefer self.allocator.free(value_dup);
         try self.placeholder_to_original.put(key_dup, value_dup);
+    }
+
+    /// Whether this Redactor will substitute placeholders back to originals.
+    /// Callers (CLI display, tool-arg rehydration) gate downstream behavior
+    /// on this, so a future "redact-only" mode (record_originals=false) does
+    /// not silently break UX paths that assume `unredact()` is meaningful.
+    pub fn wouldRehydrate(self: *const Redactor) bool {
+        return self.config.record_originals;
     }
 
     /// Replace `[EMAIL_N]` / `[PHONE_N]` / `[CARD_N]` / `[ID_N]` / `[TOKEN_N]`
