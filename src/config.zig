@@ -4425,6 +4425,39 @@ test "json parse gateway configurable limits" {
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
 }
 
+test "json parse gateway webhook_sync_for_workers" {
+    const allocator = std.testing.allocator;
+
+    // Default: field absent → false. Same shape as other defaulted bool fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"port\": 3000}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit true → true.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": true}}");
+        try std.testing.expect(cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit false → false.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": false}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Wrong JSON type (string instead of bool) → field stays at default false,
+    // matching how the parser handles type mismatches for sibling fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": \"yes\"}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+}
+
 test "json parse browser allowed domains" {
     const allocator = std.testing.allocator;
     const json =
