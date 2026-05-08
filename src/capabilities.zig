@@ -27,6 +27,7 @@ const core_tool_names = [_][]const u8{
     "delegate",
     "schedule",
     "spawn",
+    "sqlite_query",
 };
 
 const optional_tool_names = [_][]const u8{
