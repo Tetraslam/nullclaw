@@ -161,7 +161,51 @@ Then:
 nullclaw --help
 ```
 
-### 3) Common commands
+### 3) Run with Docker Compose
+
+The repository includes a Makefile wrapper around Docker Compose for local
+containerized runs.
+
+```bash
+make build
+make config
+make up
+```
+
+`make config` runs `nullclaw onboard --interactive` inside the agent container.
+For non-interactive setup:
+
+```bash
+make config CONFIG_ARGS="--api-key sk-... --provider openrouter"
+```
+
+The compose gateway defaults to `NULLCLAW_PORT=3210`, binds inside the
+container on `0.0.0.0`, and publishes on all host interfaces:
+
+```bash
+curl http://127.0.0.1:3210/health
+curl http://<host-ip>:3210/health
+```
+
+Override the port when needed:
+
+```bash
+make up NULLCLAW_PORT=8080
+```
+
+Operational shortcuts:
+
+```bash
+make logs
+make down
+make shell
+```
+
+Because the compose gateway is published on `0.0.0.0`, keep pairing, webhook
+secrets, allowlists, and host firewall rules configured before using it on an
+untrusted network.
+
+### 4) Common commands
 
 ```bash
 
