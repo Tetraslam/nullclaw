@@ -27,7 +27,7 @@ build: check-buildx
 config: check-buildx
 	$(COMPOSE) --profile agent run --rm agent onboard $(CONFIG_ARGS)
 
-up: check-buildx config
+up: check-buildx
 	$(COMPOSE) --profile $(PROFILE) up -d --build $(SERVICE)
 
 down:
