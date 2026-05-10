@@ -390,17 +390,12 @@ pub fn allTools(
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
         .path_env_vars = tc.path_env_vars,
-        // sandbox and sandbox_storage initialized below if enabled
     };
     if (opts.sandbox_enabled and comptime builtin.os.tag != .windows) {
-        // Windows shells use cmd.exe/PowerShell, which Unix-oriented sandboxes
-        // cannot wrap without breaking command execution semantics.
-        st.sandbox = createSandbox(
-            allocator,
-            mapConfigSandboxBackend(opts.sandbox_backend),
-            workspace_dir,
-            &st.sandbox_storage,
-        );
+        // Delay sandbox auto-detection until the shell tool is actually used so
+        // channel/runtime startup does not spawn probe children preemptively.
+        st.sandbox_backend = mapConfigSandboxBackend(opts.sandbox_backend);
+        st.sandbox_allocator = allocator;
     }
     try list.append(allocator, st.tool());
 
@@ -970,7 +965,7 @@ test "all tools apply configured descriptions and enabled filters" {
     try std.testing.expectEqual(@as(usize, 17), tools.len);
 }
 
-test "all tools wires shell sandbox by default" {
+test "all tools defers shell sandbox initialization by default" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
@@ -980,7 +975,9 @@ test "all tools wires shell sandbox by default" {
     for (tools) |t| {
         if (!std.mem.eql(u8, t.name(), "shell")) continue;
         const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
-        try std.testing.expect(st.sandbox != null);
+        try std.testing.expect(st.sandbox == null);
+        try std.testing.expectEqual(SandboxBackend.auto, st.sandbox_backend.?);
+        try std.testing.expect(st.sandbox_allocator != null);
         saw_shell = true;
         break;
     }
