@@ -14,6 +14,7 @@ threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
+pub const CredentialedCurlArgError = error{CredentialedCurlArgRejected};
 
 fn classifyCurlExitCode(code: u8) []const u8 {
     return switch (code) {
@@ -132,6 +133,135 @@ pub const HttpResponseWithHeaders = struct {
     headers: []u8,
     body: []u8,
 };
+
+fn headerName(header: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, header, ':') orelse return header;
+    return std.mem.trim(u8, header[0..colon], " \t\r\n");
+}
+
+fn isCredentialHeader(header: []const u8) bool {
+    const name = headerName(header);
+    return std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "x-api-key") or
+        std.ascii.eqlIgnoreCase(name, "api-key") or
+        std.ascii.eqlIgnoreCase(name, "x-goog-api-key") or
+        std.ascii.eqlIgnoreCase(name, "anthropic-api-key") or
+        std.ascii.eqlIgnoreCase(name, "cookie");
+}
+
+fn hasSensitiveUrlToken(url: []const u8) bool {
+    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return false;
+    var query = url[query_start + 1 ..];
+    while (query.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, query, '&') orelse query.len;
+        const pair = query[0..amp];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        const key = pair[0..eq];
+        if (std.ascii.eqlIgnoreCase(key, "key") or
+            std.ascii.eqlIgnoreCase(key, "api_key") or
+            std.ascii.eqlIgnoreCase(key, "apikey") or
+            std.ascii.eqlIgnoreCase(key, "access_token") or
+            std.ascii.eqlIgnoreCase(key, "token") or
+            std.ascii.eqlIgnoreCase(key, "auth_token"))
+        {
+            return true;
+        }
+        if (amp >= query.len) break;
+        query = query[amp + 1 ..];
+    }
+    return false;
+}
+
+pub fn validateNoCredentialedCurlArgs(url: []const u8, headers: []const []const u8) CredentialedCurlArgError!void {
+    if (hasSensitiveUrlToken(url)) return error.CredentialedCurlArgRejected;
+    for (headers) |header| {
+        if (isCredentialHeader(header)) return error.CredentialedCurlArgRejected;
+    }
+}
+
+fn parseHeader(header: []const u8) ?std.http.Header {
+    const colon = std.mem.indexOfScalar(u8, header, ':') orelse return null;
+    const name = std.mem.trim(u8, header[0..colon], " \t\r\n");
+    const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r\n");
+    if (name.len == 0) return null;
+    return .{ .name = name, .value = value };
+}
+
+fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
+    var proxy_client = try ProxyHttpClient.init(allocator);
+    if (proxy == null) return proxy_client;
+
+    proxy_client.deinit();
+    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer proxy_arena.deinit();
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    errdefer client.deinit();
+    var env_map = std_compat.process.EnvMap.init(proxy_arena.allocator());
+    try env_map.put("HTTPS_PROXY", proxy.?);
+    try env_map.put("https_proxy", proxy.?);
+    try env_map.put("HTTP_PROXY", proxy.?);
+    try env_map.put("http_proxy", proxy.?);
+    try client.initDefaultProxies(proxy_arena.allocator(), &env_map);
+    return .{ .proxy_arena = proxy_arena, .client = client };
+}
+
+pub fn httpRequest(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    var header_buf: [20]std.http.Header = undefined;
+    var header_count: usize = 0;
+    if (content_type) |ct| {
+        header_buf[header_count] = .{ .name = "Content-Type", .value = ct };
+        header_count += 1;
+    }
+    for (headers) |header| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = parseHeader(header) orelse return error.InvalidHeader;
+        header_count += 1;
+    }
+
+    var client = try initProxyClientWithOptionalProxy(allocator, proxy);
+    defer client.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = try client.client.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .payload = body,
+        .extra_headers = header_buf[0..header_count],
+        .response_writer = &aw.writer,
+    });
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) return error.HttpStatusError;
+    const response = aw.writer.buffer[0..aw.writer.end];
+    return try allocator.dupe(u8, response);
+}
+
+pub fn httpPostJsonWithProxy(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    return httpRequest(allocator, .POST, url, body, headers, "application/json", proxy);
+}
+
+pub fn httpGetWithProxy(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    return httpRequest(allocator, .GET, url, null, headers, null, proxy);
+}
 
 const proxy_env_var_names = [_][]const u8{
     "http_proxy",
@@ -329,6 +459,7 @@ fn curlRequestWithProxy(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
+    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -498,6 +629,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
+    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -638,6 +770,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponseWithHeaders {
+    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [56][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -798,6 +931,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
+    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -915,6 +1049,7 @@ fn curlGetWithProxyAndResolve(
     resolve_entry: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
+    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -1162,6 +1297,7 @@ pub fn curlGetSSE(
     url: []const u8,
     timeout_secs: []const u8,
 ) ![]u8 {
+    try validateNoCredentialedCurlArgs(url, &.{});
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -1289,6 +1425,24 @@ test "curlGetWithResolve compiles and is callable" {
 
 test "curlGetMaxBytes compiles and is callable" {
     _ = curlGetMaxBytes;
+}
+
+test "credentialed curl argv validation rejects authorization header" {
+    try std.testing.expectError(
+        error.CredentialedCurlArgRejected,
+        validateNoCredentialedCurlArgs("https://example.com/v1", &.{"Authorization: Bearer test-token"}),
+    );
+}
+
+test "credentialed curl argv validation rejects token query" {
+    try std.testing.expectError(
+        error.CredentialedCurlArgRejected,
+        validateNoCredentialedCurlArgs("https://example.com/v1?access_token=test-token", &.{}),
+    );
+}
+
+test "credentialed curl argv validation permits non-secret headers" {
+    try validateNoCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"});
 }
 
 test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinning" {

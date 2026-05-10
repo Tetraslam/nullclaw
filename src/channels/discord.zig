@@ -298,7 +298,7 @@ pub const DiscordChannel = struct {
         auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, "{}", &.{auth_header}) catch return;
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, "{}", &.{auth_header}, null) catch return;
         self.allocator.free(resp);
     }
 
@@ -396,7 +396,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, body_list.items, &.{auth_header}, null) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -404,69 +404,12 @@ pub const DiscordChannel = struct {
     }
 
     fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = method;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-
         var auth_buf: [512]u8 = undefined;
         var auth_writer: std.Io.Writer = .fixed(&auth_buf);
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_writer.buffered();
-        argc += 1;
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std_compat.process.Child.init(argv_buf[0..argc], self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(body) catch {
-                stdin_file.close();
-                child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return error.CurlWriteError;
-            };
-            stdin_file.close();
-            child.stdin = null;
-        } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        }
-
-        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlReadError;
-        };
-        defer self.allocator.free(stdout);
-
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .exited => |code| if (code != 0) return error.DiscordApiError,
-            else => return error.DiscordApiError,
-        }
+        const http_method: std.http.Method = if (std.mem.eql(u8, method, "PATCH")) .PATCH else .POST;
+        const resp = root.http_util.httpRequest(self.allocator, http_method, url, body, &.{auth_writer.buffered()}, "application/json", null) catch return error.DiscordApiError;
+        self.allocator.free(resp);
     }
 
     fn nextInteractionToken(self: *DiscordChannel) ![]u8 {
@@ -677,7 +620,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, body.items, &.{auth_header}, null) catch |err| {
             log.err("Discord API rich POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -732,7 +675,7 @@ pub const DiscordChannel = struct {
         const owned_body = body catch return;
         defer self.allocator.free(owned_body);
 
-        const resp = root.http_util.curlPost(self.allocator, url, owned_body, &.{}) catch return;
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, owned_body, &.{}, null) catch return;
         self.allocator.free(resp);
     }
 
