@@ -1,7 +1,7 @@
 //! Orchestrates LLM-based triage of workspace audit findings.
 //!
 //! For each finding with collected envelope context: build a privacy-safe
-//! envelope, optionally call the LLM, log to the audit log, and apply the
+//! envelope, optionally call the LLM, write audit-log events, and apply the
 //! verdict (drop false positives, adjust severity).
 
 const std = @import("std");
@@ -12,6 +12,7 @@ const envelope = @import("envelope.zig");
 const llm_client = @import("llm_client.zig");
 const audit_log_mod = @import("audit_log.zig");
 const types = @import("types.zig");
+const fs_compat = @import("../fs_compat.zig");
 
 const Finding = types.Finding;
 const Severity = types.Severity;
@@ -43,6 +44,9 @@ pub fn runTriage(
 
     var audit_log = try audit_log_mod.AuditLog.init(allocator, audit_log_path);
     defer audit_log.deinit();
+    if (options.mode == .external) {
+        try audit_log.preflight();
+    }
 
     var kept: std.ArrayListUnmanaged(Finding) = .empty;
     errdefer {
@@ -93,6 +97,8 @@ pub fn runTriage(
             continue;
         }
 
+        try audit_log.recordSent(env_json);
+
         var verdict = client.triageEnvelope(allocator, env_json) catch |err| {
             stats.errors += 1;
             std.debug.print("triage: llm call failed for {s}:{?d}: {s}\n", .{
@@ -107,7 +113,7 @@ pub fn runTriage(
         defer verdict.deinit(allocator);
         stats.llm_calls += 1;
 
-        try audit_log.record(env_json, verdict);
+        try audit_log.recordVerdict(env.envelope_hash[0..], verdict);
 
         switch (verdict.decision) {
             .real_secret => stats.verdicts_real += 1,
@@ -240,6 +246,22 @@ test "runTriage respects max llm calls" {
     try std.testing.expectEqual(@as(usize, 1), stats.llm_calls);
     try std.testing.expectEqual(@as(usize, 1), stats.skipped_budget);
     try std.testing.expectEqual(@as(usize, 2), report.findings.len);
+
+    const log_content = try fs_compat.readFileAlloc(tmp.dir, allocator, "audit.jsonl", 64 * 1024);
+    defer allocator.free(log_content);
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, log_content, " \t\r\n"), '\n');
+    const sent_line = lines.next() orelse return error.TestUnexpectedResult;
+    const verdict_line = lines.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lines.next() == null);
+
+    var sent = try std.json.parseFromSlice(std.json.Value, allocator, sent_line, .{});
+    defer sent.deinit();
+    var verdict = try std.json.parseFromSlice(std.json.Value, allocator, verdict_line, .{});
+    defer verdict.deinit();
+    try std.testing.expectEqualStrings("sent", sent.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("verdict", verdict.value.object.get("event").?.string);
+    const sent_hash = sent.value.object.get("envelope").?.object.get("envelope_hash").?.string;
+    try std.testing.expectEqualStrings(sent_hash, verdict.value.object.get("envelope_hash").?.string);
 }
 
 fn testFinding(allocator: Allocator, path: []const u8, raw_line: []const u8) !Finding {

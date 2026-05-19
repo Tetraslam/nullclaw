@@ -169,9 +169,9 @@ To pin audit triage to a smaller/local model without changing the normal agent m
 }
 ```
 
-This config does not enable external LLM calls by itself; the operator still has to pass `--llm-triage external`. CLI flags `--llm-provider`, `--llm-model`, and `--llm-max-calls` override these config values for a single run.
+This config does not enable external LLM calls by itself; the operator still has to pass `--llm-triage external`. CLI flags `--llm-provider`, `--llm-model`, and `--llm-max-calls` override these config values for a single run. Unknown provider names are rejected unless that provider has an explicit `models.providers.<name>.base_url`, so a typo cannot silently route audit envelopes through a fallback provider.
 
-Every `external` request is appended to `~/.nullclaw/audit-log.jsonl` as `{"timestamp": ..., "envelope": ..., "verdict": ...}`. The log is append-only and intended for after-the-fact verification of what metadata was sent.
+Every `external` request is appended to `<config-dir>/audit-log.jsonl`. NullClaw writes a `sent` event containing the envelope before the LLM call, then a `verdict` event keyed by `envelope_hash` after the response. The log is append-only and intended for after-the-fact verification of what metadata was sent.
 
 ### Operator notes
 

@@ -99,10 +99,18 @@ pub const TriageMode = enum {
     pub fn parse(text: []const u8) ?TriageMode {
         if (std.mem.eql(u8, text, "off")) return .off;
         if (std.mem.eql(u8, text, "dry-run") or std.mem.eql(u8, text, "dry_run")) return .dry_run;
-        if (std.mem.eql(u8, text, "external") or std.mem.eql(u8, text, "on")) return .external;
+        if (std.mem.eql(u8, text, "external")) return .external;
         return null;
     }
 };
+
+test "TriageMode parse accepts documented values only" {
+    try std.testing.expectEqual(TriageMode.off, TriageMode.parse("off").?);
+    try std.testing.expectEqual(TriageMode.dry_run, TriageMode.parse("dry-run").?);
+    try std.testing.expectEqual(TriageMode.dry_run, TriageMode.parse("dry_run").?);
+    try std.testing.expectEqual(TriageMode.external, TriageMode.parse("external").?);
+    try std.testing.expect(TriageMode.parse("on") == null);
+}
 
 pub const Finding = struct {
     severity: Severity,

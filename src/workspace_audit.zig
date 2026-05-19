@@ -99,6 +99,8 @@ const PathCategory = enum {
     neutral,
 };
 
+/// Scan-only command helper. LLM triage is orchestrated by the CLI layer so
+/// this detector module stays provider-free and deterministic.
 pub fn run(allocator: Allocator, options: Options) !u8 {
     const resolved_workspace = try fs_compat.realpathAllocPath(allocator, options.workspace_dir);
     defer allocator.free(resolved_workspace);
@@ -965,7 +967,7 @@ fn looksLikeAccessorLine(line: []const u8) bool {
 fn detectHighEntropyCandidate(path: []const u8, line: []const u8, source: FindingSource) ?DetectedRule {
     _ = source;
     const path_category = classifyPath(path);
-    if (!containsHighEntropyCandidate(line)) return null;
+    const candidate = findHighEntropyCandidate(line) orelse return null;
 
     return .{
         .severity = if (path_category == .config) .high else .medium,
@@ -977,10 +979,15 @@ fn detectHighEntropyCandidate(path: []const u8, line: []const u8, source: Findin
             .vendor_like => .low,
         },
         .rule = "high_entropy_secret_candidate",
+        .detected_value = candidate,
     };
 }
 
 fn containsHighEntropyCandidate(line: []const u8) bool {
+    return findHighEntropyCandidate(line) != null;
+}
+
+fn findHighEntropyCandidate(line: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < line.len) {
         while (i < line.len and !isEntropyCharset(line[i])) : (i += 1) {}
@@ -997,11 +1004,11 @@ fn containsHighEntropyCandidate(line: []const u8) bool {
                 !looksLikeGitCommitHash(candidate) and
                 audit_envelope.computeShannonEntropy(candidate) >= 4.0)
             {
-                return true;
+                return candidate;
             }
         }
     }
-    return false;
+    return null;
 }
 
 fn candidateFromEntropyRun(candidate_run: []const u8) ?[]const u8 {
@@ -1363,6 +1370,7 @@ test "workspace audit only secrets hides medium findings" {
 test "entropy detector finds custom candidate" {
     const rule = detectLine("notes.txt", "opaque_blob=ZXhhbXBsZVRva2VuQ2FuZGlkYXRlMTIzNDU2", .workspace_file).?;
     try std.testing.expectEqualStrings("high_entropy_secret_candidate", rule.rule);
+    try std.testing.expectEqualStrings("ZXhhbXBsZVRva2VuQ2FuZGlkYXRlMTIzNDU2", rule.detected_value.?);
 }
 
 test "entropy detector ignores git commit hash and uuid" {

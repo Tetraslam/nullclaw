@@ -3384,6 +3384,10 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
 
     if (triage_options.mode == .external) {
         const provider_name = workspaceAuditTriageProviderName(triage_provider_name, &cfg);
+        if (!workspaceAuditTriageProviderIsAllowed(&cfg, provider_name)) {
+            std.debug.print("workspace audit: unknown LLM provider '{s}'. Use a built-in provider name or configure models.providers.{s}.base_url explicitly.\n", .{ provider_name, provider_name });
+            std_compat.process.exit(1);
+        }
         const model_name = workspaceAuditTriageModelName(triage_model_name, &cfg) orelse {
             std.debug.print("workspace audit: no model configured. Set workspace_audit.llm_triage.model, agents.defaults.model.primary, or pass --llm-model.\n", .{});
             std_compat.process.exit(1);
@@ -3423,7 +3427,7 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
         std_compat.process.exit(1);
     }
 
-    const exit_code = executeWorkspaceAudit(allocator, options, triage_options) catch |err| {
+    const exit_code = executeWorkspaceAudit(allocator, &cfg, options, triage_options) catch |err| {
         switch (err) {
             error.NotGitRepository => std.debug.print("workspace audit: staged mode requires a Git repository\n", .{}),
             error.GitUnavailable => std.debug.print("workspace audit: git is not available in this environment\n", .{}),
@@ -3438,6 +3442,7 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
 
 fn executeWorkspaceAudit(
     allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
     options: yc.workspace_audit.Options,
     triage_options: yc.audit.triager.Options,
 ) !u8 {
@@ -3452,7 +3457,7 @@ fn executeWorkspaceAudit(
 
     var maybe_stats: ?yc.audit.TriageStats = null;
     if (triage_options.mode != .off) {
-        const log_path = try defaultWorkspaceAuditLogPath(allocator);
+        const log_path = try defaultWorkspaceAuditLogPath(allocator, cfg);
         defer allocator.free(log_path);
         maybe_stats = try yc.audit.triager.runTriage(allocator, &report, triage_options, log_path);
     }
@@ -3474,11 +3479,15 @@ fn executeWorkspaceAudit(
     return if (report.exceedsThreshold(options.fail_on)) 1 else 0;
 }
 
-fn defaultWorkspaceAuditLogPath(allocator: std.mem.Allocator) ![]u8 {
-    const home_env = std_compat.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (home_env) |h| allocator.free(h);
-    const home: []const u8 = home_env orelse ".";
-    return std.fmt.allocPrint(allocator, "{s}/.nullclaw/audit-log.jsonl", .{home});
+fn defaultWorkspaceAuditLogPath(allocator: std.mem.Allocator, cfg: *const yc.config.Config) ![]u8 {
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    return std_compat.fs.path.join(allocator, &.{ config_dir, "audit-log.jsonl" });
+}
+
+fn workspaceAuditTriageProviderIsAllowed(cfg: *const yc.config.Config, provider_name: []const u8) bool {
+    if (yc.providers.classifyProvider(provider_name) != .unknown) return true;
+    const base_url = cfg.getProviderBaseUrl(provider_name) orelse return false;
+    return yc.config.ProviderEntry.isValidBaseUrl(base_url);
 }
 
 fn resolveWorkspaceAuditTriageApiKey(
@@ -5543,6 +5552,46 @@ test "workspace audit triage config selects provider model and budget before def
     try std.testing.expectEqual(@as(usize, 12), workspaceAuditTriageMaxLlmCalls(&cfg));
     try std.testing.expectEqualStrings("openai", workspaceAuditTriageProviderName("openai", &cfg));
     try std.testing.expectEqualStrings("gpt-5.4", workspaceAuditTriageModelName("gpt-5.4", &cfg).?);
+}
+
+test "workspace audit triage rejects unknown provider without explicit base url" {
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{
+            .name = "custom-compat",
+            .base_url = "https://llm.example.com/v1",
+        },
+        .{
+            .name = "bad-compat",
+            .base_url = "http://api.example.com/v1",
+        },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = std.testing.allocator,
+        .providers = &providers_cfg,
+    };
+
+    try std.testing.expect(workspaceAuditTriageProviderIsAllowed(&cfg, "ollama"));
+    try std.testing.expect(workspaceAuditTriageProviderIsAllowed(&cfg, "custom-compat"));
+    try std.testing.expect(!workspaceAuditTriageProviderIsAllowed(&cfg, "olama"));
+    try std.testing.expect(!workspaceAuditTriageProviderIsAllowed(&cfg, "bad-compat"));
+}
+
+test "workspace audit log path follows config directory" {
+    const allocator = std.testing.allocator;
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-home/config.json",
+        .allocator = allocator,
+    };
+
+    const path = try defaultWorkspaceAuditLogPath(allocator, &cfg);
+    defer allocator.free(path);
+    const expected = try std_compat.fs.path.join(allocator, &.{ "/tmp/nullclaw-home", "audit-log.jsonl" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {
