@@ -399,6 +399,12 @@ fn renderRows(
     defer r.deinit();
     const redacted = try r.redact(allocator, rendered);
     allocator.free(rendered);
+    if (redacted.len > max_bytes) {
+        // Regression: redaction can expand short values such as a@b.co into
+        // placeholders, so the public byte cap must apply after redaction too.
+        allocator.free(redacted);
+        return renderTruncatedEmptyRows(allocator);
+    }
     return ToolResult{ .success = true, .output = redacted };
 }
 
@@ -1015,6 +1021,48 @@ test "sqlite_query: huge text and aliases stay within max_result_bytes" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(result.output.len <= 512);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
+}
+
+test "sqlite_query: redacted output stays within max_result_bytes" {
+    // Regression: short sensitive values can expand during redaction, so the
+    // final returned payload must still obey max_result_bytes.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/emails.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+
+    {
+        var db: ?*c.sqlite3 = null;
+        if (c.sqlite3_open(db_path_z.ptr, &db) != c.SQLITE_OK) return error.OpenFailed;
+        defer _ = c.sqlite3_close(db);
+
+        if (c.sqlite3_exec(db, "CREATE TABLE emails (email TEXT);", null, null, null) != c.SQLITE_OK) {
+            return error.PopulateFailed;
+        }
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            if (c.sqlite3_exec(db, "INSERT INTO emails VALUES ('a@b.co');", null, null, null) != c.SQLITE_OK) {
+                return error.PopulateFailed;
+            }
+        }
+    }
+
+    var sqt = SqliteQueryTool{
+        .workspace_dir = ws_path,
+        .max_result_bytes = 512,
+    };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"emails.db\",\"query\":\"SELECT email FROM emails\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(result.output.len <= 512);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "a@b.co") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
 }
 
