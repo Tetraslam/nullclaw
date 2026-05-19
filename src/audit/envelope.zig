@@ -96,6 +96,7 @@ pub const Charset = enum {
 
         if (has_plus or has_slash or has_equals) return .base64ish;
 
+        if (has_digit and has_lower_alpha and has_upper_alpha and isHexMixed(value)) return .hex_mixed;
         if (has_digit and has_hex_only_lower and !has_upper_alpha) return .hex_lower;
         if (has_digit and has_hex_only_upper and !has_lower_alpha) return .hex_upper;
         if (has_digit and (has_hex_only_lower or has_hex_only_upper) and isHexMixed(value)) return .hex_mixed;
@@ -400,14 +401,22 @@ fn maskValue(allocator: Allocator, full_line: []const u8, value: []const u8, cha
     const placeholder = try std.fmt.allocPrint(allocator, "<SECRET:len={d},charset={s},entropy={d:.1}>", .{ value.len, charset_name, entropy });
     defer allocator.free(placeholder);
 
-    if (std.mem.indexOf(u8, full_line, value)) |idx| {
-        return try std.mem.concat(allocator, u8, &.{
-            full_line[0..idx],
-            placeholder,
-            full_line[idx + value.len ..],
-        });
+    if (value.len == 0) return try allocator.dupe(u8, placeholder);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var start: usize = 0;
+    var masked = false;
+    while (std.mem.indexOfPos(u8, full_line, start, value)) |idx| {
+        try buf.appendSlice(allocator, full_line[start..idx]);
+        try buf.appendSlice(allocator, placeholder);
+        start = idx + value.len;
+        masked = true;
     }
-    return try allocator.dupe(u8, placeholder);
+    if (!masked) return try allocator.dupe(u8, placeholder);
+    try buf.appendSlice(allocator, full_line[start..]);
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn appendFmt(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, comptime fmt: []const u8, args: anytype) !void {
@@ -543,6 +552,10 @@ test "Charset.classify hex upper" {
     try std.testing.expectEqual(Charset.hex_upper, Charset.classify("DEADBEEF0123456789ABCDEF"));
 }
 
+test "Charset.classify hex mixed" {
+    try std.testing.expectEqual(Charset.hex_mixed, Charset.classify("deadBEEF0123456789ABCDEF"));
+}
+
 test "Charset.classify base64ish" {
     try std.testing.expectEqual(Charset.base64ish, Charset.classify("wJalrXUtnFEMI/K7MDENG/bPxRfiCY+EXAMPLEKEY="));
 }
@@ -659,6 +672,23 @@ test "build envelope masks the value in line context" {
     try std.testing.expect(std.mem.indexOf(u8, env.line_context_masked, "ghp_aBc") == null);
     try std.testing.expect(std.mem.indexOf(u8, env.line_context_masked, "<SECRET:") != null);
     try std.testing.expect(std.mem.indexOf(u8, env.line_context_masked, "API_KEY=") != null);
+}
+
+test "build envelope masks repeated values in line context" {
+    const allocator = std.testing.allocator;
+    const secret = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+    var env = try build(allocator, .{
+        .file_path = "secrets.env",
+        .line_no = 1,
+        .full_line = "TOKEN=ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 # duplicate ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        .value = secret,
+        .variable_name = "TOKEN",
+        .detector = "env_secret_assignment",
+        .assignment_operator = "=",
+    });
+    defer env.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, env.line_context_masked, secret) == null);
 }
 
 test "build envelope flags test path" {

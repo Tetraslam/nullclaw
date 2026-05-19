@@ -1,6 +1,6 @@
 //! Append-only JSONL log of LLM-triage requests for transparency.
 //!
-//! Every triage call writes one line: `{"timestamp":..., "envelope":{...}, "verdict":{...}, "cache_hit":bool}`.
+//! Every triage call writes one line: `{"timestamp":..., "envelope":{...}, "verdict":{...}}`.
 //! Users can review this file to verify exactly what metadata left their machine.
 
 const std = @import("std");
@@ -36,6 +36,8 @@ pub const AuditLog = struct {
         try file.seekFromEnd(0);
 
         const ts: i64 = std_compat.time.timestamp();
+        const severity_escaped = try jsonEscape(self.allocator, verdict.severity_adjusted);
+        defer self.allocator.free(severity_escaped);
         const reasoning_escaped = try jsonEscape(self.allocator, verdict.reasoning);
         defer self.allocator.free(reasoning_escaped);
 
@@ -46,7 +48,7 @@ pub const AuditLog = struct {
                 ts,
                 envelope_json,
                 verdict.decision.name(),
-                verdict.severity_adjusted,
+                severity_escaped,
                 reasoning_escaped,
                 verdict.confidence_score,
             },
@@ -79,4 +81,37 @@ fn jsonEscape(allocator: Allocator, s: []const u8) ![]u8 {
         }
     }
     return buf.toOwnedSlice(allocator);
+}
+
+test "audit log record escapes model-controlled verdict strings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "audit.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var log = try AuditLog.init(std.testing.allocator, path);
+    defer log.deinit();
+
+    var verdict = Verdict{
+        .decision = .uncertain,
+        .severity_adjusted = try std.testing.allocator.dupe(u8, "hi\"gh"),
+        .reasoning = try std.testing.allocator.dupe(u8, "line\nbreak\\slash"),
+        .confidence_score = 0.5,
+    };
+    defer verdict.deinit(std.testing.allocator);
+
+    try log.record("{}", verdict);
+
+    const content = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "audit.jsonl", 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trim(u8, content, " \t\r\n"), .{});
+    defer parsed.deinit();
+
+    const verdict_obj = parsed.value.object.get("verdict").?.object;
+    try std.testing.expectEqualStrings("hi\"gh", verdict_obj.get("severity_adjusted").?.string);
+    try std.testing.expectEqualStrings("line\nbreak\\slash", verdict_obj.get("reasoning").?.string);
 }

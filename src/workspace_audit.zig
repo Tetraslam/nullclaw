@@ -623,11 +623,12 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
         return .{ .severity = .critical, .confidence = .high, .rule = "private_key_block" };
     }
 
-    if (hasCredentialUrl(line)) {
+    if (findCredentialUrl(line)) |credential_url| {
         return .{
             .severity = .high,
             .confidence = if (path_category == .docs or path_category == .code) .medium else .high,
             .rule = "credential_in_url",
+            .detected_value = credential_url,
         };
     }
 
@@ -635,7 +636,7 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
         return classifySecretAssignment(path, line, path_category, assignment);
     }
 
-    if (hasTokenPrefix(line) and !looksPlaceholder(line)) {
+    if (findTokenPrefixedValue(line)) |token| {
         return .{
             .severity = .high,
             .confidence = if (source == .git_staged_diff or source == .git_history or path_category == .config)
@@ -643,6 +644,7 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
             else
                 .medium,
             .rule = "hardcoded_token",
+            .detected_value = token,
         };
     }
 
@@ -704,27 +706,43 @@ fn containsPrivateKeyMarker(line: []const u8) bool {
     return std.mem.indexOf(u8, line, "-----BEGIN ") != null and std.mem.indexOf(u8, line, "PRIVATE KEY-----") != null;
 }
 
-fn hasCredentialUrl(line: []const u8) bool {
-    const scheme_idx = std.mem.indexOf(u8, line, "://") orelse return false;
+fn findCredentialUrl(line: []const u8) ?[]const u8 {
+    const scheme_idx = std.mem.indexOf(u8, line, "://") orelse return null;
+    var url_start = scheme_idx;
+    while (url_start > 0 and isUrlSchemeChar(line[url_start - 1])) : (url_start -= 1) {}
+
+    var url_end = scheme_idx + 3;
+    while (url_end < line.len) : (url_end += 1) {
+        switch (line[url_end]) {
+            ' ', '\t', '"', '\'', '`', ',', ';' => break,
+            else => {},
+        }
+    }
+
     const rest = line[scheme_idx + 3 ..];
-    const authority_end = firstIndexAny(rest, "/?#") orelse rest.len;
+    const authority_end = firstIndexAny(rest, "/?# \t\"'`,;") orelse rest.len;
     const authority = rest[0..authority_end];
-    const at_idx = std.mem.indexOfScalar(u8, authority, '@') orelse return false;
+    const at_idx = std.mem.indexOfScalar(u8, authority, '@') orelse return null;
     const userinfo = authority[0..at_idx];
-    return std.mem.indexOfScalar(u8, userinfo, ':') != null;
+    if (std.mem.indexOfScalar(u8, userinfo, ':') == null) return null;
+    return line[url_start..url_end];
 }
 
-fn hasTokenPrefix(text: []const u8) bool {
+fn isUrlSchemeChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '-' or ch == '.';
+}
+
+fn findTokenPrefixedValue(text: []const u8) ?[]const u8 {
     for (token_prefixes) |prefix| {
         if (std.mem.indexOf(u8, text, prefix)) |idx| {
             const end = tokenEnd(text, idx + prefix.len);
             if (end > idx + prefix.len) {
                 const token = text[idx..end];
-                if (!looksPlaceholder(token)) return true;
+                if (!looksPlaceholder(token)) return token;
             }
         }
     }
-    return false;
+    return null;
 }
 
 fn tokenEnd(text: []const u8, start: usize) usize {
@@ -740,19 +758,16 @@ fn looksPlaceholder(text: []const u8) bool {
     const trimmed = normalizeValue(text);
     if (trimmed.len == 0) return true;
 
-    const lower = std.ascii.allocLowerString(std.heap.page_allocator, trimmed) catch return false;
-    defer std.heap.page_allocator.free(lower);
-
-    if (std.mem.startsWith(u8, lower, "${") or std.mem.startsWith(u8, lower, "{{") or std.mem.startsWith(u8, lower, "<")) return true;
-    if (std.mem.indexOf(u8, lower, "example") != null) return true;
-    if (std.mem.indexOf(u8, lower, "placeholder") != null) return true;
-    if (std.mem.indexOf(u8, lower, "replace") != null) return true;
-    if (std.mem.indexOf(u8, lower, "changeme") != null) return true;
-    if (std.mem.indexOf(u8, lower, "dummy") != null) return true;
-    if (std.mem.indexOf(u8, lower, "sample") != null) return true;
-    if (std.mem.indexOf(u8, lower, "fake") != null) return true;
-    if (std.mem.indexOf(u8, lower, "test") != null) return true;
-    if (std.mem.eql(u8, lower, "null") or std.mem.eql(u8, lower, "false") or std.mem.eql(u8, lower, "true")) return true;
+    if (std.mem.startsWith(u8, trimmed, "${") or std.mem.startsWith(u8, trimmed, "{{") or std.mem.startsWith(u8, trimmed, "<")) return true;
+    if (indexOfIgnoreCase(trimmed, "example") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "placeholder") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "replace") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "changeme") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "dummy") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "sample") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "fake") != null) return true;
+    if (indexOfIgnoreCase(trimmed, "test") != null) return true;
+    if (eqlIgnoreCase(trimmed, "null") or eqlIgnoreCase(trimmed, "false") or eqlIgnoreCase(trimmed, "true")) return true;
     return false;
 }
 
@@ -778,14 +793,21 @@ fn appendFinding(
     const assignment_operator: ?[]u8 = if (collect and rule.assignment_operator != null) try allocator.dupe(u8, rule.assignment_operator.?) else null;
     errdefer if (assignment_operator) |v| allocator.free(v);
 
+    const rule_owned = try allocator.dupe(u8, rule.rule);
+    errdefer allocator.free(rule_owned);
+    const path_owned = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_owned);
+    const preview_owned = try buildPreview(allocator, raw_preview);
+    errdefer allocator.free(preview_owned);
+
     try findings.append(allocator, .{
         .severity = rule.severity,
         .confidence = rule.confidence,
-        .rule = try allocator.dupe(u8, rule.rule),
-        .path = try allocator.dupe(u8, path),
+        .rule = rule_owned,
+        .path = path_owned,
         .line = line_no,
         .source = source,
-        .preview = try buildPreview(allocator, raw_preview),
+        .preview = preview_owned,
         .raw_line = raw_line,
         .detected_value = detected_value,
         .assignment_key = assignment_key,
@@ -874,7 +896,8 @@ fn classifySecretAssignment(
     const value = normalizeValue(assignment.value);
     if (value.len == 0 or looksPlaceholder(value)) return null;
 
-    const known_token = hasTokenPrefix(value);
+    const token_value = findTokenPrefixedValue(value);
+    const known_token = token_value != null;
     const opaque_value = looksOpaqueSecretValue(value);
     const expression = looksLikeExpression(value) and !known_token and !opaque_value;
     const high_risk_keyword = assignment.strong_keyword or assignment.keyword_score >= 4 or isHighRiskKeyword(assignment.key);
@@ -921,7 +944,7 @@ fn classifySecretAssignment(
         .severity = severity,
         .confidence = confidence,
         .rule = if (std.mem.indexOf(u8, path, ".env") != null) "env_secret_assignment" else "secret_assignment",
-        .detected_value = value,
+        .detected_value = token_value orelse value,
         .assignment_key = assignment.key,
         .assignment_operator = assignment.operator,
     };
@@ -1364,6 +1387,18 @@ test "match secret assignment catches aws access key id" {
     try std.testing.expect(assignment.keyword_score >= 2);
 }
 
+test "detect line captures token value for triage envelope" {
+    const rule = detectLine("config.txt", "Authorization: Bearer ghp_abcd1234567890secret", .workspace_file).?;
+    try std.testing.expectEqualStrings("hardcoded_token", rule.rule);
+    try std.testing.expectEqualStrings("ghp_abcd1234567890secret", rule.detected_value.?);
+}
+
+test "detect line captures credential url for triage envelope" {
+    const rule = detectLine("config.env", "DATABASE_URL=postgres://user:pass@example.com/db", .workspace_file).?;
+    try std.testing.expectEqualStrings("credential_in_url", rule.rule);
+    try std.testing.expectEqualStrings("postgres://user:pass@example.com/db", rule.detected_value.?);
+}
+
 test "workspace audit ignores code variable token assignment" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1604,4 +1639,57 @@ test "failure threshold none never fails" {
 
     try std.testing.expect(!report.exceedsThreshold(.none));
     try std.testing.expect(report.exceedsThreshold(.critical));
+}
+
+test "append finding cleans partial allocations on allocation failure" {
+    const rule = DetectedRule{
+        .severity = .high,
+        .confidence = .high,
+        .rule = "hardcoded_token",
+        .detected_value = "ghp_abcd1234567890secret",
+    };
+    const options = Options{
+        .workspace_dir = "/tmp/ws",
+        .triage_mode = .dry_run,
+    };
+
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var counted_findings: std.ArrayListUnmanaged(Finding) = .empty;
+    try appendFinding(
+        counting.allocator(),
+        &counted_findings,
+        options,
+        rule,
+        "config.txt",
+        1,
+        .workspace_file,
+        "Authorization: Bearer ghp_abcd1234567890secret",
+    );
+    const alloc_count = counting.alloc_index;
+    for (counted_findings.items) |*finding| finding.deinit(counting.allocator());
+    counted_findings.deinit(counting.allocator());
+
+    var fail_index: usize = 0;
+    while (fail_index < alloc_count) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        failing.fail_index = fail_index;
+        var findings: std.ArrayListUnmanaged(Finding) = .empty;
+        defer {
+            for (findings.items) |*finding| finding.deinit(failing.allocator());
+            findings.deinit(failing.allocator());
+        }
+
+        appendFinding(
+            failing.allocator(),
+            &findings,
+            options,
+            rule,
+            "config.txt",
+            1,
+            .workspace_file,
+            "Authorization: Bearer ghp_abcd1234567890secret",
+        ) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+    }
 }

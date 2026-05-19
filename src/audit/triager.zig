@@ -94,18 +94,10 @@ pub fn runTriage(
             finding.* = makeEmptyFinding();
             continue;
         };
-        const api_key = options.triage_api_key orelse {
-            stats.errors += 1;
-            std.debug.print("triage: missing api_key for provider {s}\n", .{provider_name});
-            try kept.append(allocator, finding.*);
-            finding.* = makeEmptyFinding();
-            continue;
-        };
-
         var verdict = llm_client.triageEnvelope(allocator, .{
             .name = provider_name,
             .model = model_name,
-            .api_key = api_key,
+            .api_key = options.triage_api_key,
         }, env_json) catch |err| {
             stats.errors += 1;
             std.debug.print("triage: llm call failed for {s}:{?d}: {s}\n", .{

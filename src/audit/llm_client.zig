@@ -3,7 +3,7 @@
 //! Reuses src/providers/ — the same code paths the agent uses for any of:
 //! anthropic, openai, openrouter, ollama, gemini, vertex, custom OpenAI-
 //! compatible. We never speak HTTP directly here; we delegate to
-//! providers.completeWithSystem() and parse the returned text as a Verdict.
+//! the provider vtable/factory and parse the returned text as a Verdict.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -44,9 +44,8 @@ pub const Verdict = struct {
 pub const TriageProvider = struct {
     name: []const u8,
     model: []const u8,
-    api_key: []const u8,
+    api_key: ?[]const u8,
     temperature: f64 = 0.0,
-    max_tokens: ?u64 = 300,
 };
 
 const SYSTEM_PROMPT =
@@ -80,24 +79,34 @@ pub fn triageEnvelope(
     provider: TriageProvider,
     envelope_json: []const u8,
 ) !Verdict {
-    const cfg = .{
-        .api_key = provider.api_key,
-        .default_provider = provider.name,
-        .default_model = @as(?[]const u8, provider.model),
-        .temperature = provider.temperature,
-        .max_tokens = provider.max_tokens,
-    };
+    var holder = triageProviderHolder(allocator, provider);
+    defer holder.deinit();
 
-    const response_text = try providers.completeWithSystem(
+    const response_text = try holder.provider().chatWithSystem(
         allocator,
-        &cfg,
         SYSTEM_PROMPT,
         envelope_json,
+        provider.model,
+        provider.temperature,
     );
     defer allocator.free(response_text);
 
     const trimmed = std.mem.trim(u8, response_text, " \t\r\n");
     return parseVerdictJson(allocator, stripFences(trimmed));
+}
+
+fn triageProviderHolder(allocator: Allocator, provider: TriageProvider) providers.ProviderHolder {
+    return providers.ProviderHolder.fromConfig(
+        allocator,
+        provider.name,
+        provider.api_key,
+        null,
+        true,
+        null,
+        null,
+        false,
+        null,
+    );
 }
 
 fn stripFences(text: []const u8) []const u8 {
@@ -181,4 +190,15 @@ test "stripFences removes markdown code fence" {
     const stripped = stripFences(text);
     try std.testing.expect(std.mem.startsWith(u8, stripped, "{"));
     try std.testing.expect(std.mem.endsWith(u8, stripped, "}"));
+}
+
+test "triage provider holder supports keyless local provider" {
+    var holder = triageProviderHolder(std.testing.allocator, .{
+        .name = "ollama",
+        .model = "llama3.2",
+        .api_key = null,
+    });
+    defer holder.deinit();
+
+    try std.testing.expectEqualStrings("Ollama", holder.provider().getName());
 }

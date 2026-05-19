@@ -3262,6 +3262,8 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
     var options = yc.workspace_audit.Options{
         .workspace_dir = cfg.workspace_dir,
     };
+    var owned_triage_api_key: ?[]u8 = null;
+    defer if (owned_triage_api_key) |key| allocator.free(key);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -3355,12 +3357,14 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
             std_compat.process.exit(1);
         }
         const provider_name = options.triage_provider.?;
-        if (cfg.getProviderKey(provider_name)) |key| {
-            options.triage_api_key = key;
-        } else {
-            std.debug.print("workspace audit: no api_key for provider '{s}'. Set models.providers.{s}.api_key in config.\n", .{ provider_name, provider_name });
-            std_compat.process.exit(1);
-        }
+        owned_triage_api_key = resolveWorkspaceAuditTriageApiKey(allocator, &cfg, provider_name) catch |err| switch (err) {
+            error.NoApiKey => {
+                std.debug.print("workspace audit: no api_key for provider '{s}'. Set providers.{s}.api_key, an environment key, or use a local/keyless provider.\n", .{ provider_name, provider_name });
+                std_compat.process.exit(1);
+            },
+            else => return err,
+        };
+        options.triage_api_key = owned_triage_api_key;
     }
 
     var git_modes: usize = 0;
@@ -3384,6 +3388,22 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
         std_compat.process.exit(1);
     };
     if (exit_code != 0) std_compat.process.exit(exit_code);
+}
+
+fn resolveWorkspaceAuditTriageApiKey(
+    allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
+    provider_name: []const u8,
+) !?[]u8 {
+    if (cfg.getProviderKey(provider_name)) |key| {
+        const trimmed = std.mem.trim(u8, key, " \t\r\n");
+        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    }
+
+    if (yc.provider_probe.providerRequiresApiKey(provider_name, cfg.getProviderBaseUrl(provider_name))) {
+        return (try yc.providers.resolveApiKey(allocator, provider_name, null)) orelse error.NoApiKey;
+    }
+    return null;
 }
 
 fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
@@ -5330,6 +5350,35 @@ test "buildModelsSummaryJson emits sorted provider summaries without key content
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ollama\",\"has_key\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"openrouter\",\"has_key\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "sk-test") == null);
+}
+
+test "resolveWorkspaceAuditTriageApiKey uses configured provider key" {
+    const allocator = std.testing.allocator;
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-test" },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+        .providers = &providers_cfg,
+    };
+
+    const key = (try resolveWorkspaceAuditTriageApiKey(allocator, &cfg, "openrouter")).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("sk-test", key);
+}
+
+test "resolveWorkspaceAuditTriageApiKey allows keyless local provider" {
+    const allocator = std.testing.allocator;
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+    };
+
+    const key = try resolveWorkspaceAuditTriageApiKey(allocator, &cfg, "ollama");
+    try std.testing.expect(key == null);
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {
