@@ -594,7 +594,7 @@ fn appendOpenRouterRequestFields(
 /// HTTP GET via curl subprocess with auth header.
 fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);

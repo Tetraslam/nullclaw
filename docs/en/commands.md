@@ -46,6 +46,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
 | `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
+| `nullclaw acp` | Run the Agent Client Protocol stdio adapter for ACP-compatible editors |
+| `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model for editor-launched sessions |
 
 ### Interactive model routing
 
@@ -59,6 +61,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
 - Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
+- `nullclaw acp` speaks newline-delimited JSON-RPC on stdio. Editors create ACP sessions with an absolute `cwd`; NullClaw forwards that cwd as the workspace for `agent invoke`.
 
 ## Runtime and operations
 
@@ -148,8 +151,21 @@ Notes:
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
 | `nullclaw memory get <key>` | Show one memory entry |
 | `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory export-jsonl --limit 1000` | Export a governed, PII-redacted JSONL dataset from memory |
+| `nullclaw memory hygiene-report --json` | Dry-run exact/normalized duplicate report for memory |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
 | `nullclaw memory forget <key>` | Delete one memory entry |
+
+`memory export-jsonl` emits one JSON object per line with a stable
+`schema_version`, `key`, `category`, `timestamp`, `session_id`, and `content`
+schema. Bootstrap/autosave internals are excluded unless `--include-internal`
+is passed. Content is PII-redacted by default for DS notebooks, model
+evaluation, and external review; use `--include-pii` only for trusted local raw
+exports.
+
+`memory hygiene-report` is non-destructive. It scans the selected memory slice
+and reports exact duplicates plus normalized duplicates where case and
+whitespace differ. It does not delete or rewrite entries.
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 

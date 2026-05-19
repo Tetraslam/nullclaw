@@ -217,6 +217,25 @@ pub const ChatResponse = struct {
     pub fn contentOrEmpty(self: ChatResponse) []const u8 {
         return self.content orelse "";
     }
+
+    pub fn deinit(self: *ChatResponse, allocator: std.mem.Allocator) void {
+        if (self.content) |c| allocator.free(c);
+        if (self.reasoning_content) |rc| allocator.free(rc);
+        if (self.model.len > 0) allocator.free(self.model);
+        if (self.provider.len > 0) allocator.free(self.provider);
+        for (self.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(self.tool_calls);
+        self.content = null;
+        self.tool_calls = &.{};
+        self.usage = .{};
+        self.provider = "";
+        self.model = "";
+        self.reasoning_content = null;
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -818,6 +837,24 @@ test "shouldRecoverPartialStream returns true after partial output" {
 
 test "shouldRecoverPartialStream returns false without output" {
     try std.testing.expect(!shouldRecoverPartialStream(0, false));
+}
+
+test "ChatResponse deinit resets owned fields" {
+    const allocator = std.testing.allocator;
+    var response = ChatResponse{
+        .content = try allocator.dupe(u8, "hello"),
+        .provider = try allocator.dupe(u8, "provider"),
+        .model = try allocator.dupe(u8, "model"),
+        .reasoning_content = try allocator.dupe(u8, "reasoning"),
+    };
+
+    response.deinit(allocator);
+
+    try std.testing.expect(response.content == null);
+    try std.testing.expect(response.reasoning_content == null);
+    try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+    try std.testing.expectEqualStrings("", response.provider);
+    try std.testing.expectEqualStrings("", response.model);
 }
 
 test "emitChatResponseAsStream frees unused chat response fields" {

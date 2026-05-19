@@ -24,6 +24,8 @@ const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
+const governance = @import("governance.zig");
+const redaction = @import("redaction.zig");
 const util = @import("util.zig");
 const onboard = @import("onboard.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
@@ -37,6 +39,7 @@ const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const cost_mod = @import("cost.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -79,12 +82,44 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
     return .{ .slice = preview.slice, .truncated = preview.truncated };
 }
 
+const SafeMessageLogPreview = struct {
+    owned: ?[]u8 = null,
+    slice: []const u8,
+    truncated: bool,
+
+    fn deinit(self: *SafeMessageLogPreview, allocator: Allocator) void {
+        if (self.owned) |owned| allocator.free(owned);
+    }
+};
+
+fn safeMessageLogPreview(allocator: Allocator, text: []const u8) SafeMessageLogPreview {
+    var r = redaction.Redactor.init(allocator, .{});
+    defer r.deinit();
+    const safe_text = r.redact(allocator, text) catch return .{
+        .slice = "[redaction failed]",
+        .truncated = false,
+    };
+    const preview = messageLogPreview(safe_text);
+    return .{
+        .owned = safe_text,
+        .slice = preview.slice,
+        .truncated = preview.truncated,
+    };
+}
+
 test "messageLogPreview keeps UTF-8 intact when truncating" {
     const prefix = "a" ** (MESSAGE_LOG_MAX_BYTES - 1);
     const preview = messageLogPreview(prefix ++ "\xd0\x99tail");
     try std.testing.expectEqualStrings(prefix, preview.slice);
     try std.testing.expect(preview.truncated);
     try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+}
+
+test "safeMessageLogPreview redacts PII" {
+    var preview = safeMessageLogPreview(testing.allocator, "hello user@example.com");
+    defer preview.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, preview.slice, "user@example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, preview.slice, "[EMAIL_1]") != null);
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
@@ -275,6 +310,7 @@ pub const SessionManager = struct {
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
+    cost_tracker: ?cost_mod.CostTracker = null,
 
     /// Result of the startup vision probe against the configured model.
     /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
@@ -341,12 +377,14 @@ pub const SessionManager = struct {
             .verified_bindings = .{},
             .used_claim_nonces = .{},
             .claim_attempts = .{},
+            .cost_tracker = if (config.cost.enabled) cost_mod.CostTracker.init(allocator, config.workspace_dir, config.cost.enabled, config.cost.daily_limit_usd, config.cost.monthly_limit_usd, config.cost.warn_at_percent) else null,
         };
         manager.loadClaimState();
         return manager;
     }
 
     pub fn deinit(self: *SessionManager) void {
+        if (self.cost_tracker) |*tracker| tracker.deinit();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -1422,7 +1460,7 @@ pub const SessionManager = struct {
                 }
             }
         }
-        if (self.config.diagnostics.token_usage_ledger_enabled) {
+        if (self.config.diagnostics.token_usage_ledger_enabled or self.config.cost.enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
@@ -1503,11 +1541,25 @@ pub const SessionManager = struct {
 
     const StreamAdapterCtx = struct {
         sink: streaming.Sink,
+        suppress_live: bool = false,
     };
 
     fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
         const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (adapter.suppress_live and !chunk.is_final) return;
         streaming.forwardProviderChunk(adapter.sink, chunk);
+    }
+
+    fn shouldRehydrateDisplay(session_key: []const u8, conversation_context: ?ConversationContext) bool {
+        const channel = if (conversation_context) |ctx| ctx.channel else null;
+        const is_group = if (conversation_context) |ctx| ctx.is_group else null;
+        return governance.shouldRehydrateDisplay(session_key, channel, is_group);
+    }
+
+    fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8, display_rehydrate_allowed: bool) bool {
+        if (!display_rehydrate_allowed) return false;
+        const r = redactor orelse return false;
+        return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
     }
 
     fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
@@ -1594,6 +1646,13 @@ pub const SessionManager = struct {
     fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
         self.usage_log_mutex.lock();
         defer self.usage_log_mutex.unlock();
+
+        if (self.cost_tracker) |*tracker| {
+            const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+            tracker.recordUsage(usage) catch |err| {
+                log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+            };
+        }
 
         const ledger_path = self.usageLedgerPath() orelse return;
         defer self.allocator.free(ledger_path);
@@ -1734,7 +1793,8 @@ pub const SessionManager = struct {
             log.info("message receipt channel={s} session=0x{x} bytes={d}", .{ channel, session_hash, content.len });
         }
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(content);
+            var preview = safeMessageLogPreview(self.allocator, content);
+            defer preview.deinit(self.allocator);
             log.info(
                 "message inbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{
@@ -1749,7 +1809,8 @@ pub const SessionManager = struct {
 
         if (self.maybeHandleClaimGate(session_key, content, conversation_context)) |gate_reply| {
             if (self.config.diagnostics.log_message_payloads) {
-                const preview = messageLogPreview(gate_reply);
+                var preview = safeMessageLogPreview(self.allocator, gate_reply);
+                defer preview.deinit(self.allocator);
                 log.info(
                     "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                     .{
@@ -1786,9 +1847,12 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = prev_stream_ctx;
         }
 
+        const display_rehydrate_allowed = shouldRehydrateDisplay(session_key, conversation_context);
+
         var stream_adapter: StreamAdapterCtx = undefined;
         if (stream_sink) |sink| {
-            stream_adapter = .{ .sink = sink };
+            const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
+            stream_adapter = .{ .sink = sink, .suppress_live = suppress_live };
             session.agent.stream_callback = streamChunkForwarder;
             session.agent.stream_ctx = @ptrCast(&stream_adapter);
         } else {
@@ -1868,14 +1932,27 @@ pub const SessionManager = struct {
 
         // Persist messages via session store
         if (session.agent.session_store) |store| {
+            const persisted_content = if (session.agent.redactor) |r|
+                r.redact(self.allocator, content) catch null
+            else
+                null;
+            defer if (persisted_content) |text| self.allocator.free(text);
+
+            const persisted_response = if (session.agent.redactor) |r|
+                r.redact(self.allocator, response) catch null
+            else
+                null;
+            defer if (persisted_response) |text| self.allocator.free(text);
+
             turn_persistence.persistTurn(store, .{
                 .history = session.agent.history.items,
                 .total_tokens = session.agent.total_tokens,
-            }, session_key, content, response);
+            }, session_key, persisted_content orelse content, persisted_response orelse response);
         }
 
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(response);
+            var preview = safeMessageLogPreview(self.allocator, response);
+            defer preview.deinit(self.allocator);
             log.info(
                 "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{
@@ -1886,6 +1963,16 @@ pub const SessionManager = struct {
                     if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
+        }
+
+        if (display_rehydrate_allowed) {
+            if (session.agent.redactor) |r| {
+                if (r.wouldRehydrate()) {
+                    const display_response = try r.unredact(self.allocator, response);
+                    self.allocator.free(response);
+                    return display_response;
+                }
+            }
         }
 
         return response;
@@ -2430,7 +2517,11 @@ const LateInjectionProvider = struct {
 
 const CapturePromptProvider = struct {
     response: []const u8 = "ok",
-    captured_system: ?[]const u8 = null,
+    captured_system: ?[]u8 = null,
+    /// Allocator used to dup `captured_system` so the test can read it after
+    /// `agent.turn()` returns and the per-turn arena (where request.messages
+    /// live) has been freed. Set by the test before calling `provider()`.
+    capture_alloc: ?Allocator = null,
 
     const vtable = Provider.VTable{
         .chatWithSystem = chatWithSystem,
@@ -2464,7 +2555,10 @@ const CapturePromptProvider = struct {
     ) anyerror!providers.ChatResponse {
         const self: *CapturePromptProvider = @ptrCast(@alignCast(ptr));
         if (request.messages.len > 0 and request.messages[0].role == .system) {
-            self.captured_system = request.messages[0].content;
+            if (self.capture_alloc) |alloc| {
+                if (self.captured_system) |old| alloc.free(old);
+                self.captured_system = try alloc.dupe(u8, request.messages[0].content);
+            }
         }
         return .{ .content = try allocator.dupe(u8, self.response) };
     }
@@ -2880,6 +2974,45 @@ test "usage ledger appends records when retention limits are disabled" {
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
 }
 
+test "cost tracker records usage when diagnostics ledger is disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.cost.enabled = true;
+    cfg.diagnostics.token_usage_ledger_enabled = false;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 201,
+        .provider = "p1",
+        .model = "gpt-4o",
+        .usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 },
+        .success = true,
+    });
+
+    const tracker = if (sm.cost_tracker) |*value| value else return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), tracker.requestCount());
+
+    const file = try std_compat.fs.openFileAbsolute(tracker.storage_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"model\":\"gpt-4o\"") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"input_tokens\":10") != null);
+}
+
 test "usage ledger resets when max line limit is reached" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3241,7 +3374,8 @@ test "getOrCreate preserves named agent system prompt when workspace_path is set
     try testing.expectEqualStrings(expected_prompt, session.agent.profile_system_prompt.?);
     try expectPathEndsWith(session.agent.workspace_dir, "/agents/coder-agent");
 
-    var capture = CapturePromptProvider{};
+    var capture = CapturePromptProvider{ .capture_alloc = testing.allocator };
+    defer if (capture.captured_system) |c| testing.allocator.free(c);
     session.agent.provider = capture.provider();
 
     const response = try session.agent.turn("hello");
@@ -4107,6 +4241,105 @@ test "processMessageStreaming forwards provider deltas" {
     try testing.expectEqualStrings("streaming reply", collector.data.items);
 }
 
+test "processMessageStreaming suppresses redacted chunks and returns display response" {
+    var mock = MockStreamingProvider{ .response = "sent to [EMAIL_1]" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const session_key = "stream:redaction";
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "please email alice@example.com",
+        null,
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+        null,
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("sent to alice@example.com", resp);
+    try testing.expectEqualStrings("", collector.data.items);
+
+    const detailed = try sqlite_mem.sessionStore().loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
+}
+
+test "processMessageStreaming does not rehydrate placeholders for group sessions" {
+    var mock = MockStreamingProvider{ .response = "sent to [EMAIL_1]" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const session_key = "telegram:main:group:-1001";
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "please email alice@example.com",
+        .{
+            .channel = "telegram",
+            .is_group = true,
+        },
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+        null,
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("sent to [EMAIL_1]", resp);
+    try testing.expectEqualStrings("sent to [EMAIL_1]", collector.data.items);
+
+    const detailed = try sqlite_mem.sessionStore().loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
+    }
+}
+
 test "processMessageStreaming forwards tool progress hints" {
     var provider = SummaryFailureProvider{};
     var probe_tool = ProbeTool{};
@@ -4470,6 +4703,42 @@ test "restored session reconstructs token count from persisted assistant replies
     var expected_line_buf: [64]u8 = undefined;
     const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
     try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
+}
+
+test "processMessage session persistence redacts PII" {
+    var mock = MockProvider{ .response = "assistant saw user@example.com" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:privacy";
+    const reply = try sm.processMessage(session_key, "hello user@example.com", null);
+    defer testing.allocator.free(reply);
+
+    const store = sqlite_mem.sessionStore();
+    const detailed = try store.loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "user@example.com") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
 }
 
 test "restored session token reconstruction ignores usage footer decorations" {

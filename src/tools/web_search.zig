@@ -65,7 +65,7 @@ pub const WebSearchTool = struct {
     timeout_secs: u64 = DEFAULT_TIMEOUT_SECS,
 
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web. Providers: searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina. Configure via http_request.search_provider/search_fallback_providers and API key env vars.";
+    pub const tool_description = "Search the internet for real-time information, recipes, news, or technical documentation that might not be in your local knowledge base. Use this whenever the user asks for information from the web or the internet.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina)"}},"required":["query"]}
     ;
@@ -363,10 +363,6 @@ pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8,
     return search_providers.searxng.formatResults(allocator, json_body, query);
 }
 
-fn formatDuckDuckGoResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8, count: usize) !ToolResult {
-    return search_providers.duckduckgo.formatResults(allocator, json_body, query, count);
-}
-
 // ══════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════
@@ -625,27 +621,6 @@ test "formatSearxngResults parses valid JSON" {
     try testing.expect(std.mem.indexOf(u8, result.output, "https://docs.searxng.org") != null);
 }
 
-test "formatDuckDuckGoResults parses related topics" {
-    const json =
-        \\{
-        \\  "Heading": "Zig",
-        \\  "AbstractText": "",
-        \\  "AbstractURL": "",
-        \\  "RelatedTopics": [
-        \\    {"Text": "Zig - Programming language", "FirstURL": "https://ziglang.org"},
-        \\    {"Topics": [
-        \\      {"Text": "Ziglang docs - Official docs", "FirstURL": "https://ziglang.org/documentation/master/"}
-        \\    ]}
-        \\  ]
-        \\}
-    ;
-    const result = try formatDuckDuckGoResults(testing.allocator, json, "zig", 5);
-    defer testing.allocator.free(result.output);
-    try testing.expect(result.success);
-    try testing.expect(std.mem.indexOf(u8, result.output, "1. Zig") != null);
-    try testing.expect(std.mem.indexOf(u8, result.output, "https://ziglang.org") != null);
-}
-
 test "formatBraveResults empty results" {
     const json = "{\"web\":{\"results\":[]}}";
     const result = try formatBraveResults(testing.allocator, json, "nothing");
@@ -670,4 +645,8 @@ test "formatBraveResults invalid JSON" {
 test "formatSearxngResults invalid JSON" {
     const result = try formatSearxngResults(testing.allocator, "not json", "q");
     try testing.expect(!result.success);
+}
+
+test {
+    _ = search_providers;
 }

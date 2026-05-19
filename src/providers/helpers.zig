@@ -627,7 +627,7 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
@@ -647,7 +647,7 @@ pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);

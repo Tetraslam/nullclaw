@@ -14,7 +14,9 @@ const command_summary = @import("../command_summary.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 const log = std.log.scoped(.shell);
 const Sandbox = @import("../security/sandbox.zig").Sandbox;
+const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
 const SandboxStorage = @import("../security/sandbox.zig").SandboxStorage;
+const createSandbox = @import("../security/sandbox.zig").createSandbox;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -142,6 +144,9 @@ pub const ShellTool = struct {
     // Storage for sandbox backends; must outlive the ShellTool.
     // This is part of the vtable ownership pattern: the tool creator owns the storage.
     sandbox_storage: SandboxStorage = .{},
+    sandbox_backend: ?SandboxBackend = null,
+    sandbox_allocator: ?std.mem.Allocator = null,
+    sandbox_mu: std_compat.sync.Mutex = .{},
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
@@ -155,6 +160,19 @@ pub const ShellTool = struct {
             .ptr = @ptrCast(self),
             .vtable = &vtable,
         };
+    }
+
+    fn ensureSandbox(self: *ShellTool) ?Sandbox {
+        self.sandbox_mu.lock();
+        defer self.sandbox_mu.unlock();
+
+        if (self.sandbox != null or self.sandbox_backend == null) return self.sandbox;
+
+        const backend = self.sandbox_backend orelse return self.sandbox;
+        const allocator = self.sandbox_allocator orelse return self.sandbox;
+        self.sandbox = createSandbox(allocator, backend, self.workspace_dir, &self.sandbox_storage);
+        self.sandbox_backend = null;
+        return self.sandbox;
     }
 
     pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -186,6 +204,8 @@ pub const ShellTool = struct {
             };
         }
 
+        const sandbox = self.ensureSandbox();
+
         // Determine working directory
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {
             // cwd must be absolute
@@ -209,7 +229,7 @@ pub const ShellTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        if (sandboxRestrictsToWorkspace(self.sandbox)) {
+        if (sandboxRestrictsToWorkspace(sandbox)) {
             const resolved_cwd = fs_compat.realpathAllocPath(allocator, effective_cwd) catch
                 return ToolResult.fail("sandboxed cwd must stay within workspace");
             defer allocator.free(resolved_cwd);
@@ -239,7 +259,7 @@ pub const ShellTool = struct {
             const ws_resolved: ?[]const u8 = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
             const ws_for_check = ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL;
-            const sandbox_allowed_paths = if (sandboxRestrictsToWorkspace(self.sandbox))
+            const sandbox_allowed_paths = if (sandboxRestrictsToWorkspace(sandbox))
                 &.{}
             else
                 self.allowed_paths;
@@ -285,7 +305,7 @@ pub const ShellTool = struct {
 
         // Apply sandbox wrapper if configured.
         var wrap_buf: [512][]const u8 = undefined;
-        const final_argv = try wrapCommandArgv(self.sandbox, base_argv, &wrap_buf);
+        const final_argv = try wrapCommandArgv(sandbox, base_argv, &wrap_buf);
 
         // Execute command.
         const result = try proc.run(allocator, final_argv, .{
@@ -1160,4 +1180,47 @@ test "shell with sandbox wrapper executes command" {
 
     try std.testing.expect(result.success);
     try std.testing.expectEqualStrings("test", result.output);
+}
+
+test "shell lazily initializes configured sandbox on first execute" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox_backend = .none,
+        .sandbox_allocator = std.testing.allocator,
+    };
+    try std.testing.expect(st.sandbox == null);
+    try std.testing.expectEqual(SandboxBackend.none, st.sandbox_backend.?);
+
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"printf lazy\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("lazy", result.output);
+    try std.testing.expect(st.sandbox != null);
+    try std.testing.expect(st.sandbox_backend == null);
+    try std.testing.expectEqualStrings("none", st.sandbox.?.name());
+}
+
+test "shell missing command does not initialize lazy sandbox" {
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox_backend = .none,
+        .sandbox_allocator = std.testing.allocator,
+    };
+    const parsed = try root.parseTestArgs("{}");
+    defer parsed.deinit();
+
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+
+    // Regression: invalid shell invocations must not trigger sandbox probes.
+    try std.testing.expect(!result.success);
+    try std.testing.expect(st.sandbox == null);
+    try std.testing.expectEqual(SandboxBackend.none, st.sandbox_backend.?);
 }

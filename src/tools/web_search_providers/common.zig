@@ -160,6 +160,82 @@ pub fn formatJinaPlainText(allocator: std.mem.Allocator, text: []const u8, query
     return ToolResult{ .success = true, .output = output };
 }
 
+pub fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const h1 = std.fmt.charToDigit(input[i + 1], 16) catch {
+                try buf.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            const h2 = std.fmt.charToDigit(input[i + 2], 16) catch {
+                try buf.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            try buf.append(allocator, @as(u8, @intCast(h1 << 4 | h2)));
+            i += 3;
+        } else if (input[i] == '+') {
+            try buf.append(allocator, ' ');
+            i += 1;
+        } else {
+            try buf.append(allocator, input[i]);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn stripTags(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < html.len) {
+        if (html[i] == '<') {
+            const end = std.mem.indexOfScalarPos(u8, html, i + 1, '>') orelse {
+                try buf.append(allocator, html[i]);
+                i += 1;
+                continue;
+            };
+            i = end + 1;
+        } else if (html[i] == '&') {
+            const end = std.mem.indexOfScalarPos(u8, html, i + 1, ';') orelse {
+                try buf.append(allocator, html[i]);
+                i += 1;
+                continue;
+            };
+            const entity = html[i .. end + 1];
+            if (std.mem.eql(u8, entity, "&quot;")) {
+                try buf.append(allocator, '"');
+            } else if (std.mem.eql(u8, entity, "&amp;")) {
+                try buf.append(allocator, '&');
+            } else if (std.mem.eql(u8, entity, "&#39;")) {
+                try buf.append(allocator, '\'');
+            } else if (std.mem.eql(u8, entity, "&lt;")) {
+                try buf.append(allocator, '<');
+            } else if (std.mem.eql(u8, entity, "&gt;")) {
+                try buf.append(allocator, '>');
+            } else if (std.mem.eql(u8, entity, "&nbsp;")) {
+                try buf.append(allocator, ' ');
+            } else if (std.mem.eql(u8, entity, "&rsquo;") or std.mem.eql(u8, entity, "&lsquo;")) {
+                try buf.append(allocator, '\'');
+            } else if (std.mem.eql(u8, entity, "&ldquo;") or std.mem.eql(u8, entity, "&rdquo;")) {
+                try buf.append(allocator, '"');
+            } else {
+                try buf.appendSlice(allocator, entity);
+            }
+            i = end + 1;
+        } else {
+            try buf.append(allocator, html[i]);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 pub fn noWebResults(allocator: std.mem.Allocator) !ToolResult {
     return .{ .success = true, .output = try allocator.dupe(u8, NO_WEB_RESULTS_MESSAGE) };
 }
@@ -271,4 +347,18 @@ test "requireArrayField rejects missing field" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidResponse, requireArrayField(parsed.object, "results"));
+}
+
+test "stripTags" {
+    const html = "Hello <b>World</b> &amp; &quot;Quotes&quot; &rsquo; &ldquo;Test&rdquo;";
+    const stripped = try stripTags(std.testing.allocator, html);
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expectEqualStrings("Hello World & \"Quotes\" ' \"Test\"", stripped);
+}
+
+test "urlDecode" {
+    const input = "https%3A%2F%2Fexample.com%2F%3Fq%3Dfoo%2Bbar+baz%20qux";
+    const decoded = try urlDecode(std.testing.allocator, input);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("https://example.com/?q=foo+bar baz qux", decoded);
 }

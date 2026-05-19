@@ -14,6 +14,7 @@ pub fn renderBytes(
     errdefer out.deinit(allocator);
 
     var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    errdefer out_writer.deinit();
     try @call(.auto, render_fn, .{&out_writer.writer} ++ args);
     out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);

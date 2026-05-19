@@ -17,6 +17,7 @@
 **看完先去哪里**
 
 - 还没跑起来：先看 [安装指南](./installation.md)
+- Debian 源码构建还缺 Zig：先看 [Zig 安装指南](./zig-installation.md)
 - 已经装好，准备接 provider / memory / channel：看 [配置指南](./configuration.md)
 - 只想找命令：直接去 [命令参考](./commands.md)
 
@@ -77,6 +78,7 @@ MS:
 
 BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，从这里开始
 - [安装指南](./installation.md)
+- [Zig 安装指南](./zig-installation.md)
 - [Termux 指南](./termux.md)
 - [配置指南](./configuration.md)
 - [使用与运维](./usage.md)
@@ -94,7 +96,7 @@ BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，
 
 ## 先看这 3 条
 
-1. NullClaw 当前要求 **Zig 0.16.0**（精确版本）。
+1. NullClaw 当前要求 **Zig 0.16.0**（精确版本）；Debian 安装见 [Zig 安装指南](./zig-installation.md)。
 2. 默认配置文件路径为 `~/.nullclaw/config.json`（由 `nullclaw onboard` 生成）。
 3. 首次上手建议先跑 `onboard --interactive`，再用 `agent` 和 `gateway` 验证。
 

@@ -24,7 +24,7 @@ This guide covers the main installation paths for macOS, Linux, and Windows.
 
 ## Prerequisites
 
-- If building from source, use **Zig 0.16.0**.
+- If building from source, use **Zig 0.16.0**. See [Zig Installation](./zig-installation.md) for Debian setup.
 - Git (required for source install).
 
 Check Zig version:

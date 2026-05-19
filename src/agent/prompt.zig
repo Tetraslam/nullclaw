@@ -405,6 +405,13 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Example: `echo \"Time is up!\"`\n");
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 
+    // Web Search guidance
+    try w.writeAll("## External Information and Web Search\n\n");
+    try w.writeAll("- If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n");
+    try w.writeAll("- Do not merely state that you can find the information; execute the tool call in the same turn.\n");
+    try w.writeAll("- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n");
+    try w.writeAll("- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n");
+
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.observer);
 

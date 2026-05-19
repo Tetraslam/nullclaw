@@ -35,6 +35,62 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 | Resource limits | Enabled | Configurable memory/CPU/subprocess limits |
 | Audit logging | Enabled | Optional audit trail with retention policy |
 
+## Privacy Redaction Boundary
+
+When PII redaction is enabled, NullClaw replaces detected sensitive values with
+deterministic placeholders such as `[EMAIL_1]`, `[PHONE_1]`, or `[CARD_1]`
+before provider calls, local session persistence, memory autosave, diagnostics,
+and vector embedding sync.
+
+The reusable redactor defaults to one-way operation: it keys values by
+HMAC-SHA256 fingerprints and does not retain the original plaintext. The agent
+uses an opt-in in-memory reverse map for its per-conversation redactor so it can
+rehydrate placeholders for same-principal, single-user display paths. Shared
+channel, group, and thread sessions keep placeholders in the outbound response.
+Tool arguments keep literal placeholders by default; this prevents provider
+output from becoming a provider-to-tool exfiltration channel. The reverse map
+lives only in process RAM, is bounded, is reset with the conversation, and is
+not written to memory, history, JSONL export, or diagnostics.
+
+The redactor is a lightweight text scanner, not a full DLP/OCR engine. It covers
+common text forms for emails, phone numbers, Luhn-valid cards, anchored
+passport/ID values, and token/secret patterns. Binary image contents, OCR text,
+EXIF metadata, and unsupported locale-specific document formats are outside
+this boundary unless another tool extracts them as text first.
+
+## Governed Memory Workflows
+
+Use `nullclaw memory export-jsonl` when memory needs to become a DS artifact.
+The command emits JSONL with a stable schema and excludes bootstrap/autosave
+internal entries by default. Content is PII-redacted by default. Use
+`--include-pii` only when exporting inside a trusted local boundary; the older
+`--redact-pii` flag is still accepted as a compatibility no-op.
+
+Use `nullclaw memory hygiene-report` before cleanup work. The command is always
+a dry run: it reports exact and normalized duplicate groups without deleting,
+rewriting, or reindexing memory entries.
+
+## On-Demand Anonymization Tool
+
+The `anonymize_text` tool exposes the same lightweight redaction primitive to
+the agent for one-off text snippets. It accepts a required `text` field and
+optional `redact_email`, `redact_phone`, `redact_card`, `redact_id`, and
+`redact_tokens` booleans. All categories are enabled by default; explicitly
+disabled categories pass through unchanged.
+
+The model-facing `sqlite_query` tool always returns redacted results. Raw
+sensitive SQLite output is not exposed through the agent tool schema. It also
+rejects common text transform / encoding functions such as `hex(...)` and
+`substr(...)`, because those can turn PII into a form the text redactor cannot
+recover after query execution.
+
+Each call uses a fresh one-way redactor, so placeholder counters restart from
+`[EMAIL_1]` / `[PHONE_1]` inside that call and no plaintext reverse map is kept
+after the tool returns. Use it before putting user-supplied text into tickets,
+notebooks, logs, exports, or downstream tools that do not need the original
+sensitive values. The tool is text-only and bounded to 256 KiB input; it does
+not inspect binary image contents, OCR text, or EXIF metadata.
+
 ## Channel Allowlists
 
 - `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.

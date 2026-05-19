@@ -190,10 +190,23 @@ fn prepareCurlBodyArg(
     return prepared;
 }
 
+/// Content delta from an SSE chunk.
+pub const DeltaContent = union(enum) {
+    text: []const u8,
+    reasoning: []const u8,
+
+    pub fn deinit(self: DeltaContent, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .text => |t| allocator.free(t),
+            .reasoning => |r| allocator.free(r),
+        }
+    }
+};
+
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
-    /// Text delta content (owned, caller frees).
-    delta: []const u8,
+    /// Text or reasoning delta content (owned, caller frees).
+    delta: DeltaContent,
     /// Stream is complete ([DONE] sentinel).
     done: void,
     /// Token usage from a stream chunk.
@@ -201,6 +214,48 @@ pub const SseLineResult = union(enum) {
     /// Line should be skipped (empty, comment, or no content).
     skip: void,
 };
+
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
+
+fn closeReasoningBlock(
+    allocator: std.mem.Allocator,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    in_reasoning: *bool,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !void {
+    if (!in_reasoning.*) return;
+    in_reasoning.* = false;
+    try accumulated.appendSlice(allocator, THINK_CLOSE_TAG);
+    callback(ctx, root.StreamChunk.textDelta(THINK_CLOSE_TAG));
+}
+
+fn appendDeltaContent(
+    allocator: std.mem.Allocator,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    in_reasoning: *bool,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+    content: DeltaContent,
+) !void {
+    switch (content) {
+        .text => |text| {
+            try closeReasoningBlock(allocator, accumulated, in_reasoning, callback, ctx);
+            try accumulated.appendSlice(allocator, text);
+            callback(ctx, root.StreamChunk.textDelta(text));
+        },
+        .reasoning => |reasoning| {
+            if (!in_reasoning.*) {
+                in_reasoning.* = true;
+                try accumulated.appendSlice(allocator, THINK_OPEN_TAG);
+                callback(ctx, root.StreamChunk.textDelta(THINK_OPEN_TAG));
+            }
+            try accumulated.appendSlice(allocator, reasoning);
+            callback(ctx, root.StreamChunk.textDelta(reasoning));
+        },
+    }
+}
 
 /// Parse a single SSE line in OpenAI streaming format.
 ///
@@ -237,8 +292,11 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
 /// The final chunk typically has `choices:[]` and a top-level `usage` object.
+/// OpenAI usage chunks may contain nested objects (prompt_tokens_details,
+/// completion_tokens_details) so we use a generous 32 KB stack buffer.
 fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
-    var buf: [4096]u8 = undefined;
+    // 32 KB is sufficient for OpenAI's nested usage objects.
+    var buf: [32 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const alloc = fba.allocator();
 
@@ -246,32 +304,63 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
         return null;
     defer parsed.deinit();
 
+    if (parsed.value != .object) return null;
     const obj = parsed.value.object;
     const usage_val = obj.get("usage") orelse return null;
     if (usage_val != .object) return null;
 
     var usage = root.TokenUsage{};
-    if (usage_val.object.get("prompt_tokens")) |v| {
-        if (v == .integer) usage.prompt_tokens = @intCast(v.integer);
+    // Handle prompt_tokens (OpenAI) or input_tokens (Anthropic/some compatible)
+    const prompt_val = usage_val.object.get("prompt_tokens") orelse
+        usage_val.object.get("input_tokens");
+    if (prompt_val) |v| {
+        switch (v) {
+            .integer => |n| usage.prompt_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.prompt_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
     }
-    if (usage_val.object.get("completion_tokens")) |v| {
-        if (v == .integer) usage.completion_tokens = @intCast(v.integer);
+
+    const completion_val = usage_val.object.get("completion_tokens") orelse
+        usage_val.object.get("output_tokens");
+    if (completion_val) |v| {
+        switch (v) {
+            .integer => |n| usage.completion_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.completion_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
     }
+
     if (usage_val.object.get("total_tokens")) |v| {
-        if (v == .integer) usage.total_tokens = @intCast(v.integer);
+        switch (v) {
+            .integer => |n| usage.total_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.total_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
+    } else {
+        usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
     }
+
+    // Require at least one non-zero field to treat this as a valid usage chunk.
+    // This guards against "usage":null being coerced into a zero struct.
+    if (usage.prompt_tokens == 0 and usage.completion_tokens == 0 and usage.total_tokens == 0) {
+        return null;
+    }
+
     return usage;
 }
 
-/// Extract visible streaming text from an SSE JSON payload.
-/// Falls back to `delta.reasoning`, `delta.reasoning_content`, or
-/// `delta.reasoning_details` when providers stream their thinking trace
-/// separately and wraps it in think tags so higher layers can suppress it
-/// from user-visible output.
-/// Returns owned slice or null if no content found.
-pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
+/// Extract visible streaming text or reasoning from an SSE JSON payload.
+/// Returns owned DeltaContent or null if no content found.
+pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?DeltaContent {
+    if (verbose.isVerbose()) {
+        log.debug("SSE JSON: {s}", .{json_str});
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{ json_str, @errorName(err) });
         return error.InvalidSseJson;
+    };
     defer parsed.deinit();
 
     const obj = parsed.value.object;
@@ -284,29 +373,25 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     const delta = first.object.get("delta") orelse return null;
     if (delta != .object) return null;
 
+    // Check content first, but only if not empty
     if (delta.object.get("content")) |content| {
         if (content == .string and content.string.len > 0) {
-            return try allocator.dupe(u8, content.string);
+            return .{ .text = try allocator.dupe(u8, content.string) };
         }
     }
 
-    if (delta.object.get("reasoning")) |reasoning| {
-        if (reasoning == .string and reasoning.string.len > 0) {
-            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning.string});
-        }
-    }
-
-    if (delta.object.get("reasoning_content")) |reasoning_content| {
-        if (reasoning_content == .string and reasoning_content.string.len > 0) {
-            const wrapped = try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_content.string});
-            return wrapped;
-        }
-    }
-
-    if (delta.object.get("reasoning_details")) |reasoning_details| {
-        if (try root.extractReasoningTextFromDetails(allocator, reasoning_details)) |reasoning_text| {
-            defer allocator.free(reasoning_text);
-            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_text});
+    // Fallback to various reasoning fields
+    const reasoning_keys = [_][]const u8{ "reasoning", "reasoning_content", "reasoning_details" };
+    for (reasoning_keys) |key| {
+        if (delta.object.get(key)) |val| {
+            if (val == .string and val.string.len > 0) {
+                return .{ .reasoning = try allocator.dupe(u8, val.string) };
+            }
+            if (std.mem.eql(u8, key, "reasoning_details") and val == .array) {
+                if (try root.extractReasoningTextFromDetails(allocator, val)) |text| {
+                    return .{ .reasoning = text };
+                }
+            }
         }
     }
 
@@ -462,6 +547,7 @@ pub fn curlStream(
     var saw_done = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
+    var in_reasoning = false;
 
     outer: while (true) {
         const n = stdout_file.read(&read_buf) catch |err| {
@@ -518,10 +604,9 @@ pub fn curlStream(
                 };
                 line_buf.clearRetainingCapacity();
                 switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
+                    .delta => |content| {
+                        defer content.deinit(allocator);
+                        try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                     },
                     .usage => |u| stream_usage = u,
                     .done => {
@@ -549,10 +634,9 @@ pub fn curlStream(
         line_buf.clearRetainingCapacity();
         if (trailing) |result| {
             switch (result) {
-                .delta => |text| {
-                    defer allocator.free(text);
-                    try accumulated.appendSlice(allocator, text);
-                    callback(ctx, root.StreamChunk.textDelta(text));
+                .delta => |content| {
+                    defer content.deinit(allocator);
+                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                 },
                 .usage => |u| stream_usage = u,
                 .done => {},
@@ -577,6 +661,7 @@ pub fn curlStream(
         log.err("curlStream child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
+            try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, stream_usage);
         }
@@ -589,6 +674,7 @@ pub fn curlStream(
         .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
+                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
@@ -597,6 +683,7 @@ pub fn curlStream(
         else => {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
+                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
@@ -605,6 +692,7 @@ pub fn curlStream(
     }
 
     // Signal stream completion only after curl exits successfully.
+    try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
     return finalizeStreamResult(allocator, accumulated.items, stream_usage);
 }
@@ -886,9 +974,9 @@ test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |text| {
-            defer allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
+        .delta => |d| {
+            defer d.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", d.text);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -898,9 +986,9 @@ test "parseSseLine valid delta without optional space" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |text| {
-            defer allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
+        .delta => |d| {
+            defer d.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", d.text);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -999,9 +1087,9 @@ test "parseSseLine invalid JSON" {
 
 test "extractDeltaContent with content" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("world", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("world", d.text);
 }
 
 test "extractDeltaContent without content" {
@@ -1016,42 +1104,77 @@ test "extractDeltaContent empty content" {
 
 test "extractDeltaContent falls back to reasoning_content when content empty" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 // Regression: OpenRouter's documented chat stream uses delta.reasoning.
 test "extractDeltaContent falls back to reasoning when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 test "extractDeltaContent falls back to reasoning_content when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 // Regression: OpenRouter's current normalized streaming shape uses reasoning_details.
 test "extractDeltaContent falls back to reasoning_details when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(
+    const d = (try extractDeltaContent(
         allocator,
         "{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"plan\"},{\"type\":\"reasoning.text\",\"text\":\"step by step\"}]}}]}",
     )).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>plan\nstep by step</think>", result);
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("plan\nstep by step", d.reasoning);
 }
 
 test "extractDeltaContent prefers visible content over reasoning_content" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("final answer", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("final answer", d.text);
+}
+
+test "appendDeltaContent closes reasoning before final" {
+    const Collector = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var collector = Collector{};
+    defer collector.buf.deinit(allocator);
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(allocator);
+
+    var in_reasoning = false;
+    const content = DeltaContent{ .reasoning = try allocator.dupe(u8, "private") };
+    defer content.deinit(allocator);
+
+    try appendDeltaContent(allocator, &accumulated, &in_reasoning, Collector.callback, @ptrCast(&collector), content);
+    try closeReasoningBlock(allocator, &accumulated, &in_reasoning, Collector.callback, @ptrCast(&collector));
+    Collector.callback(@ptrCast(&collector), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expect(!in_reasoning);
+    try std.testing.expectEqualStrings("<think>private</think>", accumulated.items);
+    try std.testing.expectEqualStrings("<think>private</think>", collector.buf.items);
 }
 
 test "extractDeltaContent empty reasoning_content returns null" {
@@ -1192,4 +1315,35 @@ test "parseSseLine extracts usage from final chunk" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+// Regression: OpenAI usage chunks contain nested objects (prompt_tokens_details,
+// completion_tokens_details) that exceeded the old 4096-byte FixedBufferAllocator,
+// silently returning null from extractStreamUsage and causing prompt_tokens=0.
+test "parseSseLine extracts usage from OpenAI nested usage chunk" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"id\":\"chatcmpl-De08d\",\"object\":\"chat.completion.chunk\"," ++
+        "\"created\":1778426023,\"model\":\"gpt-4o-2024-08-06\"," ++
+        "\"service_tier\":\"default\",\"system_fingerprint\":\"fp_5acb5510d6\"," ++
+        "\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18," ++
+        "\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0}," ++
+        "\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0," ++
+        "\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}}}";
+    const result = try parseSseLine(allocator, line);
+    switch (result) {
+        .usage => |u| {
+            try std.testing.expectEqual(@as(u32, 9), u.prompt_tokens);
+            try std.testing.expectEqual(@as(u32, 9), u.completion_tokens);
+            try std.testing.expectEqual(@as(u32, 18), u.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "extractStreamUsage returns null for null usage field" {
+    // Intermediate OpenAI chunks have "usage":null — must not produce a zero struct.
+    const json =
+        \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
+    ;
+    try std.testing.expect(extractStreamUsage(json) == null);
 }

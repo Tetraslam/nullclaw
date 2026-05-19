@@ -263,6 +263,150 @@ pub const TagFilter = struct {
 const std = @import("std");
 
 // ---------------------------------------------------------------------------
+// ThinkPassthroughFilter — replaces <think>…</think> with a visible block
+// instead of stripping it. Used when reasoning_mode == .stream so that
+// thinking content appears live in the CLI.
+// ---------------------------------------------------------------------------
+
+/// Header emitted in place of `<think>` tag.
+pub const THINK_HEADER = "\n💭 Thinking:\n";
+/// Footer emitted in place of `</think>` tag.
+pub const THINK_FOOTER = "\n---\n";
+
+pub const ThinkPassthroughFilter = struct {
+    inner: Sink,
+    state: State = .passthrough,
+    buf: [max_buf_len]u8 = undefined,
+    buf_len: usize = 0,
+
+    const State = enum {
+        passthrough, // normal text — pass through verbatim
+        maybe_open, // saw '<', buffering to check for '<think>'
+        inside_think, // inside <think>…</think>, pass body through
+        maybe_close, // inside think, saw '<', buffering for '</think>'
+    };
+
+    const open_tag = "<think>";
+    const close_tag = "</think>";
+    const max_buf_len = close_tag.len + 1;
+
+    pub fn init(inner: Sink) ThinkPassthroughFilter {
+        return .{ .inner = inner };
+    }
+
+    pub fn sink(self: *ThinkPassthroughFilter) Sink {
+        return .{
+            .callback = filterCallback,
+            .ctx = @ptrCast(self),
+        };
+    }
+
+    fn filterCallback(ctx: *anyopaque, event: Event) void {
+        const self: *ThinkPassthroughFilter = @ptrCast(@alignCast(ctx));
+        if (event.stage == .final) {
+            self.flushBuf();
+            self.inner.emit(event);
+            return;
+        }
+        self.process(event.text);
+    }
+
+    fn process(self: *ThinkPassthroughFilter, text: []const u8) void {
+        var clean_start: usize = 0;
+        for (text, 0..) |b, i| {
+            switch (self.state) {
+                .passthrough => {
+                    if (b == '<') {
+                        if (i > clean_start)
+                            self.inner.emitChunk(text[clean_start..i]);
+                        self.buf[0] = b;
+                        self.buf_len = 1;
+                        self.state = .maybe_open;
+                    }
+                },
+                .maybe_open => {
+                    self.buf[self.buf_len] = b;
+                    self.buf_len += 1;
+                    const prefix = self.buf[0..self.buf_len];
+                    if (std.mem.eql(u8, prefix, open_tag)) {
+                        // Matched <think> — emit header, enter think body.
+                        self.buf_len = 0;
+                        self.state = .inside_think;
+                        self.inner.emitChunk(THINK_HEADER);
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, open_tag, prefix)) {
+                        // Still a valid prefix of <think> — keep buffering.
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    // Not a <think> prefix — flush the buffer as normal text.
+                    self.inner.emitChunk(self.buf[0..self.buf_len]);
+                    self.buf_len = 0;
+                    self.state = .passthrough;
+                    clean_start = i + 1;
+                },
+                .inside_think => {
+                    if (b == '<') {
+                        if (i > clean_start)
+                            self.inner.emitChunk(text[clean_start..i]);
+                        self.buf[0] = b;
+                        self.buf_len = 1;
+                        self.state = .maybe_close;
+                        clean_start = i + 1;
+                    }
+                },
+                .maybe_close => {
+                    self.buf[self.buf_len] = b;
+                    self.buf_len += 1;
+                    const prefix = self.buf[0..self.buf_len];
+                    if (std.mem.eql(u8, prefix, close_tag)) {
+                        // Matched </think> — emit footer, return to passthrough.
+                        self.buf_len = 0;
+                        self.state = .passthrough;
+                        self.inner.emitChunk(THINK_FOOTER);
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, close_tag, prefix)) {
+                        // Still a valid prefix — keep buffering.
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    // Not a </think> close — emit the buffer as think-body text.
+                    self.inner.emitChunk(self.buf[0..self.buf_len]);
+                    self.buf_len = 0;
+                    self.state = .inside_think;
+                    clean_start = i + 1;
+                },
+            }
+        }
+        // Flush remaining passthrough or inside_think text.
+        switch (self.state) {
+            .passthrough => {
+                if (clean_start < text.len)
+                    self.inner.emitChunk(text[clean_start..]);
+            },
+            .inside_think => {
+                if (clean_start < text.len)
+                    self.inner.emitChunk(text[clean_start..]);
+            },
+            else => {}, // buffering — don't flush mid-tag
+        }
+    }
+
+    fn flushBuf(self: *ThinkPassthroughFilter) void {
+        if (self.buf_len > 0) {
+            // Incomplete tag at end of stream — emit as-is.
+            self.inner.emitChunk(self.buf[0..self.buf_len]);
+        }
+        self.buf_len = 0;
+        self.state = .passthrough;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -460,4 +604,70 @@ test "TagFilter strips think blocks split across chunks" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Before  after", col.joined(&buf));
+}
+
+test "ThinkPassthroughFilter passthrough without think tags" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Hello world!");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Hello world!", col.joined(&buf));
+    try std.testing.expect(col.got_final);
+}
+
+test "ThinkPassthroughFilter replaces think block with header and footer" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <think>reasoning here</think> after");
+    s.emitFinal();
+    var buf: [256]u8 = undefined;
+    const expected = "Before " ++ THINK_HEADER ++ "reasoning here" ++ THINK_FOOTER ++ " after";
+    try std.testing.expectEqualStrings(expected, col.joined(&buf));
+}
+
+test "ThinkPassthroughFilter think tag split across chunks" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <th");
+    s.emitChunk("ink>private");
+    s.emitChunk("</think> after");
+    s.emitFinal();
+    var buf: [256]u8 = undefined;
+    const expected = "Before " ++ THINK_HEADER ++ "private" ++ THINK_FOOTER ++ " after";
+    try std.testing.expectEqualStrings(expected, col.joined(&buf));
+}
+
+test "ThinkPassthroughFilter close tag split across chunks" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("<think>body</thi");
+    s.emitChunk("nk>after");
+    s.emitFinal();
+    var buf: [256]u8 = undefined;
+    const expected = THINK_HEADER ++ "body" ++ THINK_FOOTER ++ "after";
+    try std.testing.expectEqualStrings(expected, col.joined(&buf));
+}
+
+test "ThinkPassthroughFilter false positive angle bracket passes through" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("a < b > c");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a < b > c", col.joined(&buf));
+}
+
+test "ThinkPassthroughFilter emits final on stream end" {
+    var col = collectChunks(16){};
+    var filter = ThinkPassthroughFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("text");
+    s.emitFinal();
+    try std.testing.expect(col.got_final);
 }

@@ -23,8 +23,11 @@ jobs:
     uses: nullclaw/nullbuilder/.github/workflows/zig-nightly.yml@v1
     permissions:
       actions: read
-      contents: read
+      contents: write
     with:
       binary_name: nullclaw
       artifact_prefix: nullclaw
+      publish_release: true
+      release_tag: nightly
+      release_title: NullClaw Nightly
       force: ${{ inputs.force || false }}

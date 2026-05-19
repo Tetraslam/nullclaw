@@ -32,6 +32,8 @@
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | 本次进程使用指定 workspace 运行 agent |
 | `nullclaw agent --skill news-digest -m "..."` | 在指定 skill 激活的状态下执行单条消息 |
 | `nullclaw agent` | 交互会话模式 |
+| `nullclaw acp` | 启动面向 ACP 兼容编辑器的 stdio 适配器 |
+| `nullclaw acp --provider openai --model gpt-5.2` | 为编辑器启动的 ACP 会话固定 provider/model |
 
 ### 交互式模型路由
 
@@ -45,6 +47,7 @@
 - 如果没有配置 `model_routes`，`/model auto` 仍然会清除 pin，并把会话切回配置里的默认模型。
 - 通过 `--model` 或 `--provider` 启动 `nullclaw agent` 时，也会把该次运行 pin 到显式模型，从而绕过 `model_routes`。
 - 通过 `--skill <name>` 启动 `nullclaw agent` 时，会在第一条消息或 REPL 轮次前激活该 skill。
+- `nullclaw acp` 通过 stdio 使用按行分隔的 JSON-RPC。编辑器创建 ACP 会话时传入绝对 `cwd`；NullClaw 会把它作为 `agent invoke` 的 workspace。
 
 ## 运行与运维
 

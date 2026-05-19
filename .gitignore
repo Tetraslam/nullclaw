@@ -23,6 +23,7 @@ config.signal.json
 # IDE configurations
 .idea/
 .vscode/
+.history/
 .cursor/
 .trae/
 .codebuddy/

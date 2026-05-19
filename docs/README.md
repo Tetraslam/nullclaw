@@ -11,6 +11,7 @@ MB:## Core User Docs
 TJ:
 HP:- **Beginner's Guide:** New to NullClaw? Start here. Plain language, no jargon. | [English](./en/beginners-guide.md) / [中文](./zh/beginners-guide.md)
 SK:- Install: [`en/installation.md`](./en/installation.md) / [`zh/installation.md`](./zh/installation.md)
+SK:- Install Zig: [`en/zig-installation.md`](./en/zig-installation.md) / [`zh/zig-installation.md`](./zh/zig-installation.md)
 RT:- Configure: [`en/configuration.md`](./en/configuration.md) / [`zh/configuration.md`](./zh/configuration.md)
 TS:- Commands: [`en/commands.md`](./en/commands.md) / [`zh/commands.md`](./zh/commands.md)
 VX:- Usage & operations: [`en/usage.md`](./en/usage.md) / [`zh/usage.md`](./zh/usage.md)

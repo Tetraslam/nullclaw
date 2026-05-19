@@ -182,8 +182,8 @@ pub const ProxyHttpClient = struct {
 
 pub const SafeResolveEntryError = Allocator.Error || error{
     InvalidUrl,
-    LocalAddressBlocked,
     HostResolutionFailed,
+    LocalAddressBlocked,
 };
 
 fn defaultPortForScheme(uri: std.Uri) ?u16 {
@@ -220,6 +220,10 @@ fn buildCurlResolveEntry(
 /// Build an optional curl `--resolve` entry for remote provider requests.
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
+///
+/// DNS resolution failures are fail-closed. Falling back to curl's resolver would
+/// bypass the single resolved-address check and weaken SSRF protection against
+/// DNS answers that resolve to local/private networks.
 pub fn buildSafeResolveEntryForRemoteUrl(
     allocator: Allocator,
     url: []const u8,
@@ -230,11 +234,23 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
-    const connect_host = try net_security.resolveConnectHost(allocator, host, port);
+    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err|
+        return mapResolveConnectHostError(host, err);
     defer allocator.free(connect_host);
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
     return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
+fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnectHostError) SafeResolveEntryError {
+    return switch (err) {
+        error.HostResolutionFailed => blk: {
+            log.debug("host resolution unavailable for {s}; failing closed", .{host});
+            break :blk error.HostResolutionFailed;
+        },
+        error.LocalAddressBlocked => error.LocalAddressBlocked,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
@@ -1097,6 +1113,7 @@ fn putProxyEnvVarFromProcess(
     if (std_compat.process.getEnvVarOwned(allocator, key)) |raw_value| {
         defer allocator.free(raw_value);
         if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            defer allocator.free(proxy);
             try env_map.put(key, proxy);
         }
     } else |_| {}
@@ -1297,6 +1314,12 @@ test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinni
 
 test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
     try std.testing.expectError(error.LocalAddressBlocked, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "https://2130706433/v1"));
+}
+
+test "buildSafeResolveEntryForRemoteUrl maps resolution failure to fail closed" {
+    // Regression: do not silently fall back to curl DNS on resolver failure,
+    // because that bypasses private-address screening before --resolve pinning.
+    try std.testing.expect(mapResolveConnectHostError("example.com", error.HostResolutionFailed) == error.HostResolutionFailed);
 }
 
 test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {

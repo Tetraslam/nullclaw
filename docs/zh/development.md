@@ -10,7 +10,7 @@
 
 ## 开发前先确认
 
-- 本项目开发与测试固定在 **Zig 0.16.0**。
+- 本项目开发与测试固定在 **Zig 0.16.0**。如果需要在 Debian 上安装 Zig，请看 [Zig 安装指南](./zig-installation.md)。
 - 修改代码前，先读 `AGENTS.md`。
 - 如需理解工程背景、模块边界、测试与构建约束，可继续读 `CLAUDE.md`。
 - 如果你使用仓库里的 flake，则 `nix build` 和 `nix develop` 都固定为 **Zig 0.16.0**。

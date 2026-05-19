@@ -63,11 +63,16 @@ pub const DiscordChannel = struct {
     sequence: Atomic(i64) = Atomic(i64).init(0),
     heartbeat_interval_ms: Atomic(u64) = Atomic(u64).init(0),
     heartbeat_stop: Atomic(bool) = Atomic(bool).init(false),
+    last_gateway_activity_ms: Atomic(i64) = Atomic(i64).init(0),
     session_id: ?[]u8 = null,
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
     gateway_thread: ?std.Thread = null,
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
+    /// Count of consecutive op-7 RECONNECT events without an intervening READY.
+    /// Used to implement exponential backoff and RESUME→IDENTIFY fallback.
+    /// Only accessed from gatewayLoop (single-threaded write path); no atomic needed.
+    consecutive_reconnects: u32 = 0,
 
     const SocketFd = std_compat.net.Stream.Handle;
     const invalid_socket: SocketFd = switch (builtin.os.tag) {
@@ -79,6 +84,12 @@ pub const DiscordChannel = struct {
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+    /// Minimum stale-gateway grace window. The channel_manager checks health every 10s;
+    /// allow at least 3 heartbeat intervals OR 90s before declaring the gateway dead.
+    const GATEWAY_STALE_GRACE_MS: i64 = 90 * std.time.ms_per_s;
+    /// After this many consecutive op-7 RECONNECT events without a successful READY,
+    /// give up resuming and clear the session to force a fresh IDENTIFY.
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
     const InvalidSessionAction = enum {
         identify,
         resume_session,
@@ -157,12 +168,61 @@ pub const DiscordChannel = struct {
         return token[0..dot_pos];
     }
 
-    pub fn healthCheck(_: *DiscordChannel) bool {
-        return true;
+    pub fn healthCheck(self: *DiscordChannel) bool {
+        return self.gatewayHealthyAt(std_compat.time.milliTimestamp());
     }
 
     pub fn setBus(self: *DiscordChannel, b: *bus_mod.Bus) void {
         self.bus = b;
+    }
+
+    // ── Gateway liveness helpers ──────────────────────────────────────────
+
+    fn markGatewayActivityNow(self: *DiscordChannel) void {
+        self.last_gateway_activity_ms.store(std_compat.time.milliTimestamp(), .release);
+    }
+
+    /// Returns true if the gateway appears healthy at the given wall-clock ms.
+    /// Healthy conditions: not running, interval not yet received, or last activity
+    /// within max(3×heartbeat_interval, GATEWAY_STALE_GRACE_MS).
+    fn gatewayHealthyAt(self: *DiscordChannel, now_ms: i64) bool {
+        if (!self.running.load(.acquire)) return true;
+
+        const interval_ms = self.heartbeat_interval_ms.load(.acquire);
+        if (interval_ms == 0) return true;
+
+        const last_activity_ms = self.last_gateway_activity_ms.load(.acquire);
+        if (last_activity_ms == 0 or now_ms <= last_activity_ms) return true;
+
+        const heartbeat_window_ms: i64 = @as(i64, @intCast(interval_ms)) * 3;
+        const stale_after_ms = @max(heartbeat_window_ms, GATEWAY_STALE_GRACE_MS);
+        return (now_ms - last_activity_ms) <= stale_after_ms;
+    }
+
+    const ReconnectDecision = struct {
+        attempt: u32,
+        backoff_ms: u64,
+        cleared_session: bool,
+    };
+
+    fn recordReconnectRequest(self: *DiscordChannel) ReconnectDecision {
+        self.consecutive_reconnects += 1;
+        const attempt = self.consecutive_reconnects;
+        const shift = @min(attempt - 1, 6);
+        const backoff_ms = @min(@as(u64, 1000) << @intCast(shift), 60_000);
+        var cleared_session = false;
+
+        if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+            self.clearSessionStateForIdentify();
+            self.consecutive_reconnects = 0;
+            cleared_session = true;
+        }
+
+        return .{
+            .attempt = attempt,
+            .backoff_ms = backoff_ms,
+            .cleared_session = cleared_session,
+        };
     }
 
     // ── Pure helper functions ─────────────────────────────────────────────
@@ -740,6 +800,7 @@ pub const DiscordChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        self.markGatewayActivityNow();
         self.running.store(true, .release);
         self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
     }
@@ -750,10 +811,16 @@ pub const DiscordChannel = struct {
         self.heartbeat_stop.store(true, .release);
         self.stopAllTyping();
         self.deinitPendingInteractions();
-        // Close socket to unblock blocking read
+        // Shut down the socket to unblock a blocking readv in the gateway thread.
+        // close() on a remote TCP socket does NOT interrupt a blocked readv in another
+        // thread on POSIX/macOS — the kernel holds its own file-description reference
+        // for the blocked reader.  shutdown(SHUT_RDWR) explicitly delivers EOF to the
+        // blocked reader, causing it to return 0 (EndOfStream → ConnectionClosed).
+        // NOTE: No unit test for this path — requires a live remote TCP connection and
+        // concurrent thread; covered by manual integration testing against a live gateway.
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
+            (std_compat.net.Stream{ .handle = fd }).shutdown(.both) catch {};
         }
         if (self.gateway_thread) |t| {
             t.join();
@@ -833,11 +900,18 @@ pub const DiscordChannel = struct {
             self.runGatewayOnce() catch |err| switch (err) {
                 error.ShouldReconnect => {
                     // OP7 RECONNECT is a normal control signal from Discord.
-                    // Reconnect quickly to minimize missed events.
-                    log.info("Discord gateway reconnect requested by server", .{});
-                    backoff_ms = 250;
+                    // Use exponential backoff to avoid rate-limiting reconnect storms:
+                    // attempt 1→1s, 2→2s, 3→4s, 4→8s, 5→16s, 6→32s, 7+→60s.
+                    const reconnect = self.recordReconnectRequest();
+                    backoff_ms = reconnect.backoff_ms;
+                    log.info("Discord gateway reconnect requested by server (attempt {d}, backoff {d}ms)", .{ reconnect.attempt, reconnect.backoff_ms });
+                    if (reconnect.cleared_session) log.warn(
+                        "Discord: {d} consecutive reconnects without READY; clearing session for fresh IDENTIFY",
+                        .{reconnect.attempt},
+                    );
                 },
                 else => {
+                    self.consecutive_reconnects = 0;
                     log.warn("Discord gateway error: {}", .{err});
                 },
             };
@@ -852,20 +926,47 @@ pub const DiscordChannel = struct {
     }
 
     fn runGatewayOnce(self: *DiscordChannel) !void {
+        // Refresh the watchdog baseline before DNS/TCP/TLS. A restart should get a
+        // full stale-gateway grace window instead of inheriting the old dead socket's
+        // last activity timestamp.
+        self.markGatewayActivityNow();
+
         // Determine host
         const default_host = "gateway.discord.gg";
         const host: []const u8 = if (self.resume_gateway_url) |u| parseGatewayHost(u) else default_host;
 
-        var ws = try websocket.WsClient.connect(
+        // Phase 1: DNS + TCP only.
+        // Storing ws_fd before TLS init lets vtableStop interrupt a stalled TLS handshake
+        // via shutdown(.both), which delivers EOF to the blocked readv immediately.
+        const ws_stream = websocket.WsClient.connectTcp(self.allocator, host, 443) catch |err| {
+            // TCP failed — clear stale resume URL so next attempt uses gateway.discord.gg.
+            if (self.resume_gateway_url) |u| {
+                self.allocator.free(u);
+                self.resume_gateway_url = null;
+            }
+            return err;
+        };
+        // Store fd now so vtableStop can interrupt even during the TLS handshake below.
+        self.ws_fd.store(ws_stream.handle, .release);
+
+        // Phase 2: TLS init + WebSocket handshake (interruptible via vtableStop shutdown).
+        var ws = websocket.WsClient.connectFromStream(
             self.allocator,
+            ws_stream,
             host,
-            443,
             "/?v=10&encoding=json",
             &.{},
-        );
-
-        // Store fd for interrupt-on-stop
-        self.ws_fd.store(ws.stream.handle, .release);
+        ) catch |err| {
+            // connectFromStream closed ws_stream on failure; clear the now-invalid fd.
+            self.ws_fd.store(invalid_socket, .release);
+            // Clear stale resume URL same as TCP failure path above.
+            if (self.resume_gateway_url) |u| {
+                self.allocator.free(u);
+                self.resume_gateway_url = null;
+            }
+            return err;
+        };
+        // ws now owns ws_stream; the defer block below handles ws_fd reset + ws.deinit().
 
         // Start heartbeat thread — on failure, clean up ws manually (no errdefer to avoid
         // double-deinit with the defer block below once spawn succeeds).
@@ -886,6 +987,8 @@ pub const DiscordChannel = struct {
         const hello_text = try ws.readTextMessage() orelse return error.ConnectionClosed;
         defer self.allocator.free(hello_text);
         try self.handleHello(&ws, hello_text);
+        // Record activity after HELLO so the health watchdog has a baseline timestamp.
+        self.markGatewayActivityNow();
 
         // IDENTIFY or RESUME
         if (self.session_id != null) {
@@ -903,6 +1006,7 @@ pub const DiscordChannel = struct {
             };
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
+            self.markGatewayActivityNow();
             self.handleGatewayMessage(&ws, text) catch |err| {
                 if (err == error.ShouldReconnect) return err;
                 log.err("Discord gateway msg error: {}", .{err});
@@ -1155,6 +1259,9 @@ pub const DiscordChannel = struct {
         }
 
         log.info("Discord READY: session_id={s}", .{self.session_id orelse "<none>"});
+        // A successful READY means we have a live session — reset the reconnect counter
+        // so the next op-7 (if any) gets a fresh exponential backoff window.
+        self.consecutive_reconnects = 0;
     }
 
     /// Handle MESSAGE_CREATE event and publish to bus if filters pass.
@@ -2051,4 +2158,82 @@ test "DiscordChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+test "discord health check tolerates expected heartbeat idle window" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    ch.running.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+
+    // Within 3× heartbeat window (120s) — must still be healthy.
+    try std.testing.expect(ch.gatewayHealthyAt(1_119_999));
+}
+
+test "discord health check fails after stale gateway idle" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    ch.running.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    // Regression: a node could stay Discord-online while the gateway socket stopped
+    // delivering events — heartbeat ACKs ceased but the process didn't restart.
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+
+    // Past 3× heartbeat window (120s) — must be stale.
+    try std.testing.expect(!ch.gatewayHealthyAt(1_120_001));
+}
+
+test "discord gateway restart refreshes stale activity baseline" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    ch.running.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+    try std.testing.expect(!ch.gatewayHealthyAt(1_120_001));
+
+    // Regression: after the watchdog restarts the gateway, the next connection
+    // attempt must not inherit the stale socket timestamp and immediately fail
+    // health checks before DNS/TCP/TLS has its own grace window.
+    ch.last_gateway_activity_ms.store(1_120_001, .release);
+    try std.testing.expect(ch.gatewayHealthyAt(1_130_001));
+    try std.testing.expect(!ch.gatewayHealthyAt(1_240_002));
+}
+
+test "discord handleReady resets consecutive_reconnects to zero" {
+    // Regression: rapid op-7 reconnect storms; READY must reset the backoff counter.
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    defer {
+        if (ch.session_id) |s| alloc.free(s);
+        if (ch.resume_gateway_url) |u| alloc.free(u);
+        if (ch.bot_user_id) |u| alloc.free(u);
+    }
+    ch.consecutive_reconnects = 3;
+
+    const ready_json =
+        \\{"op":0,"s":1,"t":"READY","d":{"session_id":"sess-rc","resume_gateway_url":"wss://gateway.discord.gg/?v=10&encoding=json","user":{"id":"bot-rc"}}}
+    ;
+    var ws_dummy: websocket.WsClient = undefined;
+    try ch.handleGatewayMessage(&ws_dummy, ready_json);
+
+    try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
+}
+
+test "discord reconnect backoff clears session on exhaustion" {
+    // Regression: after MAX_RECONNECT_ATTEMPTS consecutive op-7s the session must be
+    // cleared so the next attempt does a fresh IDENTIFY rather than looping forever.
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    ch.session_id = try alloc.dupe(u8, "stale-sess");
+    ch.resume_gateway_url = try alloc.dupe(u8, "wss://gateway.discord.gg/?v=10&encoding=json");
+    ch.sequence.store(99, .release);
+    ch.consecutive_reconnects = DiscordChannel.MAX_RECONNECT_ATTEMPTS - 1;
+
+    const reconnect = ch.recordReconnectRequest();
+
+    try std.testing.expectEqual(DiscordChannel.MAX_RECONNECT_ATTEMPTS, reconnect.attempt);
+    try std.testing.expectEqual(@as(u64, 16_000), reconnect.backoff_ms);
+    try std.testing.expect(reconnect.cleared_session);
+    try std.testing.expect(ch.session_id == null);
+    try std.testing.expect(ch.resume_gateway_url == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
 }

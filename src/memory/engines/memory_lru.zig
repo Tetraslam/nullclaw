@@ -355,7 +355,9 @@ pub const InMemoryLruMemory = struct {
                 continue;
             }
             if (results.items.len >= limit) break;
-            try results.append(allocator, try cloneEntry(allocator, e));
+            var cloned = try cloneEntry(allocator, e);
+            errdefer cloned.deinit(allocator);
+            try results.append(allocator, cloned);
         }
 
         return results.toOwnedSlice(allocator);

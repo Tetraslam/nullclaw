@@ -10,6 +10,8 @@ pub const json_util = @import("json_util.zig");
 pub const admin_output = @import("admin_output.zig");
 pub const http_util = @import("http_util.zig");
 pub const net_security = @import("net_security.zig");
+pub const governance = @import("governance.zig");
+pub const redaction = @import("redaction.zig");
 pub const websocket = @import("websocket.zig");
 
 // Phase 1: Core
@@ -56,6 +58,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 pub const gateway = @import("gateway.zig");
 pub const channels = @import("channels/root.zig");
 pub const a2a = @import("a2a.zig");
+pub const acp = @import("acp.zig");
 
 // Phase 4: Extensions
 pub const security = @import("security/root.zig");

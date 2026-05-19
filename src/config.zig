@@ -152,6 +152,7 @@ const SerializedNamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    enable_pii_redaction: bool = true,
 };
 
 const SerializedModelRouteConfig = struct {
@@ -1213,6 +1214,7 @@ pub const Config = struct {
                             .api_key = encrypted_key,
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
+                            .enable_pii_redaction = agent_cfg.enable_pii_redaction,
                         };
                         agent_count += 1;
                     }
@@ -1311,6 +1313,7 @@ pub const Config = struct {
             .timezone = self.agent.timezone,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
+            .enable_pii_redaction = self.agent.enable_pii_redaction,
         }, ",\n");
 
         // Channels
@@ -2566,6 +2569,7 @@ test "save roundtrip preserves extended config sections" {
             .api_key = "rk_test",
             .temperature = 0.2,
             .max_depth = 5,
+            .enable_pii_redaction = false,
         },
     };
     cfg.agent_bindings = &.{
@@ -2620,6 +2624,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
     cfg.agent.timezone = "UTC+08:00";
+    cfg.agent.enable_pii_redaction = false;
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -2737,6 +2742,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
     try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
+    try std.testing.expect(!loaded.agents[0].enable_pii_redaction);
     try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
     try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
     try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
@@ -2754,6 +2760,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
+    try std.testing.expect(!loaded.agent.enable_pii_redaction);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -4425,6 +4432,39 @@ test "json parse gateway configurable limits" {
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
 }
 
+test "json parse gateway webhook_sync_for_workers" {
+    const allocator = std.testing.allocator;
+
+    // Default: field absent → false. Same shape as other defaulted bool fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"port\": 3000}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit true → true.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": true}}");
+        try std.testing.expect(cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit false → false.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": false}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Wrong JSON type (string instead of bool) → field stays at default false,
+    // matching how the parser handles type mismatches for sibling fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": \"yes\"}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+}
+
 test "json parse browser allowed domains" {
     const allocator = std.testing.allocator;
     const json =
@@ -4581,7 +4621,7 @@ test "json parse agents" {
     const json =
         \\{"agents": {"list": [
         \\  {"name": "researcher", "provider": "anthropic", "model": "claude-sonnet-4", "system_prompt": "Research things", "max_depth": 5},
-        \\  {"name": "coder", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test", "temperature": 0.3}
+        \\  {"name": "coder", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test", "temperature": 0.3, "enable_pii_redaction": false}
         \\]}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
@@ -4600,6 +4640,17 @@ test "json parse agents" {
     try std.testing.expectEqualStrings("sk-test", cfg.agents[1].api_key.?);
     try std.testing.expectEqual(@as(f64, 0.3), cfg.agents[1].temperature.?);
     try std.testing.expectEqual(@as(u32, 3), cfg.agents[1].max_depth);
+    try std.testing.expect(!cfg.agents[1].enable_pii_redaction);
+}
+
+test "json parse root agent pii redaction flag" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agent": {"enable_pii_redaction": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.agent.enable_pii_redaction);
 }
 
 test "json parse agents skips invalid entries" {

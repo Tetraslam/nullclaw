@@ -31,15 +31,25 @@ const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
+const redaction = @import("../redaction.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
 const commands = @import("commands.zig");
+const cost_mod = @import("../cost.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
     filter: streaming.TagFilter = undefined,
+    /// When true, the streaming callback drops live token chunks; the full
+    /// reply is printed once at end-of-turn so it can pass through
+    /// `redactor.unredact()` and the user sees originals instead of
+    /// `[EMAIL_N]`/`[PHONE_N]`/etc. Provider streaming still happens under
+    /// the hood (lower TTFB, request can still be cancelled), only the live
+    /// terminal render is suppressed.
+    suppress_live: bool = false,
+    think_filter: streaming.ThinkPassthroughFilter = undefined,
 };
 
 const CliProviderContext = struct {
@@ -59,13 +69,74 @@ fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
 }
 
+fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8) bool {
+    const r = redactor orelse return false;
+    return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
+}
+
+fn shouldPrintSeparateUsage(supports_streaming: bool, emitted_text: bool) bool {
+    // Agent.turn already embeds usage in the returned final text. The CLI only
+    // needs a separate usage line when streaming printed that final text live.
+    return supports_streaming and emitted_text;
+}
+
+fn maybePrintUsage(w: anytype, agent: *const Agent) !void {
+    if (agent.usage_mode == .off) return;
+    const usage = agent.last_turn_usage;
+    const cost = @import("../cost.zig").TokenUsage.fromProviders(agent.model_name, usage).cost();
+
+    switch (agent.usage_mode) {
+        .tokens => try w.print("Usage: {d} tokens\n", .{usage.total_tokens}),
+        .cost => try w.print("Usage: ${d:.4}\n", .{cost}),
+        .full => {
+            const total_bytes = agent.last_system_prompt_bytes + agent.last_history_bytes;
+            const sys = if (total_bytes > 0)
+                @as(u32, @intCast((@as(u64, usage.prompt_tokens) * agent.last_system_prompt_bytes) / total_bytes))
+            else
+                0;
+            const usr = usage.prompt_tokens - sys;
+            try w.print("Usage: prompt={d} (rag=~{d} + query=~{d}) completion={d} total={d} (${d:.4}) | Session: ${d:.4}\n", .{
+                usage.prompt_tokens,
+                sys,
+                usr,
+                usage.completion_tokens,
+                usage.total_tokens,
+                cost,
+                agent.total_cost_usd,
+            });
+        },
+        .off => unreachable,
+    }
+}
+
+fn cliUsageRecordCallback(ctx: *anyopaque, record: Agent.UsageRecord) void {
+    const tracker: *cost_mod.CostTracker = @ptrCast(@alignCast(ctx));
+    const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+    tracker.recordUsage(usage) catch |err| {
+        log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+    };
+}
+
 fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
     const store = agent.session_store orelse return;
     const session_key = agent.memory_session_id orelse return;
+
+    const persisted_content = if (agent.redactor) |r|
+        r.redact(agent.allocator, content) catch null
+    else
+        null;
+    defer if (persisted_content) |text| agent.allocator.free(text);
+
+    const persisted_response = if (agent.redactor) |r|
+        r.redact(agent.allocator, response) catch null
+    else
+        null;
+    defer if (persisted_response) |text| agent.allocator.free(text);
+
     turn_persistence.persistTurn(store, .{
         .history = agent.history.items,
         .total_tokens = agent.total_tokens,
-    }, session_key, content, response);
+    }, session_key, persisted_content orelse content, persisted_response orelse response);
 }
 
 fn printPendingSubagentNotices(
@@ -87,6 +158,12 @@ fn printPendingSubagentNotices(
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    // Redactor-aware: if live render is suppressed we also leave
+    // `emitted_text` false so shouldPrintTurnResponse() still fires the final
+    // print path, where the full reply is unredacted before display.
+    if (stream_ctx.suppress_live) return;
+
     stream_ctx.emitted_text = true;
 
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
@@ -101,6 +178,13 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
     filter.* = streaming.TagFilter.init(raw_sink);
+    return filter.sink();
+}
+
+/// Like makeCliStreamSink but passes <think> blocks through with a header/footer
+/// instead of stripping them. Used when reasoning_mode == .stream.
+fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.ThinkPassthroughFilter) streaming.Sink {
+    filter.* = streaming.ThinkPassthroughFilter.init(raw_sink);
     return filter.sink();
 }
 
@@ -308,6 +392,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
     defer cfg.deinit();
+
+    var cost_tracker: ?cost_mod.CostTracker = if (cfg.cost.enabled)
+        cost_mod.CostTracker.init(allocator, cfg.workspace_dir, cfg.cost.enabled, cfg.cost.daily_limit_usd, cfg.cost.monthly_limit_usd, cfg.cost.warn_at_percent)
+    else
+        null;
+    defer if (cost_tracker) |*tracker| tracker.deinit();
 
     const parsed_args = switch (parseAgentArgs(args)) {
         .ok => |parsed| parsed,
@@ -545,17 +635,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (parsed_args.skill_name) |sname| {
             _ = try commands.activateSkillByName(&agent, sname);
         }
+        if (cost_tracker) |*c_tracker| {
+            agent.usage_record_callback = cliUsageRecordCallback;
+            agent.usage_record_ctx = @ptrCast(c_tracker);
+        }
         defer agent.deinit();
 
-        // Enable streaming if provider supports it
+        // Enable streaming if provider supports it.
+        // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
+        // <think> content is printed live instead of being silently stripped.
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
+            .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
             .ctx = @ptrCast(&stream_ctx),
         };
-        stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+        if (agent.reasoning_mode == .stream) {
+            stream_ctx.sink = makeCliStreamSinkPassthrough(raw_stream_sink, &stream_ctx.think_filter);
+        } else {
+            stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+        }
         if (supports_streaming) {
             agent.stream_callback = cliStreamCallback;
             agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -587,9 +688,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, message, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("{s}\n", .{response});
+            // unredact() always returns a fresh allocation when the redactor
+            // is on. Use an optional so cleanup logic doesn't depend on
+            // pointer identity.
+            const unredacted: ?[]u8 = if (agent.redactor) |r|
+                (if (r.wouldRehydrate()) try r.unredact(allocator, response) else null)
+            else
+                null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("{s}\n", .{display});
         } else {
             try w.print("\n", .{});
+        }
+        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+            try maybePrintUsage(w, &agent);
         }
         try w.flush();
         return;
@@ -648,6 +761,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
+
+    if (cost_tracker) |*c_tracker| {
+        agent.usage_record_callback = cliUsageRecordCallback;
+        agent.usage_record_ctx = @ptrCast(c_tracker);
+    }
+
     if (parsed_args.provider_override != null or parsed_args.model_override != null) {
         agent.model_pinned_by_user = true;
     }
@@ -661,15 +780,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     defer agent.deinit();
 
-    // Enable streaming if provider supports it
+    // Enable streaming if provider supports it.
+    // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
+    // <think> content is printed live instead of being silently stripped.
     var stream_ctx = CliStreamCtx{
         .sink = undefined,
+        .suppress_live = false,
     };
     const raw_stream_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
         .ctx = @ptrCast(&stream_ctx),
     };
-    stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+    if (agent.reasoning_mode == .stream) {
+        stream_ctx.sink = makeCliStreamSinkPassthrough(raw_stream_sink, &stream_ctx.think_filter);
+    } else {
+        stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+    }
     if (supports_streaming) {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -720,7 +846,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append the effective turn input after debounce coalescing.
         repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
 
+        // Re-evaluate sink in case reasoning_mode was changed by a previous slash command
+        const repl_raw_sink = streaming.Sink{
+            .callback = cliStreamSinkCallback,
+            .ctx = @ptrCast(&stream_ctx),
+        };
+        if (agent.reasoning_mode == .stream) {
+            stream_ctx.sink = makeCliStreamSinkPassthrough(repl_raw_sink, &stream_ctx.think_filter);
+        } else {
+            stream_ctx.sink = makeCliStreamSink(repl_raw_sink, &stream_ctx.filter);
+        }
+
         stream_ctx.emitted_text = false;
+        stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
         const response = agent.turn(debounced_input.current) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -744,9 +882,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, debounced_input.current, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("\n{s}\n\n", .{response});
+            const unredacted: ?[]u8 = if (agent.redactor) |r|
+                (if (r.wouldRehydrate()) try r.unredact(allocator, response) else null)
+            else
+                null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("\n{s}\n\n", .{display});
         } else {
             try w.print("\n\n", .{});
+        }
+        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+            try maybePrintUsage(w, &agent);
         }
         try w.flush();
     }
@@ -1027,6 +1174,49 @@ test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
     try std.testing.expect(!shouldPrintTurnResponse(true, true));
 }
 
+test "persistCliTurn redacts PII before session persistence" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-redaction-session",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .redactor = &redactor,
+    };
+    defer {
+        agent.redactor = null;
+        agent.deinit();
+    }
+
+    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com");
+
+    const detailed = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-redaction-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
+}
+
 test "parseAgentArgs keeps the last override value" {
     const args = [_][]const u8{
         "--provider",
@@ -1141,6 +1331,14 @@ test "providerFailureLooksQuotaConstrained detects rate and quota detail" {
     try std.testing.expect(providerFailureLooksQuotaConstrained("groq: out of credits"));
     try std.testing.expect(providerFailureLooksQuotaConstrained("openai: billing hard limit reached"));
     try std.testing.expect(!providerFailureLooksQuotaConstrained("compatible: status=401 message=Unauthorized"));
+}
+
+test "shouldPrintSeparateUsage only for streaming text already emitted" {
+    // Regression: non-streaming CLI responses already include composeFinalReply
+    // usage details, so a second CLI usage line would duplicate the same turn.
+    try std.testing.expect(!shouldPrintSeparateUsage(false, false));
+    try std.testing.expect(!shouldPrintSeparateUsage(true, false));
+    try std.testing.expect(shouldPrintSeparateUsage(true, true));
 }
 
 test "writeRateLimitHint mentions reliability knobs and logs" {

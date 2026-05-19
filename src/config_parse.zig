@@ -472,6 +472,9 @@ fn parseNamedAgentObject(
     if (item.object.get("max_depth")) |md| {
         if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
     }
+    if (item.object.get("enable_pii_redaction")) |v| {
+        if (v == .bool) agent_cfg.enable_pii_redaction = v.bool;
+    }
     return agent_cfg;
 }
 
@@ -1551,6 +1554,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("auto_disable_vision_on_error")) |v| {
                 if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
             }
+            if (ag.object.get("enable_pii_redaction")) |v| {
+                if (v == .bool) self.agent.enable_pii_redaction = v.bool;
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
@@ -2197,6 +2203,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (gw.object.get("request_timeout_secs")) |v| {
                 if (v == .integer and v.integer >= 0) self.gateway.request_timeout_secs = @intCast(v.integer);
+            }
+            if (gw.object.get("webhook_sync_for_workers")) |v| {
+                if (v == .bool) self.gateway.webhook_sync_for_workers = v.bool;
             }
         }
     }

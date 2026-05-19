@@ -12,6 +12,7 @@ const std_compat = @import("compat");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
+const governance = @import("../governance.zig");
 const provider_api_key = @import("../providers/api_key.zig");
 const log = std.log.scoped(.memory);
 
@@ -723,7 +724,13 @@ pub const MemoryRuntime = struct {
 
         var reindexed: u32 = 0;
         for (entries) |entry| {
-            const emb = provider.embed(allocator, entry.content) catch |err| {
+            const safe_content = governance.redactForEmbedding(allocator, entry.content) catch |err| {
+                log.warn("reindex: redaction failed for key '{s}': {}", .{ entry.key, err });
+                continue;
+            };
+            defer allocator.free(safe_content);
+
+            const emb = provider.embed(allocator, safe_content) catch |err| {
                 log.warn("reindex: embed failed for key '{s}': {}", .{ entry.key, err });
                 continue;
             };
@@ -851,7 +858,14 @@ fn syncVectorUpsertWithComponents(
         if (!cb.allow()) return;
     }
 
-    const emb = provider.embed(allocator, content) catch |err| {
+    const safe_content = governance.redactForEmbedding(allocator, content) catch |err| {
+        log.warn("{s}vector sync redaction failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
+        if (circuit_breaker_inst) |cb| cb.recordFailure();
+        return;
+    };
+    defer allocator.free(safe_content);
+
+    const emb = provider.embed(allocator, safe_content) catch |err| {
         log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
         if (circuit_breaker_inst) |cb| cb.recordFailure();
         return;
@@ -2419,6 +2433,90 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
     };
     // Should not crash — just a no-op
     rt.syncVectorAfterStore(std.testing.allocator, "key", "content", null);
+}
+
+test "MemoryRuntime.syncVectorAfterStore redacts content before embedding" {
+    const CaptureEmbedding = struct {
+        allocator: std.mem.Allocator,
+        captured: ?[]u8 = null,
+
+        fn name(_: *anyopaque) []const u8 {
+            return "capture";
+        }
+
+        fn dimensions(_: *anyopaque) u32 {
+            return 1;
+        }
+
+        fn embed(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.captured) |old| self.allocator.free(old);
+            self.captured = try self.allocator.dupe(u8, text);
+            const out = try allocator.alloc(f32, 1);
+            out[0] = 1.0;
+            return out;
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const NoopVectorStore = struct {
+        fn upsert(_: *anyopaque, _: []const u8, _: []const f32) anyerror!void {}
+        fn search(_: *anyopaque, allocator: std.mem.Allocator, _: []const f32, _: u32) anyerror![]vector_store.VectorResult {
+            return allocator.alloc(vector_store.VectorResult, 0);
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn count(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+        fn healthCheck(_: *anyopaque, _: std.mem.Allocator) anyerror!vector_store.HealthStatus {
+            return .{ .ok = true, .latency_ns = 0, .entry_count = 0, .error_msg = null };
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const embed_vtable = embeddings.EmbeddingProvider.VTable{
+        .name = CaptureEmbedding.name,
+        .dimensions = CaptureEmbedding.dimensions,
+        .embed = CaptureEmbedding.embed,
+        .deinit = CaptureEmbedding.deinit,
+    };
+    const vector_vtable = vector_store.VectorStore.VTable{
+        .upsert = NoopVectorStore.upsert,
+        .search = NoopVectorStore.search,
+        .delete = NoopVectorStore.delete,
+        .count = NoopVectorStore.count,
+        .health_check = NoopVectorStore.healthCheck,
+        .deinit = NoopVectorStore.deinit,
+    };
+
+    var backend = none.NoneMemory.init();
+    defer backend.deinit();
+    var embed_state = CaptureEmbedding{ .allocator = std.testing.allocator };
+    defer if (embed_state.captured) |captured| std.testing.allocator.free(captured);
+    var vector_state: u8 = 0;
+
+    var rt = MemoryRuntime{
+        .memory = backend.memory(),
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = std.testing.allocator,
+        ._embedding_provider = .{ .ptr = @ptrCast(&embed_state), .vtable = &embed_vtable },
+        ._vector_store = .{ .ptr = @ptrCast(&vector_state), .vtable = &vector_vtable },
+        ._circuit_breaker = null,
+        ._outbox = null,
+    };
+
+    rt.syncVectorAfterStore(std.testing.allocator, "key", "contact user@example.com", null);
+
+    const captured = embed_state.captured orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {

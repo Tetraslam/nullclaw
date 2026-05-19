@@ -290,13 +290,21 @@ pub const Server = struct {
         var address: Address = undefined;
         var address_len: posix.socklen_t = @sizeOf(Address);
 
+        // accept4() with SOCK_CLOEXEC is preferred: it is atomic (no separate fcntl)
+        // and it is the only accept variant allowed by Android's seccomp policy.
+        // macOS/Haiku do not have accept4(), so fall back to accept() + fcntl there.
+        const have_accept4 = comptime builtin.os.tag == .linux;
+
         while (true) {
-            const rc = posix.system.accept(self.stream.handle, &address.any, &address_len);
+            const rc = if (have_accept4)
+                posix.system.accept4(self.stream.handle, &address.any, &address_len, posix.SOCK.CLOEXEC)
+            else
+                posix.system.accept(self.stream.handle, &address.any, &address_len);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     var stream: Stream = .{ .handle = @intCast(rc) };
                     errdefer stream.close();
-                    try setSocketCloseOnExec(stream.handle);
+                    if (!have_accept4) try setSocketCloseOnExec(stream.handle);
                     try setSocketNonblocking(stream.handle, false);
                     return .{
                         .stream = stream,
@@ -388,6 +396,79 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
     return tcpConnectToAddress(addresses.addrs[0]);
 }
 
+fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "localhost");
+}
+
+fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
+    const io = shared.io();
+    const host_name = IoNet.HostName.init(name) catch |err| switch (err) {
+        error.NameTooLong => return error.NameTooLong,
+        error.InvalidHostName => return error.UnknownHostName,
+    };
+
+    const list = blk: {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+
+        const list = try arena.allocator().create(AddressList);
+        list.* = .{
+            .arena = arena,
+            .addrs = undefined,
+            .canon_name = null,
+        };
+        break :blk list;
+    };
+    errdefer list.deinit();
+
+    const arena_allocator = list.arena.allocator();
+    var addrs = std.ArrayList(Address).empty;
+    defer addrs.deinit(arena_allocator);
+
+    var canonical_name_buffer: [IoNet.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [16]IoNet.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(IoNet.HostName.LookupResult) = .init(&lookup_buffer);
+
+    // HostName.lookup is async; use io.async so the Io runtime drives
+    // DNS resolution and closes the queue.
+    var lookup_future = io.async(IoNet.HostName.lookup, .{ host_name, io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    } });
+    defer lookup_future.cancel(io) catch {};
+
+    while (lookup_queue.getOne(io)) |resolved| {
+        switch (resolved) {
+            .address => |ip_address| try addrs.append(arena_allocator, Address.fromCurrent(ip_address)),
+            .canonical_name => |canonical| {
+                if (list.canon_name == null) {
+                    list.canon_name = try arena_allocator.dupe(u8, canonical.bytes);
+                }
+            },
+        }
+    } else |err| switch (err) {
+        error.Canceled, error.Closed => {
+            // Queue closed or cancelled; lookup is done. Propagate any lookup-level error.
+            _ = lookup_future.await(io) catch |lookup_err| switch (lookup_err) {
+                error.UnknownHostName, error.NoAddressReturned => return error.UnknownHostName,
+                error.NameServerFailure,
+                error.ResolvConfParseFailed,
+                error.InvalidDnsARecord,
+                error.InvalidDnsAAAARecord,
+                error.InvalidDnsCnameRecord,
+                error.DetectingNetworkConfigurationFailed,
+                => return error.NameServerFailure,
+                error.SystemResources => return error.SystemResources,
+                else => return error.Unexpected,
+            };
+        },
+    }
+
+    if (addrs.items.len == 0) return error.UnknownHostName;
+    list.addrs = try addrs.toOwnedSlice(arena_allocator);
+    return list;
+}
+
 pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
     if (name.len > IoNet.HostName.max_len) return error.NameTooLong;
 
@@ -405,19 +486,23 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
     } else |_| {}
 
     if (builtin.os.tag == .windows) {
-        const fallback_name = if (std.ascii.eqlIgnoreCase(name, "localhost")) "127.0.0.1" else return error.UnknownHostName;
-        const fallback_addr = Address.parseIp(fallback_name, port) catch unreachable;
+        if (shouldUseWindowsLocalhostFallback(name)) {
+            const fallback_name = "127.0.0.1";
+            const fallback_addr = Address.parseIp(fallback_name, port) catch unreachable;
 
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
 
-        const list = try arena.allocator().create(AddressList);
-        list.* = .{
-            .arena = arena,
-            .addrs = try arena.allocator().dupe(Address, &.{fallback_addr}),
-            .canon_name = try arena.allocator().dupe(u8, fallback_name),
-        };
-        return list;
+            const list = try arena.allocator().create(AddressList);
+            list.* = .{
+                .arena = arena,
+                .addrs = try arena.allocator().dupe(Address, &.{fallback_addr}),
+                .canon_name = try arena.allocator().dupe(u8, fallback_name),
+            };
+            return list;
+        }
+
+        return getAddressListWindows(gpa, name, port);
     }
 
     const result = blk: {
@@ -491,6 +576,15 @@ test "compat net oversized hostname fails fast" {
     try std.testing.expectError(error.NameTooLong, getAddressList(std.testing.allocator, oversized, 443));
 }
 
+test "compat net windows localhost fallback helper is scoped" {
+    // Regression: Windows getAddressList used to return UnknownHostName for
+    // every non-localhost hostname because this fallback short-circuited DNS.
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("localhost"));
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("LOCALHOST"));
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("example.invalid"));
+}
+
 test "compat net normalizes listener and stream blocking mode" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -526,6 +620,32 @@ test "compat net nonblocking listener accept reports WouldBlock when idle" {
     // Regression for #851: Zig 0.16 Threaded accept maps EAGAIN on externally
     // non-blocking listeners to Unexpected instead of WouldBlock.
     try std.testing.expectError(error.WouldBlock, server.accept());
+}
+
+test "compat net nonblocking listener accept4 accepted socket is blocking" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    // Regression: acceptPosixNonblocking used accept() which is blocked by Android
+    // seccomp policy (SIGSYS). It must use accept4(SOCK_CLOEXEC) instead.
+    // Verify that the path is exercised and the returned socket is blocking.
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = server.accept() catch |err| switch (err) {
+        error.WouldBlock => blk: {
+            std.Io.sleep(shared.io(), .fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
+            break :blk try server.accept();
+        },
+        else => return err,
+    };
+    defer conn.stream.close();
+
+    // Accepted socket must be blocking regardless of listener nonblocking mode.
+    try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
 }
 
 test "compat net stream read receives small socket payload" {

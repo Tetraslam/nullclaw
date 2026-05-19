@@ -35,7 +35,46 @@ pub const TokenUsage = struct {
     pub fn cost(self: *const TokenUsage) f64 {
         return self.cost_usd;
     }
+
+    pub fn fromProviders(model: []const u8, usage: anytype) TokenUsage {
+        const pricing = resolvePricing(model);
+        return TokenUsage.init(
+            model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            pricing.input_usd_per_1m,
+            pricing.output_usd_per_1m,
+        );
+    }
 };
+
+pub const ModelPricing = struct {
+    input_usd_per_1m: f64,
+    output_usd_per_1m: f64,
+};
+
+/// Hardcoded pricing for common models.
+/// Prices are in USD per 1M tokens.
+pub const pricing_table = [_]struct { []const u8, ModelPricing }{
+    .{ "o3-mini", .{ .input_usd_per_1m = 1.10, .output_usd_per_1m = 4.40 } },
+    .{ "gpt-4o", .{ .input_usd_per_1m = 2.50, .output_usd_per_1m = 10.00 } },
+    .{ "gpt-4.5", .{ .input_usd_per_1m = 30.00, .output_usd_per_1m = 60.00 } },
+    .{ "deepseek-v3", .{ .input_usd_per_1m = 0.14, .output_usd_per_1m = 0.28 } },
+    .{ "deepseek-r1", .{ .input_usd_per_1m = 0.14, .output_usd_per_1m = 0.28 } },
+    .{ "claude-3-5-sonnet", .{ .input_usd_per_1m = 3.00, .output_usd_per_1m = 15.00 } },
+    .{ "claude-3-opus", .{ .input_usd_per_1m = 15.00, .output_usd_per_1m = 75.00 } },
+    .{ "claude-3-haiku", .{ .input_usd_per_1m = 0.25, .output_usd_per_1m = 1.25 } },
+};
+
+pub fn resolvePricing(model: []const u8) ModelPricing {
+    for (pricing_table) |entry| {
+        if (std.ascii.indexOfIgnoreCase(model, entry[0]) != null) {
+            return entry[1];
+        }
+    }
+    // Default/fallback pricing (conservative estimate for unknown models)
+    return .{ .input_usd_per_1m = 0.50, .output_usd_per_1m = 1.50 };
+}
 
 /// Time period for cost aggregation.
 pub const UsagePeriod = enum {
@@ -78,6 +117,11 @@ pub const CostSummary = struct {
 pub const CostRecord = struct {
     usage: TokenUsage,
     session_id: []const u8,
+
+    fn deinit(self: *CostRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.usage.model);
+        allocator.free(self.session_id);
+    }
 };
 
 /// Cost tracker for API usage monitoring and budget enforcement.
@@ -106,6 +150,9 @@ pub const CostTracker = struct {
     }
 
     pub fn deinit(self: *CostTracker) void {
+        for (self.session_records.items) |*record| {
+            record.deinit(self.allocator);
+        }
         self.session_records.deinit(self.allocator);
         if (self.storage_path.len > 0) {
             self.allocator.free(self.storage_path);
@@ -157,14 +204,21 @@ pub const CostTracker = struct {
         if (!self.enabled) return;
         if (!std.math.isFinite(usage.cost_usd) or usage.cost_usd < 0.0) return;
 
-        const record = CostRecord{
-            .usage = usage,
-            .session_id = "current",
+        var owned_usage = usage;
+        owned_usage.model = try self.allocator.dupe(u8, usage.model);
+        errdefer self.allocator.free(owned_usage.model);
+        const owned_session_id = try self.allocator.dupe(u8, "current");
+        errdefer self.allocator.free(owned_session_id);
+
+        var record = CostRecord{
+            .usage = owned_usage,
+            .session_id = owned_session_id,
         };
+        errdefer record.deinit(self.allocator);
         try self.session_records.append(self.allocator, record);
 
         // Persist to JSONL file
-        self.appendToJsonl(&record) catch {};
+        self.appendToJsonl(&self.session_records.items[self.session_records.items.len - 1]) catch {};
     }
 
     /// Append a cost record to the JSONL file.
@@ -176,31 +230,21 @@ pub const CostTracker = struct {
             fs_compat.makePath(dir) catch {};
         }
 
-        // Write JSON line
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
+        const line = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"model\":{f},\"input_tokens\":{d},\"output_tokens\":{d},\"cost_usd\":{d:.8},\"timestamp\":{d},\"session\":{f}}}\n",
+            .{
+                std.json.fmt(record.usage.model, .{}),
+                record.usage.input_tokens,
+                record.usage.output_tokens,
+                record.usage.cost_usd,
+                record.usage.timestamp_secs,
+                std.json.fmt(record.session_id, .{}),
+            },
+        );
+        defer self.allocator.free(line);
 
-        try buf.appendSlice(self.allocator, "{\"model\":\"");
-        try buf.appendSlice(self.allocator, record.usage.model);
-        try buf.appendSlice(self.allocator, "\",\"input_tokens\":");
-        var num_buf: [20]u8 = undefined;
-        const in_str = std.fmt.bufPrint(&num_buf, "{d}", .{record.usage.input_tokens}) catch "0";
-        try buf.appendSlice(self.allocator, in_str);
-        try buf.appendSlice(self.allocator, ",\"output_tokens\":");
-        const out_str = std.fmt.bufPrint(&num_buf, "{d}", .{record.usage.output_tokens}) catch "0";
-        try buf.appendSlice(self.allocator, out_str);
-        try buf.appendSlice(self.allocator, ",\"cost_usd\":");
-        var cost_buf_arr: [32]u8 = undefined;
-        const cost_str = std.fmt.bufPrint(&cost_buf_arr, "{d:.8}", .{record.usage.cost_usd}) catch "0.0";
-        try buf.appendSlice(self.allocator, cost_str);
-        try buf.appendSlice(self.allocator, ",\"timestamp\":");
-        const ts_str = std.fmt.bufPrint(&num_buf, "{d}", .{record.usage.timestamp_secs}) catch "0";
-        try buf.appendSlice(self.allocator, ts_str);
-        try buf.appendSlice(self.allocator, ",\"session\":\"");
-        try buf.appendSlice(self.allocator, record.session_id);
-        try buf.appendSlice(self.allocator, "\"}\n");
-
-        fs_compat.appendBytes(self.storage_path, buf.items) catch {};
+        fs_compat.appendBytes(self.storage_path, line) catch {};
     }
 
     /// Get total session cost.
@@ -412,6 +456,19 @@ test "CostTracker summary" {
     try std.testing.expect(summary.total_tokens > 0);
 }
 
+test "CostTracker owns recorded model strings" {
+    var tracker = CostTracker.init(std.testing.allocator, "/tmp", true, 10.0, 100.0, 80);
+    defer tracker.deinit();
+
+    const model = try std.testing.allocator.dupe(u8, "gpt-4o");
+    defer std.testing.allocator.free(model);
+
+    try tracker.recordUsage(TokenUsage.init(model, 100, 50, 1.0, 2.0));
+    @memset(model, 'x');
+
+    try std.testing.expectEqualStrings("gpt-4o", tracker.session_records.items[0].usage.model);
+}
+
 test "CostTracker persists JSONL to absolute workspace path" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -430,4 +487,24 @@ test "CostTracker persists JSONL to absolute workspace path" {
     defer std.testing.allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"model\":\"test/model\"") != null);
+}
+
+test "CostTracker escapes JSONL model field" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var tracker = CostTracker.init(std.testing.allocator, workspace, true, 10.0, 100.0, 80);
+    defer tracker.deinit();
+
+    try tracker.recordUsage(TokenUsage.init("model\"quoted", 123, 45, 1.0, 2.0));
+
+    const file = try std_compat.fs.openFileAbsolute(tracker.storage_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"model\":\"model\\\"quoted\"") != null);
 }

@@ -139,3 +139,36 @@ test "persistTurn falls back to rendered response when assistant history is abse
     try std.testing.expectEqualStrings("assistant", detailed[1].role);
     try std.testing.expectEqualStrings("fallback reply", detailed[1].content);
 }
+
+test "persistTurn does not persist system prompt history entries" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    var history: std.ArrayListUnmanaged(Agent.OwnedMessage) = .empty;
+    defer {
+        for (history.items) |msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    try history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "ops contact admin@example.com token=sk-system-secret"),
+    });
+    try history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "ok"),
+    });
+
+    persistTurn(store, .{ .history = history.items, .total_tokens = 1 }, "system-history-session", "hello", "ok");
+
+    const detailed = try store.loadMessagesDetailed(allocator, "system-history-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try std.testing.expect(!std.mem.eql(u8, message.role, "system"));
+        try std.testing.expect(std.mem.indexOf(u8, message.content, "admin@example.com") == null);
+        try std.testing.expect(std.mem.indexOf(u8, message.content, "sk-system-secret") == null);
+    }
+}

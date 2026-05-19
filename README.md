@@ -80,6 +80,7 @@ Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links bel
 |---|---|---|
 | Start here | [`docs/en/README.md`](docs/en/README.md) | [`docs/zh/README.md`](docs/zh/README.md) |
 | Install | [`docs/en/installation.md`](docs/en/installation.md) | [`docs/zh/installation.md`](docs/zh/installation.md) |
+| Install Zig | [`docs/en/zig-installation.md`](docs/en/zig-installation.md) | [`docs/zh/zig-installation.md`](docs/zh/zig-installation.md) |
 | Configure | [`docs/en/configuration.md`](docs/en/configuration.md) | [`docs/zh/configuration.md`](docs/zh/configuration.md) |
 | Commands | [`docs/en/commands.md`](docs/en/commands.md) | [`docs/zh/commands.md`](docs/zh/commands.md) |
 | Development | [`docs/en/development.md`](docs/en/development.md) | [`docs/zh/development.md`](docs/zh/development.md) |
@@ -122,6 +123,7 @@ nullclaw --help
 > **Prerequisite:** use **Zig 0.16.0** (exact version).
 > Other Zig versions are currently unsupported and may fail to build.
 > Verify before building: `zig version` should print `0.16.0`.
+> Debian users who need Zig first can follow [`docs/en/zig-installation.md`](docs/en/zig-installation.md).
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -771,6 +773,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `onboard --interactive` | Full interactive wizard |
 | `onboard --channels-only` | Reconfigure channels/allowlists only |
 | `agent -m "..."` | Single message mode |
+| `acp` | Start the Agent Client Protocol stdio adapter for ACP-compatible editors |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
@@ -780,7 +783,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |
-| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
+| `memory stats\|count\|reindex\|search\|get\|list\|export-jsonl\|hygiene-report\|drain-outbox\|forget` | Inspect, export, and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
 | `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
@@ -875,6 +878,7 @@ Implement a vtable interface, submit a PR:
 
 - [Chinese docs overview (中文文档总览)](docs/zh/README.md)
 - [Installation guide (安装指南)](docs/zh/installation.md)
+- [Zig installation (Zig 安装指南)](docs/zh/zig-installation.md)
 - [Configuration guide (配置指南)](docs/zh/configuration.md)
 - [Usage and operations (使用与运维)](docs/zh/usage.md)
 - [Architecture overview (架构总览)](docs/zh/architecture.md)
@@ -887,6 +891,7 @@ Implement a vtable interface, submit a PR:
 
 - [English docs overview](docs/en/README.md)
 - [Installation](docs/en/installation.md)
+- [Zig Installation](docs/en/zig-installation.md)
 - [Configuration](docs/en/configuration.md)
 - [Usage and operations](docs/en/usage.md)
 - [Architecture](docs/en/architecture.md)
