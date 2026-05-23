@@ -49,7 +49,7 @@ fn returnLoggedCompatibleApiError(
     return err;
 }
 
-fn mapTransportProbeError(err: anyerror) anyerror {
+fn preserveProbeTransportError(err: anyerror) anyerror {
     return switch (err) {
         error.CurlDnsError,
         error.CurlConnectError,
@@ -851,7 +851,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return mapTransportProbeError(err);
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return preserveProbeTransportError(err);
         defer allocator.free(resp_body);
 
         return parseResponsesResponse(allocator, resp_body) catch |err| {
@@ -1399,7 +1399,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return mapTransportProbeError(err);
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return preserveProbeTransportError(err);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
@@ -1491,7 +1491,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return mapTransportProbeError(err);
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return preserveProbeTransportError(err);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
@@ -2431,11 +2431,17 @@ test "returnLoggedCompatibleApiError preserves fallback error" {
     );
 }
 
-test "mapTransportProbeError preserves curl transport failures" {
-    try std.testing.expect(mapTransportProbeError(error.CurlTimeout) == error.CurlTimeout);
-    try std.testing.expect(mapTransportProbeError(error.CurlConnectError) == error.CurlConnectError);
-    try std.testing.expect(mapTransportProbeError(error.CurlDnsError) == error.CurlDnsError);
-    try std.testing.expect(mapTransportProbeError(error.ApiError) == error.CompatibleApiError);
+test "preserveProbeTransportError preserves curl transport failures" {
+    try std.testing.expect(preserveProbeTransportError(error.CurlTimeout) == error.CurlTimeout);
+    try std.testing.expect(preserveProbeTransportError(error.CurlConnectError) == error.CurlConnectError);
+    try std.testing.expect(preserveProbeTransportError(error.CurlDnsError) == error.CurlDnsError);
+}
+
+test "preserveProbeTransportError collapses non-transport failures" {
+    // Regression: provider health probes still need generic API classification for
+    // non-transport failures after preserving raw curl transport errors.
+    try std.testing.expect(preserveProbeTransportError(error.ApiError) == error.CompatibleApiError);
+    try std.testing.expect(preserveProbeTransportError(error.RateLimited) == error.CompatibleApiError);
 }
 
 test "responsesUrl requires exact suffix match" {
