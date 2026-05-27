@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
-FROM busybox:1.37 AS config
+FROM busybox:1.38 AS config
 
 # Keep config.json at the volume root so existing compose volumes remain readable.
 RUN mkdir -p /nullclaw-data/workspace
