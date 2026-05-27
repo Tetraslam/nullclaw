@@ -35,6 +35,26 @@ pub fn mapCurlExitCodeToError(code: u8) anyerror {
     };
 }
 
+pub fn isCurlTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTimeout,
+        error.CurlTlsError,
+        error.CurlReadError,
+        error.CurlWriteError,
+        error.CurlWaitError,
+        error.CurlFailed,
+        error.CurlInterrupted,
+        => true,
+        else => false,
+    };
+}
+
+pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
+    return if (isCurlTransportError(err)) err else fallback;
+}
+
 const StderrCapture = struct {
     file: ?std_compat.fs.File = null,
     buffer: [MAX_CURL_STDERR_BYTES]u8 = undefined,
@@ -1360,6 +1380,25 @@ test "curl exit code mapping returns specific errors" {
     try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
     try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
     try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
+}
+
+test "preserveCurlTransportError preserves curl transport failures" {
+    // Regression: provider probes need raw curl transport failures instead of a
+    // provider-specific API error so they can report network_error correctly.
+    try std.testing.expect(preserveCurlTransportError(error.CurlDnsError, error.ApiError) == error.CurlDnsError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlConnectError, error.ApiError) == error.CurlConnectError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlTimeout, error.ApiError) == error.CurlTimeout);
+    try std.testing.expect(preserveCurlTransportError(error.CurlTlsError, error.ApiError) == error.CurlTlsError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlReadError, error.ApiError) == error.CurlReadError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlWriteError, error.ApiError) == error.CurlWriteError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlWaitError, error.ApiError) == error.CurlWaitError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlFailed, error.ApiError) == error.CurlFailed);
+    try std.testing.expect(preserveCurlTransportError(error.CurlInterrupted, error.ApiError) == error.CurlInterrupted);
+}
+
+test "preserveCurlTransportError returns fallback for non-transport failures" {
+    try std.testing.expect(preserveCurlTransportError(error.RateLimited, error.ApiError) == error.ApiError);
+    try std.testing.expect(preserveCurlTransportError(error.InvalidUrl, error.ApiError) == error.ApiError);
 }
 
 test "StderrCapture returns trimmed stderr" {
