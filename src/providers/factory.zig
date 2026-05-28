@@ -83,7 +83,7 @@ const compat_providers = [_]CompatProvider{
 
     // ── Gateways & Aggregators ────────────────────────────────────────────
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
-    .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud", .no_responses_fallback = true },
+    .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
@@ -811,9 +811,9 @@ test "findCompatProvider returns correct flags" {
     try std.testing.expect(!groq_p.no_responses_fallback);
     try std.testing.expect(!groq_p.merge_system_into_user);
 
-    // NEAR AI Cloud supports chat completions directly; do not try Responses API fallback.
+    // NEAR AI Cloud supports the OpenAI-compatible Responses API.
     const nearai = findCompatProvider("nearai").?;
-    try std.testing.expect(nearai.no_responses_fallback);
+    try std.testing.expect(!nearai.no_responses_fallback);
     try std.testing.expect(nearai.auth_style == .bearer);
 
     // minimax-cn also has both flags
@@ -929,7 +929,7 @@ test "fromConfig configures NEAR AI Cloud compatible provider" {
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqualStrings("https://cloud-api.near.ai/v1", h.compatible.base_url);
     try std.testing.expectEqualStrings("nearai", h.compatible.name);
-    try std.testing.expect(!h.compatible.supports_responses_fallback);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
 }
 
 test "fromConfig applies thinking_param flag for GLM" {

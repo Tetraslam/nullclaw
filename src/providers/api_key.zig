@@ -322,7 +322,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "perplexity", .{ "PERPLEXITY_API_KEY", "", "" } },
         .{ "cohere", .{ "COHERE_API_KEY", "", "" } },
         .{ "venice", .{ "VENICE_API_KEY", "", "" } },
-        .{ "nearai", .{ "NEARAI_API_KEY", "", "" } },
+        .{ "nearai", .{ "NEARAI_API_KEY", "NEARAI_CLOUD_API_KEY", "NEAR_AI_API_KEY" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
@@ -408,6 +408,8 @@ test "qwen-portal env candidate uses oauth token" {
 test "nearai env candidate is NEARAI_API_KEY" {
     const candidates = providerEnvCandidates("nearai");
     try std.testing.expectEqualStrings("NEARAI_API_KEY", candidates[0]);
+    try std.testing.expectEqualStrings("NEARAI_CLOUD_API_KEY", candidates[1]);
+    try std.testing.expectEqualStrings("NEAR_AI_API_KEY", candidates[2]);
 }
 
 test "azure aliases share Azure env candidate" {

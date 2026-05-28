@@ -121,7 +121,7 @@ pub const known_providers = [_]ProviderInfo{
 
     // --- Tier 4: AI platform specialists ---
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
-    .{ .key = "nearai", .label = "NEAR AI Cloud (TEE inference)", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
+    .{ .key = "nearai", .label = "NEAR AI Cloud", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -447,7 +447,7 @@ const claude_cli_fallback = [_][]const u8{
 };
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
-const NEARAI_MODELS_URL = "https://cloud-api.near.ai/v1/model/list";
+const NEARAI_MODELS_URL = "https://cloud-api.near.ai/v1/models";
 
 const ModelsDevProvider = struct {
     canonical: []const u8,
@@ -493,7 +493,7 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
         result.deinit(allocator);
     }
     for (static) |m| {
-        try result.append(allocator, try allocator.dupe(u8, m));
+        try appendOwnedCopy(allocator, &result, m);
     }
     return result.toOwnedSlice(allocator);
 }
@@ -586,7 +586,7 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
     var url: []const u8 = undefined;
     var url_to_free: ?[]const u8 = null;
     var needs_auth = false;
-    var prefix_filter: ?[]const u8 = null;
+    var parse_options: ModelIdParseOptions = .{};
     defer if (url_to_free) |u| allocator.free(u);
 
     if (std.mem.eql(u8, canonical, "openrouter")) {
@@ -594,12 +594,13 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
     } else if (std.mem.eql(u8, canonical, "openai")) {
         url = "https://api.openai.com/v1/models";
         needs_auth = true;
-        prefix_filter = "gpt-";
+        parse_options.prefix_filter = "gpt-";
     } else if (std.mem.eql(u8, canonical, "groq")) {
         url = "https://api.groq.com/openai/v1/models";
         needs_auth = true;
     } else if (std.mem.eql(u8, canonical, "nearai")) {
-        return try fetchAndParseNearAiModels(allocator, canonical, NEARAI_MODELS_URL);
+        url = NEARAI_MODELS_URL;
+        parse_options.require_chat_modalities = true;
     } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
         url_to_free = try buildModelsUrl(allocator, canonical);
         url = url_to_free.?;
@@ -618,7 +619,7 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
         headers = &headers_buf;
     }
 
-    return try fetchAndParseModels(allocator, canonical, url, headers, prefix_filter);
+    return try fetchAndParseModels(allocator, canonical, url, headers, parse_options);
 }
 
 fn modelsDevProviderKey(provider: []const u8) ?[]const u8 {
@@ -661,9 +662,12 @@ fn parseModelsDevModelIds(
     provider: []const u8,
     provider_key: []const u8,
 ) ![][]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch |err| {
-        logModelCatalogFailureErr(MODELS_DEV_URL, provider, err);
-        return error.FetchFailed;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            logModelCatalogFailureErr(MODELS_DEV_URL, provider, err);
+            return error.FetchFailed;
+        },
     };
     defer parsed.deinit();
 
@@ -698,7 +702,7 @@ fn parseModelsDevModelIds(
     var it = models_val.object.iterator();
     while (it.next()) |entry| {
         if (!modelsDevModelSupportsChat(entry.key_ptr.*, entry.value_ptr.*)) continue;
-        try result.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+        try appendOwnedCopy(allocator, &result, entry.key_ptr.*);
     }
 
     if (result.items.len == 0) {
@@ -736,6 +740,12 @@ fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
     return false;
 }
 
+fn appendOwnedCopy(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
 fn jsonArrayIsEmpty(value: std.json.Value) bool {
     return value == .array and value.array.items.len == 0;
 }
@@ -751,115 +761,66 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn nearAiModelSupportsChat(model_id: []const u8, model_obj: std.json.ObjectMap) bool {
-    if (std.ascii.eqlIgnoreCase(model_id, "openai/privacy-filter")) return false;
-    if (containsAsciiIgnoreCase(model_id, "reranker")) return false;
-    if (containsAsciiIgnoreCase(model_id, "whisper")) return false;
+fn modelIdLooksNonChat(model_id: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(model_id, "openai/privacy-filter")) return true;
+    return containsAsciiIgnoreCase(model_id, "embedding") or
+        containsAsciiIgnoreCase(model_id, "reranker") or
+        containsAsciiIgnoreCase(model_id, "whisper");
+}
 
-    const metadata_val = model_obj.get("metadata") orelse return true;
-    if (metadata_val != .object) return true;
-
-    const architecture_val = metadata_val.object.get("architecture") orelse return true;
-    if (architecture_val != .object) return true;
-
-    const input_val = architecture_val.object.get("inputModalities");
-    const output_val = architecture_val.object.get("outputModalities");
-
+fn modalitiesSupportChat(input_val: ?std.json.Value, output_val: ?std.json.Value) bool {
     if (input_val) |input| {
-        if (jsonStringArrayContains(input, "audio")) return false;
+        if (jsonArrayIsEmpty(input)) return false;
+        if (input == .array and !jsonStringArrayContains(input, "text")) return false;
     }
     if (output_val) |output| {
+        if (jsonArrayIsEmpty(output)) return false;
+        if (output == .array and !jsonStringArrayContains(output, "text")) return false;
         if (jsonStringArrayContains(output, "embedding")) return false;
         if (jsonStringArrayContains(output, "image")) return false;
-        if (!jsonStringArrayContains(output, "text")) return false;
+        if (jsonStringArrayContains(output, "audio")) return false;
     }
-    if (input_val != null and output_val != null and jsonArrayIsEmpty(input_val.?) and jsonArrayIsEmpty(output_val.?)) {
+
+    return true;
+}
+
+fn openAiModelSupportsChat(model_id: []const u8, model_obj: std.json.ObjectMap) bool {
+    if (modelIdLooksNonChat(model_id)) return false;
+
+    if (model_obj.get("architecture")) |architecture_val| {
+        if (architecture_val == .object and
+            !modalitiesSupportChat(
+                architecture_val.object.get("inputModalities"),
+                architecture_val.object.get("outputModalities"),
+            ))
+        {
+            return false;
+        }
+    }
+
+    if (!modalitiesSupportChat(model_obj.get("input_modalities"), model_obj.get("output_modalities"))) {
         return false;
     }
 
     return true;
 }
 
-fn parseNearAiModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![][]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
+const ModelIdParseOptions = struct {
+    prefix_filter: ?[]const u8 = null,
+    require_chat_modalities: bool = false,
+};
+
+fn parseOpenAiModelIds(allocator: std.mem.Allocator, json_response: []const u8, options: ModelIdParseOptions) ![][]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.FetchFailed,
+    };
     defer parsed.deinit();
 
     const root = parsed.value;
     if (root != .object) return error.FetchFailed;
-    const models = root.object.get("models") orelse return error.FetchFailed;
-    if (models != .array) return error.FetchFailed;
-
-    var result: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (result.items) |item| allocator.free(item);
-        result.deinit(allocator);
-    }
-
-    for (models.array.items) |item| {
-        if (item != .object) continue;
-        const model_id_val = item.object.get("modelId") orelse continue;
-        if (model_id_val != .string) continue;
-        if (!nearAiModelSupportsChat(model_id_val.string, item.object)) continue;
-        try result.append(allocator, try allocator.dupe(u8, model_id_val.string));
-    }
-
-    sortModelIds(result.items);
-    return result.toOwnedSlice(allocator);
-}
-
-fn fetchAndParseNearAiModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8) ![][]const u8 {
-    const response = http_util.curlGet(allocator, url, &.{}, "10") catch |err| {
-        logModelCatalogFailureErr(url, provider, err);
-        return error.FetchFailed;
-    };
-    defer allocator.free(response);
-
-    if (response.len == 0) {
-        logModelCatalogFailure(url, provider, "empty response body");
-        return error.FetchFailed;
-    }
-
-    const models = try parseNearAiModelIds(allocator, response);
-    if (models.len == 0) {
-        allocator.free(models);
-        logModelCatalogFailure(url, provider, "no chat-capable models found");
-        return error.FetchFailed;
-    }
-    return models;
-}
-
-fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
-    const response = http_util.curlGet(allocator, url, headers, "10") catch |err| {
-        logModelCatalogFailureErr(url, provider, err);
-        return error.FetchFailed;
-    };
-    defer allocator.free(response);
-
-    if (response.len == 0) {
-        logModelCatalogFailure(url, provider, "empty response body");
-        return error.FetchFailed;
-    }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err| {
-        logModelCatalogFailureErr(url, provider, err);
-        return error.FetchFailed;
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value;
-    if (root != .object) {
-        logModelCatalogFailure(url, provider, "top-level JSON is not an object");
-        return error.FetchFailed;
-    }
-
-    const data = root.object.get("data") orelse {
-        logModelCatalogFailure(url, provider, "missing data array");
-        return error.FetchFailed;
-    };
-    if (data != .array) {
-        logModelCatalogFailure(url, provider, "data field is not an array");
-        return error.FetchFailed;
-    }
+    const data = root.object.get("data") orelse return error.FetchFailed;
+    if (data != .array) return error.FetchFailed;
 
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -871,19 +832,42 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: 
         if (item != .object) continue;
         const id_val = item.object.get("id") orelse continue;
         if (id_val != .string) continue;
-        // Apply prefix filter (e.g. "gpt-" for OpenAI)
-        if (prefix_filter) |pf| {
-            if (!std.mem.startsWith(u8, id_val.string, pf)) continue;
+
+        if (options.prefix_filter) |prefix_filter| {
+            if (!std.mem.startsWith(u8, id_val.string, prefix_filter)) continue;
         }
-        try result.append(allocator, try allocator.dupe(u8, id_val.string));
+        if (options.require_chat_modalities and !openAiModelSupportsChat(id_val.string, item.object)) continue;
+
+        try appendOwnedCopy(allocator, &result, id_val.string);
     }
 
-    if (result.items.len == 0) {
+    sortModelIds(result.items);
+    return result.toOwnedSlice(allocator);
+}
+
+fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, options: ModelIdParseOptions) ![][]const u8 {
+    const response = http_util.curlGet(allocator, url, headers, "10") catch |err| {
+        logModelCatalogFailureErr(url, provider, err);
+        return error.FetchFailed;
+    };
+    defer allocator.free(response);
+
+    if (response.len == 0) {
+        logModelCatalogFailure(url, provider, "empty response body");
+        return error.FetchFailed;
+    }
+
+    const models = parseOpenAiModelIds(allocator, response, options) catch |err| {
+        logModelCatalogFailureErr(url, provider, err);
+        return error.FetchFailed;
+    };
+
+    if (models.len == 0) {
+        allocator.free(models);
         logModelCatalogFailure(url, provider, "no models matched the provider response");
         return error.FetchFailed;
     }
-    sortModelIds(result.items);
-    return result.toOwnedSlice(allocator);
+    return models;
 }
 
 /// Build the models endpoint URL for an OpenAI-compatible API.
@@ -973,7 +957,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 
     for (provider_val.array.items) |item| {
         if (item != .string) continue;
-        try result.append(allocator, try allocator.dupe(u8, item.string));
+        try appendOwnedCopy(allocator, &result, item.string);
     }
 
     if (result.items.len == 0) return error.CacheEmpty;
@@ -1012,7 +996,10 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 /// Parse a mock OpenRouter-style JSON response and extract model IDs.
 /// Used for testing the JSON parsing logic without network access.
 pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![][]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.FetchFailed,
+    };
     defer parsed.deinit();
 
     const root = parsed.value;
@@ -1030,7 +1017,7 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
         if (item != .object) continue;
         const id_val = item.object.get("id") orelse continue;
         if (id_val != .string) continue;
-        try result.append(allocator, try allocator.dupe(u8, id_val.string));
+        try appendOwnedCopy(allocator, &result, id_val.string);
     }
 
     sortModelIds(result.items);
@@ -1629,11 +1616,11 @@ fn parseTelegramAllowFrom(allocator: std.mem.Allocator, raw: []const u8) ![]cons
         }
         if (exists) continue;
 
-        try allow.append(allocator, try allocator.dupe(u8, normalized));
+        try appendOwnedCopy(allocator, &allow, normalized);
     }
 
     if (allow.items.len == 0) {
-        try allow.append(allocator, try allocator.dupe(u8, "*"));
+        try appendOwnedCopy(allocator, &allow, "*");
     }
 
     return allow.toOwnedSlice(allocator);
@@ -1650,7 +1637,7 @@ fn parseWizardTokenList(allocator: std.mem.Allocator, raw: []const u8) ![]const 
     while (tokens.next()) |token| {
         const trimmed = std.mem.trim(u8, token, " \t\r\n");
         if (trimmed.len == 0) continue;
-        try items.append(allocator, try allocator.dupe(u8, trimmed));
+        try appendOwnedCopy(allocator, &items, trimmed);
     }
 
     if (items.items.len == 0) return &.{};
@@ -4838,68 +4825,77 @@ test "parseModelIds skips entries without id" {
     try std.testing.expectEqualStrings("model-b", models[1]);
 }
 
-test "parseNearAiModelIds extracts chat models and filters non-chat entries" {
+fn freeOwnedModelList(allocator: std.mem.Allocator, models: [][]const u8) void {
+    for (models) |m| allocator.free(m);
+    allocator.free(models);
+}
+
+test "parseOpenAiModelIds filters non-chat NEAR model catalog entries" {
     const json =
-        \\{"models": [
+        \\{"data": [
         \\  {
-        \\    "modelId": "zai-org/GLM-5.1-FP8",
-        \\    "metadata": {
-        \\      "architecture": {
-        \\        "inputModalities": ["text"],
-        \\        "outputModalities": ["text"]
-        \\      }
+        \\    "id": "zai-org/GLM-5.1-FP8",
+        \\    "architecture": {
+        \\      "inputModalities": ["text"],
+        \\      "outputModalities": ["text"]
         \\    }
         \\  },
         \\  {
-        \\    "modelId": "openai/privacy-filter",
-        \\    "metadata": {
-        \\      "architecture": {
-        \\        "inputModalities": ["text"],
-        \\        "outputModalities": ["text"]
-        \\      }
+        \\    "id": "openai/privacy-filter",
+        \\    "architecture": {
+        \\      "inputModalities": ["text"],
+        \\      "outputModalities": ["text"]
         \\    }
         \\  },
         \\  {
-        \\    "modelId": "Qwen/Qwen3-Embedding-0.6B",
-        \\    "metadata": {
-        \\      "architecture": {
-        \\        "inputModalities": ["text"],
-        \\        "outputModalities": ["embedding"]
-        \\      }
+        \\    "id": "Qwen/Qwen3-Embedding-0.6B",
+        \\    "architecture": {
+        \\      "inputModalities": ["text"],
+        \\      "outputModalities": ["embedding"]
         \\    }
         \\  },
         \\  {
-        \\    "modelId": "black-forest-labs/FLUX.2-klein-4B",
-        \\    "metadata": {
-        \\      "architecture": {
-        \\        "inputModalities": ["text"],
-        \\        "outputModalities": ["image"]
-        \\      }
+        \\    "id": "black-forest-labs/FLUX.2-klein-4B",
+        \\    "architecture": {
+        \\      "inputModalities": ["text"],
+        \\      "outputModalities": ["image"]
         \\    }
         \\  },
         \\  {
-        \\    "modelId": "openai/whisper-large-v3",
-        \\    "metadata": {
-        \\      "architecture": {
-        \\        "inputModalities": ["audio"],
-        \\        "outputModalities": ["text"]
-        \\      }
+        \\    "id": "openai/whisper-large-v3",
+        \\    "architecture": {
+        \\      "inputModalities": ["audio"],
+        \\      "outputModalities": ["text"]
         \\    }
         \\  },
-        \\  {"modelId": "Qwen/Qwen3-Reranker-0.6B"},
-        \\  {"modelId": "incomplete/empty", "metadata": {"architecture": {"inputModalities": [], "outputModalities": []}}},
-        \\  {"modelId": "anthropic/claude-opus-4-7"}
+        \\  {"id": "Qwen/Qwen3-Reranker-0.6B", "architecture": {"inputModalities": ["text"], "outputModalities": ["text"]}},
+        \\  {"id": "incomplete/empty", "architecture": {"inputModalities": [], "outputModalities": []}},
+        \\  {"id": "anthropic/claude-opus-4-7", "input_modalities": ["text"], "output_modalities": ["text"]}
         \\]}
     ;
-    const models = try parseNearAiModelIds(std.testing.allocator, json);
-    defer {
-        for (models) |m| std.testing.allocator.free(m);
-        std.testing.allocator.free(models);
-    }
+    const models = try parseOpenAiModelIds(std.testing.allocator, json, .{ .require_chat_modalities = true });
+    defer freeOwnedModelList(std.testing.allocator, models);
 
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4-7", models[0]);
     try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", models[1]);
+}
+
+fn parseOpenAiModelIdsAllocationTest(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"data": [
+        \\  {"id": "zai-org/GLM-5.1-FP8", "architecture": {"inputModalities": ["text"], "outputModalities": ["text"]}},
+        \\  {"id": "anthropic/claude-opus-4-7", "input_modalities": ["text"], "output_modalities": ["text"]},
+        \\  {"id": "Qwen/Qwen3-Embedding-0.6B", "architecture": {"inputModalities": ["text"], "outputModalities": ["embedding"]}}
+        \\]}
+    ;
+    const models = try parseOpenAiModelIds(allocator, json, .{ .require_chat_modalities = true });
+    defer freeOwnedModelList(allocator, models);
+}
+
+test "parseOpenAiModelIds frees partial allocations on out-of-memory" {
+    // Regression: model catalog parsing must not leak an owned id when ArrayList growth fails.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseOpenAiModelIdsAllocationTest, .{});
 }
 
 test "cache read returns error for missing file" {
