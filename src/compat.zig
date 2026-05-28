@@ -229,8 +229,39 @@ pub const time = struct {
 };
 
 pub const thread = struct {
-    pub fn sleep(nanoseconds: u64) void {
+    fn sleepWithIo(nanoseconds: u64) void {
         std.Io.sleep(io(), .fromNanoseconds(@intCast(nanoseconds)), .awake) catch {};
+    }
+
+    fn sleepWithNanosleep(nanoseconds: u64) void {
+        var req = std.posix.timespec{
+            .sec = @intCast(nanoseconds / std.time.ns_per_s),
+            .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+        };
+        var rem: std.posix.timespec = undefined;
+
+        while (true) {
+            switch (std.posix.errno(std.posix.system.nanosleep(&req, &rem))) {
+                .SUCCESS => return,
+                .INTR => req = rem,
+                else => return,
+            }
+        }
+    }
+
+    pub fn sleep(nanoseconds: u64) void {
+        if (nanoseconds == 0) return;
+        switch (builtin.os.tag) {
+            .windows, .wasi => sleepWithIo(nanoseconds),
+            .linux => sleepWithNanosleep(nanoseconds),
+            else => if (comptime builtin.link_libc) {
+                // POSIX with libc: bypass std.Io.sleep's cooperative yield, which
+                // does not actually suspend the OS thread in Threaded IO context.
+                sleepWithNanosleep(nanoseconds);
+            } else {
+                sleepWithIo(nanoseconds);
+            },
+        }
     }
 };
 
@@ -293,6 +324,19 @@ pub const sync = struct {
         }
     };
 };
+
+test "thread.sleep zero duration returns immediately without syscall" {
+    // Regression: std.Io.sleep cooperative yield does not actually suspend the OS thread.
+    // Smoke-test that sleep(0) takes the early-return path without panicking.
+    thread.sleep(0);
+}
+
+test "thread.sleep short duration completes without panic" {
+    // Smoke-test that the nanosleep path (POSIX) or std.Io.sleep path (Windows) is
+    // reachable and does not panic. 1 ns resolves instantly in practice.
+    // NOTE: No timing assertion — wall-clock assertions would be flaky on CI.
+    thread.sleep(1);
+}
 
 test {
     std.testing.refAllDecls(@This());

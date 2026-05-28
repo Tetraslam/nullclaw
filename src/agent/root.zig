@@ -6216,7 +6216,7 @@ test "slash /model provider renders interactive model choices for selected provi
 
     try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model anthropic/claude-sonnet-4-6") != null);
 }
 
 test "slash /model with a single configured provider renders models directly" {
@@ -6237,7 +6237,7 @@ test "slash /model with a single configured provider renders models directly" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model anthropic/claude-sonnet-4-6") != null);
 }
 
 test "slash /model renders interactive choices for routed slack sessions" {

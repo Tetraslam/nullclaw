@@ -282,11 +282,13 @@ fn curlPostFromFile(
     argv_buf[argc] = "POST";
     argc += 1;
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, headers);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
+        if (argc + 2 > argv_buf.len) return error.CurlFailed;
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 

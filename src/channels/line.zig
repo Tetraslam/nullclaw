@@ -93,7 +93,7 @@ pub const LineChannel = struct {
         try auth_writer.print("Authorization: Bearer {s}", .{self.config.access_token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, REPLY_URL, body, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, REPLY_URL, body, &.{auth_header}, null) catch |err| {
             log.err("replyMessage failed: {}", .{err});
             return error.LineApiError;
         };
@@ -110,7 +110,7 @@ pub const LineChannel = struct {
         try auth_writer.print("Authorization: Bearer {s}", .{self.config.access_token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, PUSH_URL, body, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, PUSH_URL, body, &.{auth_header}, null) catch |err| {
             log.err("pushMessage failed: {}", .{err});
             return error.LineApiError;
         };
@@ -237,19 +237,17 @@ pub const LineChannel = struct {
     ) ![]LineEvent {
         const events = try parseWebhookEvents(self.allocator, payload);
 
-        if (self.config.allow_from.len == 0) return events;
-
         // Filter in-place: keep only allowed events
         var kept: usize = 0;
         for (events) |*ev| {
             if (ev.user_id) |uid| {
-                if (!root.isAllowedScoped("line channel", self.config.allow_from, uid)) {
-                    ev.deinit(self.allocator);
+                if (root.isAllowedScoped("line channel", self.config.allow_from, uid)) {
+                    events[kept] = ev.*;
+                    kept += 1;
                     continue;
                 }
             }
-            events[kept] = ev.*;
-            kept += 1;
+            ev.deinit(self.allocator);
         }
 
         if (kept == events.len) return events;
@@ -986,11 +984,35 @@ test "line parseAndFilterEvents mixed allowlist keeps only allowed events" {
     try std.testing.expectEqualStrings("A", events[0].message_text.?);
 }
 
-test "line parseAndFilterEvents empty allow_from passes all" {
+test "line parseAndFilterEvents empty allow_from denies all" {
     const allocator = std.testing.allocator;
     var ch = LineChannel.init(allocator, .{
         .access_token = "tok",
         .channel_secret = "sec",
+    });
+
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"tok1","source":{"type":"user","userId":"Uany"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"Hello"}}]}
+    ;
+
+    const events = try ch.parseAndFilterEvents(payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), events.len);
+}
+
+test "line parseAndFilterEvents wildcard allow_from passes all" {
+    const allocator = std.testing.allocator;
+    var ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .allow_from = &.{"*"},
     });
 
     const payload =

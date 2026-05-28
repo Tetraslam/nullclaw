@@ -102,7 +102,7 @@ nullclaw onboard --interactive
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。
-- 常见 provider：`openrouter`、`openai`、`anthropic`、`groq` 等。
+- 常见 provider：`openrouter`、`openai`、`anthropic`、`groq`、`nearai`、`atlas-cloud` 等。
 
 示例：
 
@@ -111,6 +111,8 @@ nullclaw onboard --interactive
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
+      "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
     }
@@ -426,6 +428,7 @@ Telegram 示例：
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
       }
@@ -465,8 +468,9 @@ WeChat 说明：
 
 规则说明：
 
-- 空 `allow_from` 的行为因渠道而异。有些渠道（例如 WeChat 和 Discord）会把省略或留空视为“关闭过滤”，而不是“拒绝所有”；如果要做私有机器人，请显式填写 ID/OpenID。
+- 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
+- Telegram webhook 必须配置 `channels.telegram.accounts.<id>.webhook_secret`，并要求 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` header 匹配。
 - Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：
@@ -537,6 +541,7 @@ Telegram forum topics：
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
           "binding_commands_enabled": true,

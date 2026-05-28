@@ -1528,6 +1528,7 @@ pub const Config = struct {
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
+        InvalidTelegramWebhookSecret,
         InvalidTeamsWebhookSecret,
         InvalidWebMessageAuthMode,
         InvalidWebMessageAuthTransport,
@@ -1740,6 +1741,13 @@ pub const Config = struct {
                 }
             }
         }
+        for (self.channels.telegram) |telegram_cfg| {
+            if (telegram_cfg.webhook_secret) |webhook_secret| {
+                if (!config_types.TelegramConfig.isValidWebhookSecret(webhook_secret)) {
+                    return ValidationError.InvalidTelegramWebhookSecret;
+                }
+            }
+        }
         for (self.channels.teams) |teams_cfg| {
             if (teams_cfg.webhook_secret) |webhook_secret| {
                 if (!config_types.TeamsConfig.isValidWebhookSecret(webhook_secret)) {
@@ -1797,6 +1805,7 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidTelegramWebhookSecret => std.debug.print("Config error: channels.telegram.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidTeamsWebhookSecret => std.debug.print("Config error: channels.teams.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
             ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
@@ -3303,6 +3312,46 @@ test "validation rejects malformed web auth token" {
         },
     };
     try std.testing.expectError(Config.ValidationError.InvalidWebAuthToken, cfg.validate());
+}
+
+test "validation rejects malformed telegram webhook secret" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .webhook_secret = "short",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidTelegramWebhookSecret, cfg.validate());
+}
+
+test "validation accepts telegram config with valid webhook secret" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .webhook_secret = "telegram-webhook-secret-012345",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try cfg.validate();
 }
 
 test "validation accepts teams config without webhook secret" {
@@ -6595,7 +6644,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "webhook_secret": "telegram-webhook-secret-012345", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6603,6 +6652,7 @@ test "parse telegram accounts" {
     const tg = cfg.channels.telegram[0];
     try std.testing.expectEqualStrings("main", tg.account_id);
     try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
+    try std.testing.expectEqualStrings("telegram-webhook-secret-012345", tg.webhook_secret.?);
     try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
@@ -6622,6 +6672,7 @@ test "parse telegram accounts" {
     try std.testing.expect(!tg.interactive.remove_on_click);
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
+    allocator.free(tg.webhook_secret.?);
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
