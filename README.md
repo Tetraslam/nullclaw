@@ -173,11 +173,14 @@ make up
 ```
 
 `make config` runs `nullclaw onboard --interactive` inside the agent container.
-For non-interactive setup:
+Pass only non-secret flags through `CONFIG_ARGS`:
 
 ```bash
-make config CONFIG_ARGS="--api-key sk-... --provider openrouter"
+make config CONFIG_ARGS="--provider openrouter"
 ```
+
+Avoid putting API keys or bot tokens in `CONFIG_ARGS`; command-line arguments
+can be exposed through shell history and process listings.
 
 The compose gateway defaults to `NULLCLAW_PORT=3210`, binds inside the
 container on `0.0.0.0`, and publishes to localhost on the host:

@@ -10,7 +10,17 @@ services:
   init-data:
     image: alpine:3.23
     profiles: ["agent", "gateway"]
-    command: ["sh", "-lc", "mkdir -p /nullclaw-data/workspace && chown -R ${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534} /nullclaw-data"]
+    environment:
+      NULLCLAW_UID: "${NULLCLAW_UID:-65534}"
+      NULLCLAW_GID: "${NULLCLAW_GID:-65534}"
+    command:
+      - sh
+      - -ec
+      - |
+        case "$$NULLCLAW_UID" in (""|*[!0-9]*) echo "invalid NULLCLAW_UID" >&2; exit 1;; esac
+        case "$$NULLCLAW_GID" in (""|*[!0-9]*) echo "invalid NULLCLAW_GID" >&2; exit 1;; esac
+        mkdir -p /nullclaw-data/workspace
+        chown -R "$$NULLCLAW_UID:$$NULLCLAW_GID" /nullclaw-data
     volumes:
       - nullclaw-data:/nullclaw-data
       - ./workspace:/nullclaw-data/workspace
