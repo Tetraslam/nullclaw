@@ -312,6 +312,7 @@ pub const Agent = struct {
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
+    compact_context: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -625,6 +626,7 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
+            .compact_context = cfg.agent.compact_context,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
@@ -864,6 +866,15 @@ pub const Agent = struct {
         const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
         if (completion_budget_u32 == 0) return 1;
         return @max(@as(u32, 1), @min(max_tokens, completion_budget_u32));
+    }
+
+    /// Proactively auto-compact history, honoring `agent.compact_context`.
+    /// When the flag is disabled the history is left untouched (the user is
+    /// managing context themselves). Emergency `forceCompressHistory` used for
+    /// context-exhaustion recovery is intentionally not gated by this flag.
+    pub fn maybeAutoCompactHistory(self: *Agent) bool {
+        if (!self.compact_context) return false;
+        return self.autoCompactHistory() catch false;
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -2580,8 +2591,8 @@ pub const Agent = struct {
                     .content = try self.dupeForHistory(display_text),
                 });
 
-                // Auto-compaction before hard trimming to preserve context
-                self.last_turn_compacted = self.autoCompactHistory() catch false;
+                // Auto-compaction before hard trimming to preserve context.
+                self.last_turn_compacted = self.maybeAutoCompactHistory();
                 self.trimHistory();
 
                 // Auto-save assistant response
@@ -2873,7 +2884,7 @@ pub const Agent = struct {
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
-        self.last_turn_compacted = self.autoCompactHistory() catch false;
+        self.last_turn_compacted = self.maybeAutoCompactHistory();
         self.trimHistory();
 
         const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -3994,6 +4005,106 @@ test "compaction module reexport" {
     _ = compaction.forceCompressHistory;
     _ = compaction.trimHistory;
     _ = compaction.CompactionConfig;
+}
+
+// Minimal provider that returns a fixed summary and counts invocations,
+// used to observe whether maybeAutoCompactHistory reached the summarizer.
+const CompactionTestProvider = struct {
+    calls: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *CompactionTestProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return .{ .content = try allocator.dupe(u8, "auto summary") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "compaction-test-provider";
+    }
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+};
+
+fn makeCompactionTestAgent(allocator: std.mem.Allocator, observer: anytype, provider: Provider, compact_context: bool) Agent {
+    return Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = &.{},
+        .mem = null,
+        .observer = observer,
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 4,
+        .auto_save = false,
+        .compact_context = compact_context,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .token_limit = 0,
+    };
+}
+
+fn fillOverThreshold(allocator: std.mem.Allocator, agent: *Agent) !void {
+    try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "system prompt") });
+    for (0..12) |i| {
+        try agent.history.append(allocator, .{ .role = .user, .content = try std.fmt.allocPrint(allocator, "message {d}", .{i}) });
+        try agent.history.append(allocator, .{ .role = .assistant, .content = try std.fmt.allocPrint(allocator, "reply {d}", .{i}) });
+    }
+}
+
+test "maybeAutoCompactHistory skips compaction when compact_context is false (regression #937)" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, false);
+    defer agent.deinit();
+    try fillOverThreshold(allocator, &agent);
+
+    const len_before = agent.history.items.len;
+    const compacted = agent.maybeAutoCompactHistory();
+
+    // Flag is off: history is left untouched and the summarizer is never called,
+    // even though the message count is well over max_history_messages.
+    try std.testing.expect(!compacted);
+    try std.testing.expectEqual(len_before, agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "maybeAutoCompactHistory compacts when compact_context is true" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, true);
+    defer agent.deinit();
+    try fillOverThreshold(allocator, &agent);
+
+    const len_before = agent.history.items.len;
+    const compacted = agent.maybeAutoCompactHistory();
+
+    // Flag is on: the same over-threshold history is compacted and the
+    // summarizer is invoked, shrinking the message count.
+    try std.testing.expect(compacted);
+    try std.testing.expect(agent.history.items.len < len_before);
+    try std.testing.expect(provider_state.calls > 0);
 }
 
 test "cli module reexport" {

@@ -375,7 +375,11 @@ pub const ToolFilterGroup = struct {
 };
 
 pub const AgentConfig = struct {
-    compact_context: bool = false,
+    /// When true (default), history is auto-compacted once it crosses the
+    /// token / message thresholds. Set to false to leave history untouched
+    /// and manage context yourself. Default is true to preserve the
+    /// historical always-compact behavior.
+    compact_context: bool = true,
     max_tool_iterations: u32 = 1000,
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
