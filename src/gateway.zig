@@ -493,6 +493,7 @@ pub const GatewayState = struct {
     whatsapp_account_id: []const u8 = "default",
     telegram_bot_token: []const u8,
     telegram_account_id: []const u8 = "default",
+    telegram_webhook_secret: ?[]const u8 = null,
     telegram_allow_from: []const []const u8 = &.{},
     whatsapp_allow_from: []const []const u8 = &.{},
     whatsapp_group_allow_from: []const []const u8 = &.{},
@@ -1917,7 +1918,7 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
 }
 
 fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
-    if (allow_from.len == 0) return true;
+    if (allow_from.len == 0) return false;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -1943,6 +1944,19 @@ fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []con
     }
 
     return false;
+}
+
+fn telegramWebhookSecretMatches(raw_request: []const u8, configured_secret: ?[]const u8) bool {
+    const secret = configured_secret orelse return false;
+    if (secret.len == 0) return false;
+    const header = extractHeader(raw_request, "X-Telegram-Bot-Api-Secret-Token") orelse return false;
+    const trimmed = std.mem.trim(u8, header, " \t\r\n");
+    return constantTimeEq(trimmed, secret);
+}
+
+fn lineSenderAllowed(allow_from: []const []const u8, evt: channels.line.LineEvent) bool {
+    const user_id = evt.user_id orelse return false;
+    return channels.isAllowed(allow_from, user_id);
 }
 
 fn telegramSessionKeyRouted(
@@ -2631,48 +2645,45 @@ pub fn sendTelegramReply(
     message_thread_id: ?i64,
     text: []const u8,
 ) !void {
-    // Build the curl command to call the Telegram API
+    const body = try buildTelegramReplyBody(allocator, chat_id, message_thread_id, text);
+    defer allocator.free(body);
+
+    // Tests cover the JSON construction above; skip the real Telegram side effect.
+    if (comptime builtin.is_test) return;
+
     const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
     defer allocator.free(url);
 
-    // JSON-escape the text for the body
-    var body_buf: std.ArrayList(u8) = .empty;
-    defer body_buf.deinit(allocator);
-    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_buf);
-    const w = &body_writer.writer;
-    try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
-    for (text) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeAll("\"");
+    const resp = http_util.httpRequest(allocator, .POST, url, body, &.{}, "application/json", null) catch return;
+    allocator.free(resp);
+}
+
+fn buildTelegramReplyBody(
+    allocator: std.mem.Allocator,
+    chat_id: i64,
+    message_thread_id: ?i64,
+    text: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    var int_buf: [32]u8 = undefined;
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{chat_id}) catch "0");
+    try body.appendSlice(allocator, ",\"text\":");
+    try appendJsonStringBuf(&body, allocator, text);
     if (message_thread_id) |thread_id| {
-        try w.print(",\"message_thread_id\":{d}", .{thread_id});
+        try body.appendSlice(allocator, ",\"message_thread_id\":");
+        try body.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{thread_id}) catch "0");
     }
-    try w.writeAll("}");
-    body_buf = body_writer.toArrayList();
+    try body.appendSlice(allocator, "}");
+    return body.toOwnedSlice(allocator);
+}
 
-    const body = body_buf.items;
-
-    var curl_child = std_compat.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
+test "telegram reply body escapes text and includes thread" {
+    const body = try buildTelegramReplyBody(std.testing.allocator, 42, 7, "hello \"there\"\nnext");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"chat_id\":42,\"text\":\"hello \\\"there\\\"\\nnext\",\"message_thread_id\":7}", body);
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
@@ -3323,10 +3334,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var tg_bot_token = ctx.state.telegram_bot_token;
         var tg_allow_from = ctx.state.telegram_allow_from;
         var tg_account_id = ctx.state.telegram_account_id;
+        var tg_webhook_secret = ctx.state.telegram_webhook_secret;
         if (selectTelegramConfig(ctx.config_opt, ctx.target)) |tg_cfg| {
             tg_bot_token = tg_cfg.bot_token;
             tg_allow_from = tg_cfg.allow_from;
             tg_account_id = tg_cfg.account_id;
+            tg_webhook_secret = tg_cfg.webhook_secret;
+        }
+
+        if (!telegramWebhookSecretMatches(ctx.raw_request, tg_webhook_secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
         }
 
         const msg_text = jsonStringField(b, "text");
@@ -4062,11 +4081,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
             return;
         };
         for (events) |evt| {
-            if (line_allow_from.len > 0) {
-                if (evt.user_id) |uid| {
-                    if (!channels.isAllowed(line_allow_from, uid)) continue;
-                } else continue;
-            }
+            if (!lineSenderAllowed(line_allow_from, evt)) continue;
             if (evt.message_text) |text| {
                 var kb: [128]u8 = undefined;
                 const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
@@ -5375,6 +5390,21 @@ fn nextAcceptSleepMs(previous_sleep_ms: u64, err: anyerror) u64 {
     return @min(base * 2, ACCEPT_ERROR_BACKOFF_MAX_MS);
 }
 
+fn probeGatewayAddressAvailable(addr: std_compat.net.Address) !void {
+    if (comptime builtin.os.tag == .windows) {
+        var probe_server: ?std_compat.net.Server = addr.listen(.{ .reuse_address = false }) catch |err| switch (err) {
+            error.AddressInUse => return error.AddressInUse,
+            else => null,
+        };
+        if (probe_server) |*server| server.deinit();
+        return;
+    }
+
+    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch return;
+    probe_conn.close();
+    return error.AddressInUse;
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -5450,6 +5480,7 @@ pub fn run(
             state.telegram_bot_token = tg_cfg.bot_token;
             state.telegram_allow_from = tg_cfg.allow_from;
             state.telegram_account_id = tg_cfg.account_id;
+            state.telegram_webhook_secret = tg_cfg.webhook_secret;
         }
         if (cfg.channels.whatsappPrimary()) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
@@ -5520,11 +5551,7 @@ pub fn run(
     // Best-effort probe to detect if the port is already in use.
     // A TOCTOU gap exists between probe and listen(), but listen() will still
     // fail with AddressInUse if another process binds the port in that window.
-    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch null;
-    if (probe_conn) |conn| {
-        conn.close();
-        return error.AddressInUse;
-    }
+    try probeGatewayAddressAvailable(addr);
 
     var server = try addr.listen(.{
         .reuse_address = true,
@@ -7821,12 +7848,43 @@ test "whatsappSessionKey builds group key when group id exists" {
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
 }
 
-test "telegramSenderAllowed permits when allow_from is empty" {
+test "telegramSenderAllowed denies when allow_from is empty" {
     const allocator = std.testing.allocator;
     const body =
         \\{"message":{"from":{"id":12345,"username":"alice"}}}
     ;
-    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+    try std.testing.expect(!telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramSenderAllowed wildcard explicitly permits all senders" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    const allow_from = [_][]const u8{"*"};
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramWebhookSecretMatches requires configured secret header" {
+    const raw =
+        "POST /telegram HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Telegram-Bot-Api-Secret-Token: test-secret\r\n" ++
+        "\r\n{}";
+    try std.testing.expect(telegramWebhookSecretMatches(raw, "test-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, "wrong-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, null));
+}
+
+test "lineSenderAllowed denies empty allow_from and permits wildcard" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U123",
+    };
+    try std.testing.expect(!lineSenderAllowed(&.{}, evt));
+    try std.testing.expect(lineSenderAllowed(&.{"*"}, evt));
+    try std.testing.expect(lineSenderAllowed(&.{"U123"}, evt));
+    try std.testing.expect(!lineSenderAllowed(&.{"U999"}, evt));
 }
 
 test "telegramChatId extracts nested message.chat.id" {
@@ -9937,10 +9995,29 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 // ── Port conflict detection tests ─────────────────────────────────────
 
+test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
+    // Windows Zig 0.16 socket reuse/exclusive-bind behavior can permit another
+    // listener instead of reporting AddressInUse; keep this runtime conflict
+    // regression on platforms where the bind semantics are deterministic.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var listener = try test_addr.listen(.{ .reuse_address = false });
+    defer listener.deinit();
+
+    // Regression: the gateway probe must not silently treat an active listener
+    // as available before the final listen call.
+    try std.testing.expectError(error.AddressInUse, probeGatewayAddressAvailable(listener.listen_address));
+}
+
 test "run returns AddressInUse when port is already bound" {
+    // Avoid calling run() for this conflict case on Windows: if the OS accepts
+    // the second bind, run() owns the gateway accept loop and the test hangs.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
     // Find an available port by binding to port 0
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var listener = try test_addr.listen(.{ .reuse_address = true });
+    var listener = try test_addr.listen(.{ .reuse_address = false });
     defer listener.deinit();
 
     // Get the actual port that was assigned

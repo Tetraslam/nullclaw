@@ -21,6 +21,7 @@
 | `/cron/pause` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 暂停实时 cron 任务 |
 | `/cron/resume` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 恢复实时 cron 任务 |
 | `/cron/update` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 部分更新实时 cron 任务 |
+| `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` 必须匹配 `channels.telegram.accounts.<id>.webhook_secret` | Telegram 入站 webhook |
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
 | `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
