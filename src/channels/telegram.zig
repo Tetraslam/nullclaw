@@ -5025,6 +5025,49 @@ test "telegram processUpdate falls back to caption when text is absent" {
     try std.testing.expectEqualStrings("caption-only fallback", messages.items[0].content);
 }
 
+test "telegram processUpdate includes reply context in message content" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{
+        \\  "update_id": 1,
+        \\  "message": {
+        \\    "message_id": 42,
+        \\    "from": {"id": 1001, "username": "tester", "first_name": "Test"},
+        \\    "chat": {"id": 2002, "type": "private"},
+        \\    "reply_to_message": {"message_id": 41, "text": "Here are the results"},
+        \\    "text": "show me more"
+        \\  }
+        \\}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+    var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (media_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        media_group_ids.deinit(alloc);
+    }
+
+    ch.processUpdate(alloc, parsed.value, &messages, &media_group_ids);
+
+    // Regression: Telegram replies must carry the replied-to text into the agent input.
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", messages.items[0].content);
+}
+
 test "telegram nextPendingMediaDeadline returns earliest group deadline" {
     const group_ids = [_]?[]const u8{
         "group-a",

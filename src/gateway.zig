@@ -39,6 +39,7 @@ const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const isPublicBindHost = @import("security/pairing.zig").isPublicBind;
 const channels = @import("channels/root.zig");
+const telegram_update_ingress = @import("channels/telegram_update_ingress.zig");
 const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
@@ -2010,6 +2011,28 @@ fn telegramMessageValue(root: std.json.Value) ?std.json.Value {
     return root.object.get("message") orelse root.object.get("edited_message");
 }
 
+fn telegramMessageContentAlloc(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        if (jsonStringField(body, "text")) |text| {
+            return allocator.dupe(u8, text) catch null;
+        }
+        return null;
+    };
+    defer parsed.deinit();
+
+    const message = telegramMessageValue(parsed.value) orelse return null;
+    const base_content = telegram_update_ingress.textOrCaption(allocator, message) orelse return null;
+    const reply_text = telegram_update_ingress.replyToText(message) orelse return base_content;
+
+    const enriched = telegram_update_ingress.contentWithReplyContext(
+        allocator,
+        base_content,
+        reply_text,
+    ) catch return base_content;
+    allocator.free(base_content);
+    return enriched;
+}
+
 fn telegramMessageThreadId(message: std.json.Value) ?i64 {
     if (message != .object) return null;
 
@@ -3348,7 +3371,8 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             return;
         }
 
-        const msg_text = jsonStringField(b, "text");
+        const msg_text = telegramMessageContentAlloc(ctx.req_allocator, b);
+        defer if (msg_text) |owned| ctx.req_allocator.free(owned);
         const telegram_target = telegramWebhookTarget(ctx.req_allocator, b);
         const chat_id = if (telegram_target) |target| target.chat_id else telegramChatId(ctx.req_allocator, b);
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
@@ -7919,6 +7943,41 @@ test "telegramWebhookTarget falls back to reply message id for topic replies" {
     ;
     const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(?i64, 88), target.message_thread_id);
+}
+
+test "telegramMessageContentAlloc includes reply context" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"reply_to_message":{"message_id":88,"text":"Here are the results"},"text":"show me more"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    // Regression: webhook Telegram ingress should preserve reply context just like polling ingress.
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", content);
+}
+
+test "telegramMessageContentAlloc uses current message text before replied text" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"reply_to_message":{"message_id":88,"text":"old text"},"text":"new text"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    // Regression: the old ad-hoc field scan could read reply_to_message.text first.
+    try std.testing.expectEqualStrings("[Replying to \"old text\"] new text", content);
+}
+
+test "telegramMessageContentAlloc falls back to caption" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"caption":"caption-only fallback"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    try std.testing.expectEqualStrings("caption-only fallback", content);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {
