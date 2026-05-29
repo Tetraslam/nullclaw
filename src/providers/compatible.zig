@@ -26,6 +26,11 @@ fn logCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) void {
+    // NOTE: No unit test for this log-only behavior change.
+    // Tests assert error propagation on these paths; suppress stderr side
+    // effects under zig test so unrelated suites do not fail on expected errors.
+    if (builtin.is_test) return;
+
     const sanitized = root.sanitizeApiError(allocator, resp_body) catch null;
     defer if (sanitized) |body| allocator.free(body);
 
@@ -41,11 +46,7 @@ fn returnLoggedCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) anyerror!T {
-    // Tests assert error propagation on this path; skip log side effects there
-    // because Zig's test runner treats unexpected stderr logs as failures.
-    if (!builtin.is_test) {
-        logCompatibleApiError(allocator, provider_name, err, url, resp_body);
-    }
+    logCompatibleApiError(allocator, provider_name, err, url, resp_body);
     return err;
 }
 
