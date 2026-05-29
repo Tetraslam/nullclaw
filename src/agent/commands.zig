@@ -5751,7 +5751,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);

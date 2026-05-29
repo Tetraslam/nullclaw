@@ -15,7 +15,7 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
     pub const tool_description = "List memory entries in recency order. Use for requests like 'show first N memory records' without shell/sqlite access.";
     pub const tool_params =
-        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"session_id":{"type":"string","description":"Optional session filter"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
+        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"session_id":{"type":"string","description":"Optional session filter. Omit to list all sessions and global memory; pass an empty string to list only the current thread session."},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -41,13 +41,14 @@ pub const MemoryListTool = struct {
         else
             null;
 
-        // Default to `null` (list across all sessions, including globals
-        // with session_id = NULL) when the caller does not pin a specific
-        // session. Previously this implicitly substituted the current
-        // thread's session, which made global entries — and the `core`
-        // category — invisible to the tool.
-        const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else null
+        // Omitted session_id lists across all sessions, including globals
+        // with session_id = NULL. An explicit empty string keeps the existing
+        // memory tool convention of selecting the current thread session.
+        const session_id_opt: ?[]const u8 = if (args.get("session_id") != null)
+            if (root.getString(args, "session_id")) |sid_raw|
+                if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
+            else
+                root.threadMemorySessionId()
         else
             null;
 
@@ -254,6 +255,32 @@ test "memory_list explicit session_id still filters out unrelated entries" {
     // The other session's entry and the global must be excluded when
     // an explicit session_id is passed — the fix must not turn the
     // session filter into a no-op.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") == null);
+}
+
+test "memory_list empty session_id uses current thread session" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_language", "ru", .core, null);
+    try mem.store("recent_a", "hi from A", .conversation, "session:A");
+    try mem.store("recent_b", "hi from B", .conversation, "session:B");
+
+    const previous = root.setThreadMemorySessionId("session:A");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"session_id\":\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_a") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_b") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") == null);
 }
