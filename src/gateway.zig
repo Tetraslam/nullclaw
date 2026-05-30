@@ -5772,6 +5772,9 @@ pub fn run(
 ) !void {
     health.markComponentOk("gateway");
 
+    const addr = try std_compat.net.Address.resolveIp(host, port);
+    try probeGatewayAddressAvailable(addr);
+
     var state = GatewayState.init(allocator);
     defer state.deinit();
     state.event_bus = event_bus;
@@ -5895,14 +5898,7 @@ pub fn run(
     }
     defer if (local_agent_runtime_opt) |*runtime| runtime.deinit(allocator);
 
-    // Resolve the listen address
-    const addr = try std_compat.net.Address.resolveIp(host, port);
     const daemon_mode = event_bus != null;
-
-    // Best-effort probe to detect if the port is already in use.
-    // A TOCTOU gap exists between probe and listen(), but listen() will still
-    // fail with AddressInUse if another process binds the port in that window.
-    try probeGatewayAddressAvailable(addr);
 
     var server = try addr.listen(.{
         .reuse_address = true,
