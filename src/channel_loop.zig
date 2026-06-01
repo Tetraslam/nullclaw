@@ -750,6 +750,16 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
+    // Mirror processTelegramMessage: show "typing…" while a callback-query
+    // is being processed (model call from a /nc_choices button click can
+    // otherwise leave the chat silent for many seconds — see #942).
+    const typing_target = sender;
+    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    defer {
+        tg_ptr.stopTyping(typing_target) catch {};
+        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+    }
+
     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var response_owned = false;
