@@ -1838,15 +1838,6 @@ pub const Agent = struct {
         return prioritized;
     }
 
-    /// Filter and prioritize `self.tool_specs` for the current turn.
-    ///
-    /// Returns a slice allocated from `arena` containing only the specs that should
-    /// be included for this turn.  The returned slice borrows pointers from
-    /// `self.tool_specs` — it must NOT outlive `self.tool_specs`.
-    ///
-    /// Rules:
-    ///   - If no filter groups are configured, returns `self.tool_specs` directly (no copy).
-    ///   - A tool whose name does NOT start with "mcp_" is always included.
     /// Build a subset of `self.tools` suitable for the text-based system prompt.
     /// Only includes built-in tools and MCP tools from `always` filter groups.
     /// Dynamic-group MCP tools are omitted — their schemas are still available
@@ -2016,7 +2007,12 @@ pub const Agent = struct {
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
-            const prompt_tools = try self.filterToolsForPromptText(self.allocator);
+            var prompt_tools_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer prompt_tools_arena.deinit();
+            const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
+            const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
+
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
                 cfg_for_prompt_ptr,
@@ -2034,7 +2030,7 @@ pub const Agent = struct {
                 .bootstrap_provider = self.bootstrap,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
                 .observer = self.observer,
-                .native_tools_enabled = self.provider.supportsNativeTools(),
+                .native_tools_enabled = prompt_native_tools_enabled,
             });
             const active_skill_section = try commands.buildActiveSkillPromptSection(self);
             defer if (active_skill_section) |section| self.allocator.free(section);
@@ -10635,7 +10631,7 @@ test "filterToolsForPromptText dynamic group excluded from text" {
     try std.testing.expectEqualStrings("shell", result[0].name());
 }
 
-test "filterToolsForPromptText empty filter groups returns all tools" {
+test "filterToolsForPromptText empty group excludes MCP tools" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -10649,9 +10645,119 @@ test "filterToolsForPromptText empty filter groups returns all tools" {
         try makeMockFilterTool(allocator, "mcp_webdav_read"),
     };
     defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{} },
+    };
 
     const result = try agent.filterToolsForPromptText(arena.allocator());
-    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name());
+}
+
+test "Agent system prompt keeps parameters when streaming disables native tool schemas" {
+    // Regression: streaming turns send tools=null, so the text prompt must keep
+    // Parameters even if the provider supports native tools.
+    const StreamingPromptCapture = struct {
+        captured_system: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator_: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            try std.testing.expect(request.tools == null);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (request.messages) |msg| {
+                if (msg.role == .system) {
+                    if (self.captured_system) |old| self.capture_alloc.free(old);
+                    self.captured_system = try self.capture_alloc.dupe(u8, msg.content);
+                    break;
+                }
+            }
+            callback(callback_ctx, providers.StreamChunk.textDelta("ok"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .model = try allocator_.dupe(u8, model),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-prompt-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingPromptCapture{ .capture_alloc = allocator };
+    defer if (provider_state.captured_system) |captured| allocator.free(captured);
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingPromptCapture.chatWithSystem,
+        .chat = StreamingPromptCapture.chat,
+        .supportsNativeTools = StreamingPromptCapture.supportsNativeTools,
+        .getName = StreamingPromptCapture.getName,
+        .deinit = StreamingPromptCapture.deinitFn,
+        .supports_streaming = StreamingPromptCapture.supportsStreaming,
+        .stream_chat = StreamingPromptCapture.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_secret_lookup"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+    agent.tool_filter_groups = &.{
+        .{ .mode = .dynamic, .tools = &.{"mcp_secret_*"}, .keywords = &.{"secret"} },
+    };
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(provider_state.captured_system != null);
+    const captured = provider_state.captured_system.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {
