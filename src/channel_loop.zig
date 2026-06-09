@@ -750,6 +750,15 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
+    // Mirror processTelegramMessage: keep callback-query processing visible
+    // during slow model calls from interactive Telegram buttons.
+    const typing_target = sender;
+    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    defer {
+        tg_ptr.stopTyping(typing_target) catch {};
+        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+    }
+
     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var response_owned = false;
@@ -3015,6 +3024,66 @@ test "telegramConversationContext keeps delivery target for callback-driven topi
     try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
     try std.testing.expect(context.is_group.?);
+}
+
+test "telegram callback starts typing turn and cleans up on local slash miss" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+    const before_draft_counter = tg.draft_id_counter.load(.monotonic);
+
+    // Regression: callback-query paths should mirror normal Telegram messages
+    // and start a typing/draft turn even when the callback returns locally.
+    const handled = handleTelegramInteractiveCallback(
+        allocator,
+        runtime,
+        &tg,
+        "telegram:default:direct:12345",
+        "/not-a-local-command",
+        "12345",
+        77,
+        false,
+        "user_a",
+    );
+
+    try std.testing.expect(!handled);
+    try std.testing.expectEqual(before_draft_counter + 1, tg.draft_id_counter.load(.monotonic));
+    try std.testing.expect(tg.typing_handles.get("12345") == null);
+    try std.testing.expect(tg.draft_buffers.get("12345") == null);
 }
 
 test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {
