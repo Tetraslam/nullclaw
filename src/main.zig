@@ -994,7 +994,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
-            \\  once-agent <delay> <prompt> [--model <model>]
+            \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
@@ -1077,7 +1077,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]\n", .{});
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std_compat.process.exit(1);
         }
         const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
@@ -1086,7 +1086,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std_compat.process.exit(1);
             },
         };
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target);
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
@@ -6534,6 +6534,34 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
     const options = try parseCronAddAgentOptions(&args);
     try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", options.model.?);
     try std.testing.expectEqual(yc.cron.SessionTarget.main, options.session_target);
+    try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
+    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expect(!options.delivery.channel_owned);
+    try std.testing.expect(!options.delivery.account_id_owned);
+    try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "parseCronAgentOptions preserves once-agent delivery account flag" {
+    // Regression: cron once-agent parsed delivery flags but did not pass them to cron storage.
+    const args = [_][]const u8{
+        "once-agent",
+        "30s",
+        "say exactly one word: test",
+        "--model",
+        "glm-cn/glm-5-turbo",
+        "--announce",
+        "--channel",
+        "telegram",
+        "--account",
+        "main",
+        "--to",
+        "7972814626",
+    };
+
+    const options = try parseCronAgentOptions(&args, 3);
+    try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", options.model.?);
     try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
     try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
     try std.testing.expectEqualStrings("main", options.delivery.account_id.?);

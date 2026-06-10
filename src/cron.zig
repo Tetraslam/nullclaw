@@ -981,7 +981,7 @@ pub const CronScheduler = struct {
                             }
                         }
                     } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, job.delivery) catch |err| {
                             log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
                             job.last_run_secs = now;
                             job.last_status = "error";
@@ -1086,8 +1086,12 @@ fn runAgentJob(
     prompt: []const u8,
     model: ?[]const u8,
     timeout_secs: u64,
+    delivery: DeliveryConfig,
 ) !AgentRunResult {
-    return agent_runner.run(allocator, cwd, prompt, model, timeout_secs);
+    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, .{
+        .origin_channel = delivery.channel,
+        .origin_account_id = delivery.account_id,
+    });
 }
 
 const LoadPolicy = enum {
@@ -2246,8 +2250,9 @@ pub fn cliAddAgentOnce(
     prompt: []const u8,
     model: ?[]const u8,
     session_target: SessionTarget,
+    delivery: DeliveryConfig,
 ) !void {
-    const delivery = DeliveryConfig{};
+    const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2264,6 +2269,37 @@ pub fn cliAddAgentOnce(
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", session_target.asStr()) catch {};
         }
+        if (enriched_delivery.mode != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_mode", enriched_delivery.mode.asStr()) catch {};
+        }
+        if (enriched_delivery.channel) |ch| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_channel", ch) catch {};
+        }
+        if (enriched_delivery.account_id) |account_id| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_account_id", account_id) catch {};
+        }
+        if (enriched_delivery.to) |t| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_to", t) catch {};
+        }
+        if (enriched_delivery.peer_kind) |peer_kind| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_kind", chatTypeAsStr(peer_kind)) catch {};
+        }
+        if (enriched_delivery.peer_id) |peer_id| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_id", peer_id) catch {};
+        }
+        if (enriched_delivery.thread_id) |thread_id| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_thread_id", thread_id) catch {};
+        }
+        if (!enriched_delivery.best_effort) {
+            body_buf.appendSlice(allocator, ",\"delivery_best_effort\":false") catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
@@ -2272,7 +2308,7 @@ pub fn cliAddAgentOnce(
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentOnce(delay, prompt, model, delivery);
+    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery);
     job.session_target = session_target;
     try saveJobs(&scheduler);
 
@@ -2421,7 +2457,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, .{}) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
@@ -3063,6 +3099,69 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expect(job.delivery.thread_id != null);
     try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+}
+
+test "cliAddAgentOnce persists delivery routing" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    try resetCronStoreForTest(allocator);
+    defer resetCronStoreForTest(allocator) catch {};
+
+    try cliAddAgentOnce(allocator, "30s", "say exactly one word: test", "glm-cn/glm-5-turbo", .isolated, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "7972814626",
+    });
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expect(job.one_shot);
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expectEqualStrings("say exactly one word: test", job.prompt.?);
+    try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", job.delivery.account_id.?);
+    try std.testing.expectEqualStrings("7972814626", job.delivery.to.?);
 }
 
 test "JobType parse and asStr" {

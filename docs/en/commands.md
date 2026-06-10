@@ -115,7 +115,7 @@ Notes:
 | `nullclaw cron add "0 * * * *" "command"` | Add a recurring shell task |
 | `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
 | `nullclaw cron once 10m "command"` | Add a one-shot delayed shell task |
-| `nullclaw cron once-agent 10m "prompt" --model <model>` | Add a one-shot delayed agent task |
+| `nullclaw cron once-agent 10m "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a one-shot delayed agent task |
 | `nullclaw cron run <id>` | Run a task immediately |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
