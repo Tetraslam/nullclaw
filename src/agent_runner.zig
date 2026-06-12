@@ -151,6 +151,7 @@ fn buildAgentOutput(
     stderr: []const u8,
     timeout_secs: u64,
     timed_out: bool,
+    success: bool,
 ) ![]const u8 {
     if (timed_out) {
         const source = if (stdout.len > 0) stdout else stderr;
@@ -160,8 +161,16 @@ fn buildAgentOutput(
         return std.fmt.allocPrint(allocator, "agent timed out after {d}s", .{timeout_secs});
     }
 
-    const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
-    return allocator.dupe(u8, output_source);
+    // On success, prefer stdout; fall back to stderr only when stdout is empty
+    // (some LLM providers write diagnostic hints to stderr even on success).
+    // On failure, never use stderr - it contains initialization logs (memory
+    // plan, MCP server registration, channel startup) that are not meaningful
+    // output. Returning empty lets the caller surface a clean error message.
+    if (success) {
+        const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
+        return allocator.dupe(u8, output_source);
+    }
+    return allocator.dupe(u8, if (stdout.len > 0) stdout else "");
 }
 
 fn preferExecPath(self_exe_path: []const u8) []const u8 {
@@ -274,7 +283,7 @@ pub fn run(
         .exited => |code| code == 0,
         else => false,
     };
-    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
+    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out, success);
     return .{ .success = success, .output = output };
 }
 
@@ -352,6 +361,52 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         else => false,
     };
     try std.testing.expect(!completed_ok);
+}
+
+test "buildAgentOutput returns stdout on success" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "hello", "", 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "buildAgentOutput falls back to stderr on success when stdout empty" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", "diagnostic hint", 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("diagnostic hint", result);
+}
+
+test "buildAgentOutput skips stderr on failure" {
+    // Regression: stderr contains initialization logs (memory plan, MCP server
+    // registration) that should not be posted to channels when the agent fails.
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", "info(memory): plan resolved\ninfo(mcp): 14 tools registered", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "buildAgentOutput preserves stdout on failure" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "partial output", "error details", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("partial output", result);
+}
+
+test "buildAgentOutput appends timeout annotation" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "working...", "", 30, true, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "working...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "timed out after 30s") != null);
+}
+
+test "buildAgentOutput timeout falls back to stderr when stdout empty" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", "stderr output", 60, true, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "stderr output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "timed out after 60s") != null);
 }
 
 test "preferExecPath keeps regular executable path" {
