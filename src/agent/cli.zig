@@ -1312,6 +1312,7 @@ test "parseAgentArgs parses --skill" {
 }
 
 test "parseAgentArgs parses cron origin attribution" {
+    // Regression: scheduled child agents must retain delivery origin observability fields.
     const args = [_][]const u8{
         "--origin-channel",
         "telegram",
@@ -1338,10 +1339,14 @@ test "parseAgentArgs returns missing value for --skill" {
 }
 
 test "parseAgentArgs returns missing value for origin attribution" {
-    const args = [_][]const u8{"--origin-channel"};
-    switch (parseAgentArgs(&args)) {
-        .missing_value => |value| try std.testing.expectEqualStrings("--origin-channel", value),
-        else => unreachable,
+    // Regression: incomplete internal origin flags must fail before agent startup.
+    const flags = [_][]const u8{ "--origin-channel", "--origin-account-id" };
+    for (flags) |flag| {
+        const args = [_][]const u8{flag};
+        switch (parseAgentArgs(&args)) {
+            .missing_value => |value| try std.testing.expectEqualStrings(flag, value),
+            else => unreachable,
+        }
     }
 }
 

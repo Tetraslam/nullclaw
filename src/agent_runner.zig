@@ -405,11 +405,12 @@ test "pathAgentExecutableName returns platform command name" {
 }
 
 test "appendAgentArgv includes cron origin attribution" {
+    // Regression: scheduled child agents must receive origin metadata in every spawn attempt.
     const allocator = std.testing.allocator;
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "say test", "glm-cn/glm-5-turbo", .{
+    try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "Summarize status", "test-model", .{
         .origin_channel = "telegram",
         .origin_account_id = "main",
     });
@@ -418,13 +419,13 @@ test "appendAgentArgv includes cron origin attribution" {
         "/usr/bin/nullclaw",
         "agent",
         "--model",
-        "glm-cn/glm-5-turbo",
+        "test-model",
         "--origin-channel",
         "telegram",
         "--origin-account-id",
         "main",
         "-m",
-        "say test",
+        "Summarize status",
     };
     try std.testing.expectEqual(expected.len, argv.items.len);
     for (expected, argv.items) |want, got| {
