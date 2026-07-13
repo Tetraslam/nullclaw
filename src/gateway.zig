@@ -5756,6 +5756,19 @@ fn probeGatewayAddressAvailable(addr: std_compat.net.Address) !void {
     return error.AddressInUse;
 }
 
+/// Probe and immediately acquire the final listener before gateway runtime
+/// initialization. The final listen remains authoritative for the unavoidable
+/// syscall-sized TOCTOU gap after the best-effort probe.
+fn listenGatewayAddress(addr: std_compat.net.Address, daemon_mode: bool) !std_compat.net.Server {
+    try probeGatewayAddressAvailable(addr);
+    return try addr.listen(.{
+        .reuse_address = true,
+        // Daemon/service shutdown needs the accept loop to observe the shared
+        // shutdown flag instead of blocking forever in accept().
+        .force_nonblocking = daemon_mode,
+    });
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, POST /media/transcribe, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -5772,9 +5785,14 @@ pub fn run(
 ) !void {
     health.markComponentOk("gateway");
 
-    var state = GatewayState.init(allocator);
-    defer state.deinit();
-    state.event_bus = event_bus;
+    const daemon_mode = event_bus != null;
+    const public_bind = isPublicBindHost(host);
+    var server_opt: ?std_compat.net.Server = null;
+    if (!public_bind) {
+        const addr = try std_compat.net.Address.resolveIp(host, port);
+        server_opt = try listenGatewayAddress(addr, daemon_mode);
+    }
+    errdefer if (server_opt) |*server| server.deinit();
 
     var owned_config: ?Config = null;
     var config_opt: ?*const Config = null;
@@ -5790,7 +5808,18 @@ pub fn run(
     const max_body = if (config_opt) |cfg| cfg.gateway.max_body_size_bytes else MAX_BODY_SIZE;
     const request_timeout_secs = effectiveRequestReadTimeoutSecs(config_opt);
     try ensureSafeGatewayBind(host, config_opt, tunnel_url_opt);
-    const public_bind = isPublicBindHost(host);
+    if (public_bind) {
+        const addr = try std_compat.net.Address.resolveIp(host, port);
+        server_opt = try listenGatewayAddress(addr, daemon_mode);
+    }
+
+    var server = server_opt.?;
+    server_opt = null;
+    defer server.deinit();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.event_bus = event_bus;
 
     // Local request-response agent runtime is eager in standalone gateway mode
     // and lazy in daemon mode so channel startup is not blocked by A2A setup.
@@ -5894,23 +5923,6 @@ pub fn run(
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
     defer if (local_agent_runtime_opt) |*runtime| runtime.deinit(allocator);
-
-    // Resolve the listen address
-    const addr = try std_compat.net.Address.resolveIp(host, port);
-    const daemon_mode = event_bus != null;
-
-    // Best-effort probe to detect if the port is already in use.
-    // A TOCTOU gap exists between probe and listen(), but listen() will still
-    // fail with AddressInUse if another process binds the port in that window.
-    try probeGatewayAddressAvailable(addr);
-
-    var server = try addr.listen(.{
-        .reuse_address = true,
-        // Daemon/service shutdown needs the accept loop to observe the shared
-        // shutdown flag instead of blocking forever in accept().
-        .force_nonblocking = daemon_mode,
-    });
-    defer server.deinit();
 
     var stdout_buf: [4096]u8 = undefined;
     var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
@@ -10613,6 +10625,18 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 // ── Port conflict detection tests ─────────────────────────────────────
 
+test "listenGatewayAddress acquires final listener before initialization" {
+    if (builtin.os.tag == .wasi) return;
+
+    const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var listener = try listenGatewayAddress(test_addr, false);
+    defer listener.deinit();
+
+    // Regression: the final listener, not only the disposable probe, must be
+    // held before gateway runtime initialization starts.
+    try std.testing.expect(listener.listen_address.in.getPort() != 0);
+}
+
 test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
     // Windows Zig 0.16 socket reuse/exclusive-bind behavior can permit another
     // listener instead of reporting AddressInUse; keep this runtime conflict
@@ -10641,7 +10665,31 @@ test "run returns AddressInUse when port is already bound" {
     // Get the actual port that was assigned
     const bound_port = listener.listen_address.in.getPort();
 
-    // Try to start gateway on the same port - should fail with AddressInUse
-    const result = run(std.testing.allocator, "127.0.0.1", bound_port, null, null, null);
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullclaw-gateway-test",
+        .config_path = "/tmp/nullclaw-gateway-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: a conflict must be returned before any gateway/runtime
+    // allocation; otherwise this fail-first allocator would return OutOfMemory.
+    const result = run(failing.allocator(), "127.0.0.1", bound_port, &cfg, null, null);
     try std.testing.expectError(error.AddressInUse, result);
+}
+
+test "run rejects unsafe public bind before address resolution" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullclaw-gateway-test",
+        .config_path = "/tmp/nullclaw-gateway-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: deny-by-default policy must run before DNS, port probing, or
+    // gateway allocation for a non-loopback host.
+    const result = run(failing.allocator(), "example.com", 3000, &cfg, null, null);
+    try std.testing.expectError(error.PublicBindRequiresTunnel, result);
 }
