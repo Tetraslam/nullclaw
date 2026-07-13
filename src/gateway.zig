@@ -29,6 +29,7 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
+const agent_runner = @import("agent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
@@ -2902,38 +2903,11 @@ fn writeJsonResponse(stream: *std_compat.net.Stream, status: []const u8, body: [
 /// Process an incoming message by spawning `nullclaw agent -m "..."`.
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
-    // Find our own executable path
-    var self_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
-    const self_path = std_compat.fs.selfExePath(&self_buf) catch "nullclaw";
-
-    var child = std_compat.process.Child.init(
-        &[_][]const u8{ self_path, "agent", "-m", message },
-        allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Read stdout
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    defer stdout_buf.deinit(allocator);
-
-    const stdout_reader = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    while (true) {
-        const n = stdout_reader.read(&read_buf) catch break;
-        if (n == 0) break;
-        try stdout_buf.appendSlice(allocator, read_buf[0..n]);
-    }
-
-    const term = try child.wait();
-    _ = term;
-
-    if (stdout_buf.items.len > 0) {
-        return try allocator.dupe(u8, stdout_buf.items);
-    }
-    return try allocator.dupe(u8, "No response from agent");
+    // Keep the legacy public helper on the canonical subprocess path so stderr
+    // is drained safely and never substituted for the agent response.
+    const result = try agent_runner.run(allocator, null, message, null, 0);
+    defer allocator.free(result.output);
+    return allocator.dupe(u8, result.output);
 }
 
 /// Send a reply to a Telegram chat using the Bot API.
