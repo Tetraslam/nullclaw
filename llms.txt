@@ -1,0 +1,30 @@
+# NullClaw
+
+> Run an always-on AI agent from one 4.4–6.5 MB static Zig binary: ~60 providers, 26 channels, 39 tools, hybrid memory and default sandboxing.
+
+Part of the Null ecosystem (https://nullmenu.ai) — single-binary Zig tools for running AI agents on your own hardware. All components are pre-1.0 with CalVer releases. The links below point to canonical documentation pages.
+
+## Start
+
+- [Install](https://claw.nullmenu.ai/docs/start/install/): Get the NullClaw binary via Homebrew, Docker, or a source build with Zig 0.16.0.
+- [Quickstart](https://claw.nullmenu.ai/docs/start/quickstart/): From a fresh install to a first conversation and a running gateway.
+- [Your first channel](https://claw.nullmenu.ai/docs/start/first-channel/): Connect NullClaw to Telegram (or any of the 26 channels) and lock it down with allowlists.
+
+## Configure
+
+- [Configuration](https://claw.nullmenu.ai/docs/configure/configuration/): One JSON file at ~/.nullclaw/config.json — OpenClaw-compatible, snake_case, no magic.
+- [Providers](https://claw.nullmenu.ai/docs/configure/providers/): Connect ~60 model providers, set the default route, and add fallbacks and auto-routing.
+- [Memory](https://claw.nullmenu.ai/docs/configure/memory/): Hybrid search over SQLite by default, nine other engines when you need them, and CLI tools to keep it clean.
+
+## Operate
+
+- [Gateway and service](https://claw.nullmenu.ai/docs/operate/gateway-and-service/): Run NullClaw long-term — the HTTP gateway, pairing, cron endpoints, and background service mode.
+- [Security](https://claw.nullmenu.ai/docs/operate/security/): The layers NullClaw enforces by default, the settings that widen them, and how to audit for leaked secrets.
+
+## Reference
+
+- [CLI reference](https://claw.nullmenu.ai/docs/reference/cli/): Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags.
+
+## Source
+
+- [GitHub](https://github.com/nullclaw/nullclaw)

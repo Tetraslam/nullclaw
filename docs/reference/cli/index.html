@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta http-equiv="content-security-policy" content="default-src 'self'; base-uri 'self'; connect-src 'self' https://api.github.com; font-src 'self'; form-action 'self'; frame-src 'none'; img-src 'self' data:; manifest-src 'self'; media-src 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'sha256-IRprildjLL+3SuNhpxASNxA3FHtF9vaMbtB0cdufpr4=' 'sha256-bjCjUfcugreJ5r8vgTcfk6+jnH6vxhVAE8I/wClSl6E=' 'sha256-zRZEB4pxx4F+e/SdGXKV0IMfhrhF2r9nyqCVHLS+sG8='; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:" data-null-security-policy>
+		<meta name="referrer" content="strict-origin-when-cross-origin" data-null-security-policy>
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="theme-color" content="#0c0a08" />
+		<script>
+			document.documentElement.classList.add('js');
+			// Resolve the shared theme mode before first paint.
+			(function () {
+				var key = 'nullmenu-theme';
+				var valid = function (value) {
+					return value === 'system' || value === 'light' || value === 'dark';
+				};
+				var cookieMode = null;
+				try {
+					var cookie = document.cookie
+						.split(';')
+						.map(function (part) { return part.trim(); })
+						.find(function (part) { return part.indexOf(key + '=') === 0; });
+					if (cookie) {
+						try { cookieMode = decodeURIComponent(cookie.slice(key.length + 1)); } catch (e) {}
+					}
+				} catch (e) {}
+				var localMode = null;
+				try { localMode = localStorage.getItem(key); } catch (e) {}
+				var mode = valid(cookieMode) ? cookieMode : valid(localMode) ? localMode : 'system';
+				var theme = mode === 'system'
+					? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+					: mode;
+				document.documentElement.dataset.themeMode = mode;
+				document.documentElement.dataset.theme = theme;
+				if (theme === 'light') {
+					document.querySelector('meta[name="theme-color"]').content = '#f2ead8';
+				}
+			})();
+		</script>
+		<link rel="icon" href="../../../favicon.svg" type="image/svg+xml" />
+		<link
+			rel="preload"
+			href="../../../fonts/InstrumentSerif-normal-400-latin.woff2"
+			as="font"
+			type="font/woff2"
+			crossorigin
+		/>
+		<link
+			rel="preload"
+			href="../../../fonts/InstrumentSerif-italic-400-latin.woff2"
+			as="font"
+			type="font/woff2"
+			crossorigin
+		/>
+		<link
+			rel="preload"
+			href="../../../fonts/Geist-normal-300_700-latin.woff2"
+			as="font"
+			type="font/woff2"
+			crossorigin
+		/>
+		<link
+			rel="preload"
+			href="../../../fonts/GeistMono-normal-400_600-latin.woff2"
+			as="font"
+			type="font/woff2"
+			crossorigin
+		/>
+		<link href="../../../_app/immutable/entry/start.uOp12_Cw.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/CW_sEbVJ.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/Bneb2paa.js" rel="modulepreload">
+		<link href="../../../_app/immutable/entry/app.DE8GowH-.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/HclGiUj8.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/xihTtKlq.js" rel="modulepreload">
+		<link href="../../../_app/immutable/nodes/0.CkyUYdqN.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/DIs7c8UJ.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/Bu7QD5f9.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/DsBvvBRv.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/Bc0JvcBg.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/3dok05DY.js" rel="modulepreload">
+		<link href="../../../_app/immutable/nodes/2.DdrmgXhX.js" rel="modulepreload">
+		<link href="../../../_app/immutable/nodes/5.k1kI82s6.js" rel="modulepreload">
+		<link href="../../../_app/immutable/chunks/CfyuiuKA.js" rel="modulepreload">
+		<!--12qhfyh--><!----><style>:root:root{--spice:#ff4f30;--spice-dim:#a83a24;}</style><!----> <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%2312100d%22%2F%3E%3Ccircle%20cx%3D%2216%22%20cy%3D%2216%22%20r%3D%229%22%20stroke%3D%22%23ece5d8%22%20stroke-width%3D%223.4%22%20fill%3D%22none%22%2F%3E%3Cline%20x1%3D%228.5%22%20y1%3D%2225.5%22%20x2%3D%2223.5%22%20y2%3D%226.5%22%20stroke%3D%22%23ff4f30%22%20stroke-width%3D%223.6%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E" type="image/svg+xml"/><!----><!--gsrl61--><meta name="description" content="Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags."/> <link rel="canonical" href="https://claw.nullmenu.ai/docs/reference/cli/"/> <meta property="og:type" content="article"/> <meta property="og:site_name" content="NullClaw"/> <meta property="og:title" content="CLI reference — NullClaw docs"/> <meta property="og:description" content="Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags."/> <meta property="og:url" content="https://claw.nullmenu.ai/docs/reference/cli/"/> <meta property="og:image" content="https://claw.nullmenu.ai/og/claw.png"/> <meta property="og:image:alt" content="Social preview for NullClaw: CLI reference — NullClaw docs"/> <meta property="og:image:width" content="1200"/> <meta property="og:image:height" content="630"/> <meta name="twitter:card" content="summary_large_image"/> <meta name="twitter:title" content="CLI reference — NullClaw docs"/> <meta name="twitter:description" content="Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags."/> <meta name="twitter:image" content="https://claw.nullmenu.ai/og/claw.png"/> <meta name="twitter:image:alt" content="Social preview for NullClaw: CLI reference — NullClaw docs"/> <!----><script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Organization","@id":"https://nullmenu.ai/#organization","name":"Null ecosystem","url":"https://nullmenu.ai/","sameAs":["https://github.com/nullclaw"]},{"@type":"TechArticle","@id":"https://claw.nullmenu.ai/docs/reference/cli/#article","headline":"CLI reference — NullClaw docs","description":"Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags.","url":"https://claw.nullmenu.ai/docs/reference/cli/","image":"https://claw.nullmenu.ai/og/claw.png","inLanguage":"en","articleSection":"Reference","version":"v2026.5.29","dateModified":"2026-07-17","mainEntityOfPage":"https://claw.nullmenu.ai/docs/reference/cli/","author":{"@id":"https://nullmenu.ai/#organization"},"publisher":{"@id":"https://nullmenu.ai/#organization"}},{"@type":"BreadcrumbList","@id":"https://claw.nullmenu.ai/docs/reference/cli/#breadcrumbs","itemListElement":[{"@type":"ListItem","position":1,"name":"NullClaw","item":"https://claw.nullmenu.ai/"},{"@type":"ListItem","position":2,"name":"Documentation","item":"https://claw.nullmenu.ai/docs/"},{"@type":"ListItem","position":3,"name":"CLI reference","item":"https://claw.nullmenu.ai/docs/reference/cli/"}]}]}</script><!----><!----><title>CLI reference — NullClaw docs</title>
+		<link href="../../../_app/immutable/assets/0.b4SYXXpF.css" rel="stylesheet">
+		<link href="../../../_app/immutable/assets/2.D_3iEgFB.css" rel="stylesheet">
+		<link href="../../../_app/immutable/assets/5.s1K1snEQ.css" rel="stylesheet">
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents"><!--[--><!--[0--><!--[--><a class="skip mono svelte-12qhfyh" href="#main">Skip to content</a> <span id="sr-status" class="sr-status" role="status" aria-live="polite"></span> <header class="svelte-1elxaub"><div class="inner container svelte-1elxaub"><div class="left svelte-1elxaub"><a class="brand svelte-1elxaub" href="/" aria-label="NullClaw home"><svg width="24" height="24" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="16" cy="16" r="10.5" stroke="currentColor" stroke-width="1.75"></circle><line class="slash" x1="7" y1="27" x2="25" y2="5" stroke="var(--accent)" stroke-width="1.75" stroke-linecap="round"></line></svg><!----> <span class="word mono svelte-1elxaub">null<span class="suffix serif-i svelte-1elxaub">·claw</span></span></a> <!--[0--><a class="version mono svelte-1elxaub" href="https://github.com/nullclaw/nullclaw/releases/tag/v2026.5.29" target="_blank" rel="noopener" aria-label="Published release v2026.5.29 (opens in a new tab)">v2026.5.29<!----><svg class="functional-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></a><!--]--></div> <nav class="desktop svelte-1elxaub" aria-label="Main"><!--[--><a href="/docs/" class="nav-link mono svelte-1elxaub active" aria-current="page">Docs<!--[-1--><!--]--></a><a href="https://nullmenu.ai" class="nav-link mono svelte-1elxaub">The menu<!--[-1--><!--]--></a><a href="https://github.com/nullclaw/nullclaw" class="nav-link mono svelte-1elxaub" target="_blank" rel="noopener">GitHub<!--[0--><span class="ext svelte-1elxaub"><!----><svg class="functional-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="opens in a new tab"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></span><!--]--></a><!--]--> <button class="search-btn mono svelte-1elxaub" aria-label="Search docs"><!----><svg class="functional-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="5.75"></circle><path d="m14.8 14.8 4.7 4.7"></path></g></svg><!----><!----> <kbd class="svelte-1elxaub">Ctrl K</kbd></button> <button class="theme-toggle svelte-1elxaub" aria-label="Theme: system (dark). Switch to light theme" title="Theme: system (dark). Switch to light theme"><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" class="svelte-1elxaub"><circle cx="9" cy="9" r="6.75" fill="none" stroke="currentColor" stroke-width="1.5"></circle><path class="half" d="M9 2.25 a6.75 6.75 0 0 1 0 13.5 Z" fill="currentColor"></path></svg> <span class="theme-mode mono svelte-1elxaub" aria-hidden="true">system</span></button></nav> <button class="burger svelte-1elxaub" aria-expanded="false" aria-controls="mobile-navigation" aria-label="Open navigation"><span class="svelte-1elxaub"></span><span class="svelte-1elxaub"></span></button></div> <details class="nojs-navigation svelte-1elxaub" data-pagefind-ignore=""><summary class="mono svelte-1elxaub">Menu</summary> <nav aria-label="Main navigation" class="svelte-1elxaub"><!--[--><a href="/docs/" class="mono svelte-1elxaub">Docs<!--[-1--><!--]--></a><a href="https://nullmenu.ai" class="mono svelte-1elxaub">The menu<!--[-1--><!--]--></a><a href="https://github.com/nullclaw/nullclaw" class="mono svelte-1elxaub" target="_blank" rel="noopener">GitHub<!--[0--><span class="ext svelte-1elxaub"><!----><svg class="functional-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="opens in a new tab"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></span><!--]--></a><!--]--></nav></details> <!--[-1--><!--]--></header><!----> <!--[-1--><!--]--><!----> <main id="main" class="svelte-12qhfyh"><!--[0--><!--[--><div class="docs container svelte-1bpnej"><button class="nav-toggle mono svelte-1bpnej" aria-expanded="false" aria-controls="docs-navigation">menu — docs</button> <details class="nojs-docs-navigation svelte-1bpnej" data-pagefind-ignore=""><summary class="mono svelte-1bpnej">Browse documentation</summary> <nav aria-label="Documentation navigation" class="svelte-1bpnej"><a href="/docs/" class="serif-i svelte-1bpnej">Docs home</a> <!--[--><div class="nojs-group svelte-1bpnej"><h2 class="label svelte-1bpnej">Start</h2> <!--[--><a href="/docs/start/install/" class="svelte-1bpnej">Install</a><a href="/docs/start/quickstart/" class="svelte-1bpnej">Quickstart</a><a href="/docs/start/first-channel/" class="svelte-1bpnej">Your first channel</a><!--]--></div><div class="nojs-group svelte-1bpnej"><h2 class="label svelte-1bpnej">Configure</h2> <!--[--><a href="/docs/configure/configuration/" class="svelte-1bpnej">Configuration</a><a href="/docs/configure/providers/" class="svelte-1bpnej">Providers</a><a href="/docs/configure/memory/" class="svelte-1bpnej">Memory</a><!--]--></div><div class="nojs-group svelte-1bpnej"><h2 class="label svelte-1bpnej">Operate</h2> <!--[--><a href="/docs/operate/gateway-and-service/" class="svelte-1bpnej">Gateway and service</a><a href="/docs/operate/security/" class="svelte-1bpnej">Security</a><!--]--></div><div class="nojs-group svelte-1bpnej"><h2 class="label svelte-1bpnej">Reference</h2> <!--[--><a href="/docs/reference/cli/" class="svelte-1bpnej">CLI reference</a><!--]--></div><!--]--> <!--[-1--><!--]--></nav></details> <!--[-1--><!--]--> <div id="docs-navigation" class="sidebar svelte-1bpnej" role="navigation" aria-label="Documentation"><div class="drawer-head mono svelte-1bpnej"><div class="svelte-1bpnej"><span class="drawer-kicker svelte-1bpnej">Browse</span> <span id="docs-navigation-title" class="drawer-title svelte-1bpnej">Documentation</span></div> <button class="drawer-close svelte-1bpnej"><span>close</span><!----><svg class="functional-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m7 7 10 10"></path><path d="M17 7 7 17"></path></g></svg><!----><!----></button></div> <a href="/docs/" class="cookbook-link serif-i svelte-1bpnej">Docs home</a> <!--[--><div class="group svelte-1bpnej"><h2 class="label svelte-1bpnej">Start</h2> <ul class="svelte-1bpnej"><!--[--><li class="svelte-1bpnej"><a href="/docs/start/install/" class="svelte-1bpnej">Install</a></li><li class="svelte-1bpnej"><a href="/docs/start/quickstart/" class="svelte-1bpnej">Quickstart</a></li><li class="svelte-1bpnej"><a href="/docs/start/first-channel/" class="svelte-1bpnej">Your first channel</a></li><!--]--></ul></div><div class="group svelte-1bpnej"><h2 class="label svelte-1bpnej">Configure</h2> <ul class="svelte-1bpnej"><!--[--><li class="svelte-1bpnej"><a href="/docs/configure/configuration/" class="svelte-1bpnej">Configuration</a></li><li class="svelte-1bpnej"><a href="/docs/configure/providers/" class="svelte-1bpnej">Providers</a></li><li class="svelte-1bpnej"><a href="/docs/configure/memory/" class="svelte-1bpnej">Memory</a></li><!--]--></ul></div><div class="group svelte-1bpnej"><h2 class="label svelte-1bpnej">Operate</h2> <ul class="svelte-1bpnej"><!--[--><li class="svelte-1bpnej"><a href="/docs/operate/gateway-and-service/" class="svelte-1bpnej">Gateway and service</a></li><li class="svelte-1bpnej"><a href="/docs/operate/security/" class="svelte-1bpnej">Security</a></li><!--]--></ul></div><div class="group svelte-1bpnej"><h2 class="label svelte-1bpnej">Reference</h2> <ul class="svelte-1bpnej"><!--[--><li class="svelte-1bpnej"><a href="/docs/reference/cli/" aria-current="page" class="svelte-1bpnej active">CLI reference</a></li><!--]--></ul></div><!--]--> <!--[-1--><!--]--></div> <div class="content svelte-1bpnej"><!--[--><!----> <div class="page svelte-5oqt2y has-toc"><article data-pagefind-body=""><p class="label label--accent" data-pagefind-ignore="">Reference</p> <h1 class="serif svelte-5oqt2y">CLI reference</h1> <div class="meta mono svelte-5oqt2y" data-pagefind-ignore=""><!--[0--><span class="chip svelte-5oqt2y" title="Last verified with this release">verified · v2026.5.29</span><!--]--> <button class="meta-link svelte-5oqt2y"><!--[-1-->copy as markdown<!--]--></button> <a class="meta-link svelte-5oqt2y" href="https://github.com/nullclaw/nullmenu/edit/main/content/claw/docs/reference/cli.md" target="_blank" rel="noopener">edit on github <!----><svg class="functional-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="opens in a new tab"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></a></div> <!--[0--><details class="mobile-toc svelte-5oqt2y" data-pagefind-ignore=""><summary class="svelte-5oqt2y"><span class="label">On this page</span> <span class="toc-count mono svelte-5oqt2y">10 sections <!----><svg class="functional-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.5v11"></path><path d="M6.5 12h11"></path></g></svg><!----><!----></span></summary> <nav aria-label="On this page" class="svelte-5oqt2y"><ul class="svelte-5oqt2y"><!--[--><li class="d2 svelte-5oqt2y"><a href="#setup-and-interaction" class="svelte-5oqt2y">Setup and interaction</a></li><li class="d2 svelte-5oqt2y"><a href="#runtime-and-operations" class="svelte-5oqt2y">Runtime and operations</a></li><li class="d2 svelte-5oqt2y"><a href="#channels" class="svelte-5oqt2y">Channels</a></li><li class="d2 svelte-5oqt2y"><a href="#cron" class="svelte-5oqt2y">Cron</a></li><li class="d2 svelte-5oqt2y"><a href="#skills-and-history" class="svelte-5oqt2y">Skills and history</a></li><li class="d2 svelte-5oqt2y"><a href="#memory" class="svelte-5oqt2y">Memory</a></li><li class="d2 svelte-5oqt2y"><a href="#workspace-config-and-models" class="svelte-5oqt2y">Workspace, config, and models</a></li><li class="d2 svelte-5oqt2y"><a href="#hardware-and-automation" class="svelte-5oqt2y">Hardware and automation</a></li><li class="d2 svelte-5oqt2y"><a href="#build-flags-from-source" class="svelte-5oqt2y">Build flags (from source)</a></li><li class="d2 svelte-5oqt2y"><a href="#troubleshooting-order" class="svelte-5oqt2y">Troubleshooting order</a></li><!--]--></ul></nav></details><!--]--> <div class="prose"><!----><p>The full command surface, grouped by task. <code>nullclaw help</code> prints the top-level summary; this page expands it and follows the project&#39;s own command reference.</p>
+<aside class="callout callout--note"><div class="callout-title">Note</div><p>Pre-1.0: config and CLI may change between releases.</p>
+</aside>
+<h2 id="setup-and-interaction" aria-labelledby="heading-label-setup-and-interaction"><span id="heading-label-setup-and-interaction">Setup and interaction</span><a class="heading-anchor" href="#setup-and-interaction" aria-label="Permalink to Setup and interaction" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw help</code></td>
+<td>Show top-level help</td>
+</tr>
+<tr>
+<td><code>nullclaw version</code> / <code>nullclaw --version</code></td>
+<td>Show CLI version</td>
+</tr>
+<tr>
+<td><code>nullclaw onboard --interactive</code></td>
+<td>Run the interactive setup wizard</td>
+</tr>
+<tr>
+<td><code>nullclaw onboard --api-key sk-... --provider openrouter</code></td>
+<td>Quick provider + API key setup</td>
+</tr>
+<tr>
+<td><code>nullclaw onboard --api-key ... --provider ... --model ... --memory ...</code></td>
+<td>Set provider, model, and memory backend at once</td>
+</tr>
+<tr>
+<td><code>nullclaw agent -m &quot;...&quot;</code></td>
+<td>Run a single prompt</td>
+</tr>
+<tr>
+<td><code>nullclaw agent</code></td>
+<td>Interactive chat mode</td>
+</tr>
+<tr>
+<td><code>nullclaw agent -m &quot;...&quot; -s &lt;session&gt;</code></td>
+<td>Run a prompt in a named session</td>
+</tr>
+<tr>
+<td><code>nullclaw agent --provider &lt;name&gt; --model &lt;id&gt; --temperature 0.4</code></td>
+<td>Override provider, model, and temperature for one run</td>
+</tr>
+<tr>
+<td><code>nullclaw agent --workspace /path -m &quot;...&quot;</code></td>
+<td>Run against a specific workspace</td>
+</tr>
+<tr>
+<td><code>nullclaw agent --skill news-digest -m &quot;...&quot;</code></td>
+<td>Run with a named skill active</td>
+</tr>
+<tr>
+<td><code>nullclaw acp</code></td>
+<td>Agent Client Protocol stdio adapter for editors</td>
+</tr>
+<tr>
+<td><code>nullclaw acp --provider openai --model gpt-5.2</code></td>
+<td>Pin the ACP adapter to a provider/model</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Inside interactive mode: <code>/model</code> shows and pins models, <code>/config reload</code> hot-reloads config, <code>/bind &lt;agent&gt;</code> routes the current chat to a named agent, <code>/subagents spawn --agent &lt;id&gt;</code> delegates a one-off task.</p>
+<h2 id="runtime-and-operations" aria-labelledby="heading-label-runtime-and-operations"><span id="heading-label-runtime-and-operations">Runtime and operations</span><a class="heading-anchor" href="#runtime-and-operations" aria-label="Permalink to Runtime and operations" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw gateway</code></td>
+<td>Start the long-running runtime (default <code>127.0.0.1:3000</code>)</td>
+</tr>
+<tr>
+<td><code>nullclaw gateway --port 8080</code></td>
+<td>Override the port</td>
+</tr>
+<tr>
+<td><code>nullclaw gateway --host 0.0.0.0 --port 8080</code></td>
+<td>Override host and port</td>
+</tr>
+<tr>
+<td><code>nullclaw gateway --workspace /path</code></td>
+<td>Run the gateway against a specific workspace</td>
+</tr>
+<tr>
+<td><code>nullclaw service install|start|stop|restart|status|uninstall</code></td>
+<td>Manage the background service</td>
+</tr>
+<tr>
+<td><code>nullclaw status [--json]</code></td>
+<td>System status, or a machine-readable runtime snapshot</td>
+</tr>
+<tr>
+<td><code>nullclaw doctor</code></td>
+<td>Run diagnostics</td>
+</tr>
+<tr>
+<td><code>nullclaw update --check</code></td>
+<td>Check for updates without installing</td>
+</tr>
+<tr>
+<td><code>nullclaw update --yes</code></td>
+<td>Install updates without prompting</td>
+</tr>
+<tr>
+<td><code>nullclaw auth login|status|logout openai-codex</code></td>
+<td>OAuth device flow (<code>auth</code> currently supports only <code>openai-codex</code>)</td>
+</tr>
+<tr>
+<td><code>nullclaw auth login openai-codex --import-codex</code></td>
+<td>Import existing Codex CLI credentials instead of a fresh login</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="channels" aria-labelledby="heading-label-channels"><span id="heading-label-channels">Channels</span><a class="heading-anchor" href="#channels" aria-label="Permalink to Channels" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw channel list [--json]</code></td>
+<td>List known and configured channels</td>
+</tr>
+<tr>
+<td><code>nullclaw channel start [telegram]</code></td>
+<td>Start the default or a specific channel</td>
+</tr>
+<tr>
+<td><code>nullclaw channel status</code></td>
+<td>Show channel health</td>
+</tr>
+<tr>
+<td><code>nullclaw channel info &lt;type&gt; [--json]</code></td>
+<td>Show configured accounts for one channel type</td>
+</tr>
+<tr>
+<td><code>nullclaw channel add &lt;type&gt;</code> / <code>remove &lt;name&gt;</code></td>
+<td>Print config guidance for adding/removing a channel</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="cron" aria-labelledby="heading-label-cron"><span id="heading-label-cron">Cron</span><a class="heading-anchor" href="#cron" aria-label="Permalink to Cron" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw cron list [--json]</code></td>
+<td>List scheduled tasks</td>
+</tr>
+<tr>
+<td><code>nullclaw cron get &lt;id&gt; [--json]</code></td>
+<td>Show one task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron status [--json]</code></td>
+<td>Scheduler status and job counters</td>
+</tr>
+<tr>
+<td><code>nullclaw cron add &quot;0 * * * *&quot; &quot;command&quot;</code></td>
+<td>Add a recurring shell task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron add-agent &quot;0 * * * *&quot; &quot;prompt&quot; [--model ...] [--announce] [--channel ...] [--to ...]</code></td>
+<td>Add a recurring agent task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron once 10m &quot;command&quot;</code></td>
+<td>One-shot delayed shell task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron once-agent 10m &quot;prompt&quot;</code></td>
+<td>One-shot delayed agent task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron run &lt;id&gt;</code></td>
+<td>Run a task immediately</td>
+</tr>
+<tr>
+<td><code>nullclaw cron pause &lt;id&gt;</code> / <code>resume &lt;id&gt;</code></td>
+<td>Pause or resume</td>
+</tr>
+<tr>
+<td><code>nullclaw cron remove &lt;id&gt;</code></td>
+<td>Delete a task</td>
+</tr>
+<tr>
+<td><code>nullclaw cron runs &lt;id&gt;</code></td>
+<td>Recent run history</td>
+</tr>
+<tr>
+<td><code>nullclaw cron update &lt;id&gt; --expression ... --command ... --enable/--disable</code></td>
+<td>Update an existing task</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="skills-and-history" aria-labelledby="heading-label-skills-and-history"><span id="heading-label-skills-and-history">Skills and history</span><a class="heading-anchor" href="#skills-and-history" aria-label="Permalink to Skills and history" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw skills list</code></td>
+<td>List installed skills</td>
+</tr>
+<tr>
+<td><code>nullclaw skills install &lt;source&gt;</code></td>
+<td>Install from Git URL, local path, or well-known HTTPS endpoint</td>
+</tr>
+<tr>
+<td><code>nullclaw skills install --name &lt;query&gt;</code></td>
+<td>Search the skill registry and install the best match</td>
+</tr>
+<tr>
+<td><code>nullclaw skills remove &lt;name&gt;</code> / <code>info &lt;name&gt;</code></td>
+<td>Remove a skill / show metadata</td>
+</tr>
+<tr>
+<td><code>nullclaw history list [--limit N] [--offset N] [--json]</code></td>
+<td>List conversation sessions</td>
+</tr>
+<tr>
+<td><code>nullclaw history show &lt;session_id&gt; [--json]</code></td>
+<td>Show messages for a session</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="memory" aria-labelledby="heading-label-memory"><span id="heading-label-memory">Memory</span><a class="heading-anchor" href="#memory" aria-label="Permalink to Memory" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw memory stats</code> / <code>count</code></td>
+<td>Resolved memory config, counters, entry count</td>
+</tr>
+<tr>
+<td><code>nullclaw memory search &quot;query&quot; --limit 10</code></td>
+<td>Run retrieval against memory</td>
+</tr>
+<tr>
+<td><code>nullclaw memory get &lt;key&gt;</code> / <code>list --category task</code></td>
+<td>Inspect entries</td>
+</tr>
+<tr>
+<td><code>nullclaw memory reindex</code></td>
+<td>Rebuild the vector index</td>
+</tr>
+<tr>
+<td><code>nullclaw memory export-jsonl --limit 1000</code></td>
+<td>Export a governed, PII-redacted JSONL dataset</td>
+</tr>
+<tr>
+<td><code>nullclaw memory hygiene-report --json</code></td>
+<td>Dry-run duplicate report (never deletes)</td>
+</tr>
+<tr>
+<td><code>nullclaw memory store</code></td>
+<td>Store an entry directly</td>
+</tr>
+<tr>
+<td><code>nullclaw memory update &lt;key&gt;</code> / <code>delete &lt;key&gt;</code></td>
+<td>Update or delete one entry</td>
+</tr>
+<tr>
+<td><code>nullclaw memory drain-outbox</code></td>
+<td>Drain the durable vector outbox queue</td>
+</tr>
+<tr>
+<td><code>nullclaw memory forget &lt;key&gt;</code></td>
+<td>Delete one entry</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Details and defaults: <a href="/docs/configure/memory/">Memory</a>.</p>
+<h2 id="workspace-config-and-models" aria-labelledby="heading-label-workspace-config-and-models"><span id="heading-label-workspace-config-and-models">Workspace, config, and models</span><a class="heading-anchor" href="#workspace-config-and-models" aria-label="Permalink to Workspace, config, and models" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw workspace edit AGENTS.md</code></td>
+<td>Open a bootstrap markdown file in <code>$EDITOR</code></td>
+</tr>
+<tr>
+<td><code>nullclaw workspace reset-md --dry-run</code></td>
+<td>Preview workspace markdown reset</td>
+</tr>
+<tr>
+<td><code>nullclaw workspace audit [--staged | --commit &lt;sha&gt; | --range a..b] [--json] [--fail-on &lt;level&gt;]</code></td>
+<td>Scan for likely secret leaks — see <a href="/docs/operate/security/">Security</a></td>
+</tr>
+<tr>
+<td><code>nullclaw config show [--json]</code></td>
+<td>Print the full on-disk config</td>
+</tr>
+<tr>
+<td><code>nullclaw config get &lt;path&gt; [--json]</code></td>
+<td>Read one dotted config value</td>
+</tr>
+<tr>
+<td><code>nullclaw config set &lt;path&gt; &lt;value&gt;</code> / <code>unset &lt;path&gt;</code></td>
+<td>Write or clear one dotted config value</td>
+</tr>
+<tr>
+<td><code>nullclaw config reload</code></td>
+<td>Reload config in the running runtime</td>
+</tr>
+<tr>
+<td><code>nullclaw config validate</code></td>
+<td>Check the config file for errors</td>
+</tr>
+<tr>
+<td><code>nullclaw models list|info|summary|benchmark|refresh</code></td>
+<td>Inspect and manage the model catalog</td>
+</tr>
+<tr>
+<td><code>nullclaw mcp list</code> / <code>info &lt;name&gt;</code></td>
+<td>Inspect configured MCP servers</td>
+</tr>
+<tr>
+<td><code>nullclaw capabilities [--json]</code></td>
+<td>Show the runtime capabilities manifest</td>
+</tr>
+<tr>
+<td><code>nullclaw migrate openclaw [--dry-run] [--source PATH]</code></td>
+<td>Import memory and config from OpenClaw</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="hardware-and-automation" aria-labelledby="heading-label-hardware-and-automation"><span id="heading-label-hardware-and-automation">Hardware and automation</span><a class="heading-anchor" href="#hardware-and-automation" aria-label="Permalink to Hardware and automation" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<div class="table-scroll" role="region" aria-label="Data table: Command, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nullclaw hardware scan</code></td>
+<td>Scan connected hardware</td>
+</tr>
+<tr>
+<td><code>nullclaw hardware flash &lt;firmware&gt; [--target &lt;board&gt;]</code></td>
+<td>Flash firmware (currently a placeholder command)</td>
+</tr>
+<tr>
+<td><code>nullclaw hardware monitor</code></td>
+<td>Monitor devices (currently a placeholder command)</td>
+</tr>
+<tr>
+<td><code>nullclaw --export-manifest</code></td>
+<td>Export the runtime manifest (used by NullHub-managed installs)</td>
+</tr>
+<tr>
+<td><code>nullclaw --list-models --provider &lt;name&gt; [--api-key &lt;key&gt;] [--base-url &lt;url&gt;]</code></td>
+<td>Print model info, including custom endpoints</td>
+</tr>
+<tr>
+<td><code>nullclaw --probe-provider-health</code> / <code>--probe-channel-health</code></td>
+<td>Health probes for automation</td>
+</tr>
+<tr>
+<td><code>nullclaw --from-json</code></td>
+<td>JSON-driven entry path</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="build-flags-from-source" aria-labelledby="heading-label-build-flags-from-source"><span id="heading-label-build-flags-from-source">Build flags (from source)</span><a class="heading-anchor" href="#build-flags-from-source" aria-label="Permalink to Build flags (from source)" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<p>Passed to <code>zig build</code>; they shape what the binary contains.</p>
+<div class="table-scroll" role="region" aria-label="Data table: Flag, Purpose" tabindex="0"><table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>-Dchannels=all|none|telegram,...</code></td>
+<td>Choose which of the 23 channel integrations are compiled in (default: all; the webhook channel is always on)</td>
+</tr>
+<tr>
+<td><code>-Dengines=base|all|sqlite,...</code></td>
+<td>Choose memory engines from the 12 available (default build ships base + SQLite)</td>
+</tr>
+<tr>
+<td><code>-Dstatic</code></td>
+<td>Fully static link</td>
+</tr>
+<tr>
+<td><code>-Dembedded_wasm3</code></td>
+<td>Embed the wasm3 WebAssembly runtime (default: true)</td>
+</tr>
+<tr>
+<td><code>-Dversion=...</code></td>
+<td>Stamp the version string</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="troubleshooting-order" aria-labelledby="heading-label-troubleshooting-order"><span id="heading-label-troubleshooting-order">Troubleshooting order</span><a class="heading-anchor" href="#troubleshooting-order" aria-label="Permalink to Troubleshooting order" data-pagefind-ignore><span aria-hidden="true">#</span></a></h2>
+<p>When something is off, run these in sequence:</p>
+<figure class="code-figure" data-lang="bash"><pre class="shiki null-kitchen" style="background-color:#0a0806;color:#d9d1c3" tabindex="0"><code><span class="line"><span style="color:#ECE5D8">nullclaw</span><span style="color:#C9B795"> doctor</span></span>
+<span class="line"><span style="color:#ECE5D8">nullclaw</span><span style="color:#C9B795"> status</span></span>
+<span class="line"><span style="color:#ECE5D8">nullclaw</span><span style="color:#C9B795"> channel</span><span style="color:#C9B795"> status</span></span>
+<span class="line"><span style="color:#ECE5D8">nullclaw</span><span style="color:#C9B795"> agent</span><span style="color:#C9B795"> -m</span><span style="color:#C9B795"> "self-check"</span></span>
+<span class="line"><span style="color:#ECE5D8">curl</span><span style="color:#C9B795"> http://127.0.0.1:3000/health</span><span style="color:#877E6F;font-style:italic">   # if the gateway is involved</span></span></code></pre><button class="code-copy" type="button" data-code data-pagefind-ignore aria-live="polite">copy</button></figure>
+<!----></div> <nav class="pager svelte-5oqt2y" aria-label="Previous and next" data-pagefind-ignore=""><!--[0--><a class="pager-link prev svelte-5oqt2y" href="/docs/operate/security/"><span class="dir mono svelte-5oqt2y"><!----><svg class="functional-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m10.5 7-5 5 5 5"></path><path d="M6 12h12.5"></path></g></svg><!----><!----> previous</span> <span class="serif-i svelte-5oqt2y">Security</span></a><!--]--> <!--[-1--><!--]--></nav></article> <!--[0--><aside class="toc svelte-5oqt2y" aria-label="On this page"><h2 class="label svelte-5oqt2y">On this page</h2> <ul class="svelte-5oqt2y"><!--[--><li class="d2 svelte-5oqt2y"><a href="#setup-and-interaction" class="svelte-5oqt2y">Setup and interaction</a></li><li class="d2 svelte-5oqt2y"><a href="#runtime-and-operations" class="svelte-5oqt2y">Runtime and operations</a></li><li class="d2 svelte-5oqt2y"><a href="#channels" class="svelte-5oqt2y">Channels</a></li><li class="d2 svelte-5oqt2y"><a href="#cron" class="svelte-5oqt2y">Cron</a></li><li class="d2 svelte-5oqt2y"><a href="#skills-and-history" class="svelte-5oqt2y">Skills and history</a></li><li class="d2 svelte-5oqt2y"><a href="#memory" class="svelte-5oqt2y">Memory</a></li><li class="d2 svelte-5oqt2y"><a href="#workspace-config-and-models" class="svelte-5oqt2y">Workspace, config, and models</a></li><li class="d2 svelte-5oqt2y"><a href="#hardware-and-automation" class="svelte-5oqt2y">Hardware and automation</a></li><li class="d2 svelte-5oqt2y"><a href="#build-flags-from-source" class="svelte-5oqt2y">Build flags (from source)</a></li><li class="d2 svelte-5oqt2y"><a href="#troubleshooting-order" class="svelte-5oqt2y">Troubleshooting order</a></li><!--]--></ul></aside><!--]--></div><!--]--><!----></div></div><!--]--><!--]--><!----></main> <footer class="svelte-jz8lnl"><div class="container"><div class="signoff svelte-jz8lnl"><p class="serif-i big svelte-jz8lnl">Built for your hardware.</p> <p class="sub svelte-jz8lnl">Single-binary Zig tools for running and supervising AI agents locally.</p></div> <div class="cols svelte-jz8lnl"><div class="col svelte-jz8lnl"><h3 class="label svelte-jz8lnl">Products</h3> <ul class="svelte-jz8lnl"><!--[--><li><a href="https://hub.nullmenu.ai" class="mono svelte-jz8lnl">nullhub</a></li><li><a href="https://claw.nullmenu.ai" class="mono svelte-jz8lnl">nullclaw</a></li><li><a href="https://boiler.nullmenu.ai" class="mono svelte-jz8lnl">nullboiler</a></li><li><a href="https://tickets.nullmenu.ai" class="mono svelte-jz8lnl">nulltickets</a></li><li><a href="https://watch.nullmenu.ai" class="mono svelte-jz8lnl">nullwatch</a></li><li><a href="https://pantry.nullmenu.ai" class="mono svelte-jz8lnl">nullpantry</a></li><li><a href="https://clw.nullmenu.ai" class="mono svelte-jz8lnl">nllclw</a></li><li><a href="https://desk.nullmenu.ai" class="mono svelte-jz8lnl">nulldesk</a></li><li><a href="https://cap.nullmenu.ai" class="mono svelte-jz8lnl">nullcap</a></li><li><a href="https://builder.nullmenu.ai" class="mono svelte-jz8lnl">nullbuilder</a></li><!--]--></ul></div> <div class="col svelte-jz8lnl"><h3 class="label svelte-jz8lnl">Explore</h3> <ul class="svelte-jz8lnl"><li><a href="https://nullmenu.ai/products/" class="svelte-jz8lnl">All products</a></li> <li><a href="/docs/" class="svelte-jz8lnl">Documentation</a></li> <li><a href="/llms.txt" class="mono svelte-jz8lnl">llms.txt</a></li></ul></div> <div class="col svelte-jz8lnl"><h3 class="label svelte-jz8lnl">Source</h3> <ul class="svelte-jz8lnl"><li><a href="https://github.com/nullclaw/nullclaw" target="_blank" rel="noopener" class="svelte-jz8lnl">GitHub <!----><svg class="functional-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="opens in a new tab"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></a></li> <li><a href="https://github.com/nullclaw" target="_blank" rel="noopener" class="svelte-jz8lnl">nullclaw org <!----><svg class="functional-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="opens in a new tab"><g stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8"></path><path d="M10 8h6v6"></path></g></svg><!----><!----></a></li> <!--[0--><li><span class="dim svelte-jz8lnl">MIT licensed</span></li><!--]--> <!--[0--><li><span class="dim mono svelte-jz8lnl">v2026.5.29</span></li><!--]--></ul></div></div> <div class="bottom svelte-jz8lnl"><span class="mark svelte-jz8lnl"><svg width="24" height="24" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="16" cy="16" r="10.5" stroke="currentColor" stroke-width="1.75"></circle><line class="slash" x1="7" y1="27" x2="25" y2="5" stroke="var(--accent)" stroke-width="1.75" stroke-linecap="round"></line></svg><!----></span> <span class="mono note svelte-jz8lnl">© 2026 the Null ecosystem</span> <span class="mono note svelte-jz8lnl">built with Zig 0.16</span> <span class="mono note svelte-jz8lnl">local-first · no cloud</span></div></div></footer><!----> <div class="grain svelte-2z0jyf" aria-hidden="true" style="background-image: url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E&quot;);"></div><!----><!--]--><!--]--> <!--[-1--><!--]--><!--]-->
+			
+			<script>
+				{
+					__sveltekit_k97f0b = {
+						base: new URL("../../..", location).pathname.slice(0, -1)
+					};
+
+					const element = document.currentScript.parentElement;
+
+					Promise.all([
+						import("../../../_app/immutable/entry/start.uOp12_Cw.js"),
+						import("../../../_app/immutable/entry/app.DE8GowH-.js")
+					]).then(([kit, app]) => {
+						kit.start(app, element, {
+							node_ids: [0, 2, 5],
+							data: [null,{type:"data",data:{tree:[{slug:"start",title:"Start",pages:[{siteId:"claw",section:"start",slug:"install",path:"/content/claw/docs/start/install.md",title:"Install",description:"Get the NullClaw binary via Homebrew, Docker, or a source build with Zig 0.16.0.",order:1,verified:"v2026.5.29"},{siteId:"claw",section:"start",slug:"quickstart",path:"/content/claw/docs/start/quickstart.md",title:"Quickstart",description:"From a fresh install to a first conversation and a running gateway.",order:2,verified:"v2026.5.29"},{siteId:"claw",section:"start",slug:"first-channel",path:"/content/claw/docs/start/first-channel.md",title:"Your first channel",description:"Connect NullClaw to Telegram (or any of the 26 channels) and lock it down with allowlists.",order:3,verified:"v2026.5.29"}]},{slug:"configure",title:"Configure",pages:[{siteId:"claw",section:"configure",slug:"configuration",path:"/content/claw/docs/configure/configuration.md",title:"Configuration",description:"One JSON file at ~/.nullclaw/config.json — OpenClaw-compatible, snake_case, no magic.",order:1,verified:"v2026.5.29"},{siteId:"claw",section:"configure",slug:"providers",path:"/content/claw/docs/configure/providers.md",title:"Providers",description:"Connect ~60 model providers, set the default route, and add fallbacks and auto-routing.",order:2,verified:"v2026.5.29"},{siteId:"claw",section:"configure",slug:"memory",path:"/content/claw/docs/configure/memory.md",title:"Memory",description:"Hybrid search over SQLite by default, nine other engines when you need them, and CLI tools to keep it clean.",order:3,verified:"v2026.5.29"}]},{slug:"operate",title:"Operate",pages:[{siteId:"claw",section:"operate",slug:"gateway-and-service",path:"/content/claw/docs/operate/gateway-and-service.md",title:"Gateway and service",description:"Run NullClaw long-term — the HTTP gateway, pairing, cron endpoints, and background service mode.",order:1,verified:"v2026.5.29"},{siteId:"claw",section:"operate",slug:"security",path:"/content/claw/docs/operate/security.md",title:"Security",description:"The layers NullClaw enforces by default, the settings that widen them, and how to audit for leaked secrets.",order:2,verified:"v2026.5.29"}]},{slug:"reference",title:"Reference",pages:[{siteId:"claw",section:"reference",slug:"cli",path:"/content/claw/docs/reference/cli.md",title:"CLI reference",description:"Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags.",order:1,verified:"v2026.5.29"}]}]},uses:{}},{type:"data",data:{doc:{siteId:"claw",section:"reference",slug:"cli",path:"/content/claw/docs/reference/cli.md",title:"CLI reference",description:"Every nullclaw command, grouped by task — setup, runtime, channels, cron, memory, automation flags, and build flags.",order:1,verified:"v2026.5.29",body:"\nThe full command surface, grouped by task. `nullclaw help` prints the top-level summary; this page expands it and follows the project's own command reference.\n\n> [!NOTE]\n> Pre-1.0: config and CLI may change between releases.\n\n## Setup and interaction\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw help` | Show top-level help |\n| `nullclaw version` / `nullclaw --version` | Show CLI version |\n| `nullclaw onboard --interactive` | Run the interactive setup wizard |\n| `nullclaw onboard --api-key sk-... --provider openrouter` | Quick provider + API key setup |\n| `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | Set provider, model, and memory backend at once |\n| `nullclaw agent -m \"...\"` | Run a single prompt |\n| `nullclaw agent` | Interactive chat mode |\n| `nullclaw agent -m \"...\" -s \u003Csession>` | Run a prompt in a named session |\n| `nullclaw agent --provider \u003Cname> --model \u003Cid> --temperature 0.4` | Override provider, model, and temperature for one run |\n| `nullclaw agent --workspace /path -m \"...\"` | Run against a specific workspace |\n| `nullclaw agent --skill news-digest -m \"...\"` | Run with a named skill active |\n| `nullclaw acp` | Agent Client Protocol stdio adapter for editors |\n| `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model |\n\nInside interactive mode: `/model` shows and pins models, `/config reload` hot-reloads config, `/bind \u003Cagent>` routes the current chat to a named agent, `/subagents spawn --agent \u003Cid>` delegates a one-off task.\n\n## Runtime and operations\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw gateway` | Start the long-running runtime (default `127.0.0.1:3000`) |\n| `nullclaw gateway --port 8080` | Override the port |\n| `nullclaw gateway --host 0.0.0.0 --port 8080` | Override host and port |\n| `nullclaw gateway --workspace /path` | Run the gateway against a specific workspace |\n| `nullclaw service install\\|start\\|stop\\|restart\\|status\\|uninstall` | Manage the background service |\n| `nullclaw status [--json]` | System status, or a machine-readable runtime snapshot |\n| `nullclaw doctor` | Run diagnostics |\n| `nullclaw update --check` | Check for updates without installing |\n| `nullclaw update --yes` | Install updates without prompting |\n| `nullclaw auth login\\|status\\|logout openai-codex` | OAuth device flow (`auth` currently supports only `openai-codex`) |\n| `nullclaw auth login openai-codex --import-codex` | Import existing Codex CLI credentials instead of a fresh login |\n\n## Channels\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw channel list [--json]` | List known and configured channels |\n| `nullclaw channel start [telegram]` | Start the default or a specific channel |\n| `nullclaw channel status` | Show channel health |\n| `nullclaw channel info \u003Ctype> [--json]` | Show configured accounts for one channel type |\n| `nullclaw channel add \u003Ctype>` / `remove \u003Cname>` | Print config guidance for adding/removing a channel |\n\n## Cron\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw cron list [--json]` | List scheduled tasks |\n| `nullclaw cron get \u003Cid> [--json]` | Show one task |\n| `nullclaw cron status [--json]` | Scheduler status and job counters |\n| `nullclaw cron add \"0 * * * *\" \"command\"` | Add a recurring shell task |\n| `nullclaw cron add-agent \"0 * * * *\" \"prompt\" [--model ...] [--announce] [--channel ...] [--to ...]` | Add a recurring agent task |\n| `nullclaw cron once 10m \"command\"` | One-shot delayed shell task |\n| `nullclaw cron once-agent 10m \"prompt\"` | One-shot delayed agent task |\n| `nullclaw cron run \u003Cid>` | Run a task immediately |\n| `nullclaw cron pause \u003Cid>` / `resume \u003Cid>` | Pause or resume |\n| `nullclaw cron remove \u003Cid>` | Delete a task |\n| `nullclaw cron runs \u003Cid>` | Recent run history |\n| `nullclaw cron update \u003Cid> --expression ... --command ... --enable/--disable` | Update an existing task |\n\n## Skills and history\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw skills list` | List installed skills |\n| `nullclaw skills install \u003Csource>` | Install from Git URL, local path, or well-known HTTPS endpoint |\n| `nullclaw skills install --name \u003Cquery>` | Search the skill registry and install the best match |\n| `nullclaw skills remove \u003Cname>` / `info \u003Cname>` | Remove a skill / show metadata |\n| `nullclaw history list [--limit N] [--offset N] [--json]` | List conversation sessions |\n| `nullclaw history show \u003Csession_id> [--json]` | Show messages for a session |\n\n## Memory\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw memory stats` / `count` | Resolved memory config, counters, entry count |\n| `nullclaw memory search \"query\" --limit 10` | Run retrieval against memory |\n| `nullclaw memory get \u003Ckey>` / `list --category task` | Inspect entries |\n| `nullclaw memory reindex` | Rebuild the vector index |\n| `nullclaw memory export-jsonl --limit 1000` | Export a governed, PII-redacted JSONL dataset |\n| `nullclaw memory hygiene-report --json` | Dry-run duplicate report (never deletes) |\n| `nullclaw memory store` | Store an entry directly |\n| `nullclaw memory update \u003Ckey>` / `delete \u003Ckey>` | Update or delete one entry |\n| `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |\n| `nullclaw memory forget \u003Ckey>` | Delete one entry |\n\nDetails and defaults: [Memory](/docs/configure/memory/).\n\n## Workspace, config, and models\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw workspace edit AGENTS.md` | Open a bootstrap markdown file in `$EDITOR` |\n| `nullclaw workspace reset-md --dry-run` | Preview workspace markdown reset |\n| `nullclaw workspace audit [--staged \\| --commit \u003Csha> \\| --range a..b] [--json] [--fail-on \u003Clevel>]` | Scan for likely secret leaks — see [Security](/docs/operate/security/) |\n| `nullclaw config show [--json]` | Print the full on-disk config |\n| `nullclaw config get \u003Cpath> [--json]` | Read one dotted config value |\n| `nullclaw config set \u003Cpath> \u003Cvalue>` / `unset \u003Cpath>` | Write or clear one dotted config value |\n| `nullclaw config reload` | Reload config in the running runtime |\n| `nullclaw config validate` | Check the config file for errors |\n| `nullclaw models list\\|info\\|summary\\|benchmark\\|refresh` | Inspect and manage the model catalog |\n| `nullclaw mcp list` / `info \u003Cname>` | Inspect configured MCP servers |\n| `nullclaw capabilities [--json]` | Show the runtime capabilities manifest |\n| `nullclaw migrate openclaw [--dry-run] [--source PATH]` | Import memory and config from OpenClaw |\n\n## Hardware and automation\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw hardware scan` | Scan connected hardware |\n| `nullclaw hardware flash \u003Cfirmware> [--target \u003Cboard>]` | Flash firmware (currently a placeholder command) |\n| `nullclaw hardware monitor` | Monitor devices (currently a placeholder command) |\n| `nullclaw --export-manifest` | Export the runtime manifest (used by NullHub-managed installs) |\n| `nullclaw --list-models --provider \u003Cname> [--api-key \u003Ckey>] [--base-url \u003Curl>]` | Print model info, including custom endpoints |\n| `nullclaw --probe-provider-health` / `--probe-channel-health` | Health probes for automation |\n| `nullclaw --from-json` | JSON-driven entry path |\n\n## Build flags (from source)\n\nPassed to `zig build`; they shape what the binary contains.\n\n| Flag | Purpose |\n| --- | --- |\n| `-Dchannels=all\\|none\\|telegram,...` | Choose which of the 23 channel integrations are compiled in (default: all; the webhook channel is always on) |\n| `-Dengines=base\\|all\\|sqlite,...` | Choose memory engines from the 12 available (default build ships base + SQLite) |\n| `-Dstatic` | Fully static link |\n| `-Dembedded_wasm3` | Embed the wasm3 WebAssembly runtime (default: true) |\n| `-Dversion=...` | Stamp the version string |\n\n## Troubleshooting order\n\nWhen something is off, run these in sequence:\n\n```bash\nnullclaw doctor\nnullclaw status\nnullclaw channel status\nnullclaw agent -m \"self-check\"\ncurl http://127.0.0.1:3000/health   # if the gateway is involved\n```\n",html:"\u003Cp>The full command surface, grouped by task. \u003Ccode>nullclaw help\u003C/code> prints the top-level summary; this page expands it and follows the project&#39;s own command reference.\u003C/p>\n\u003Caside class=\"callout callout--note\">\u003Cdiv class=\"callout-title\">Note\u003C/div>\u003Cp>Pre-1.0: config and CLI may change between releases.\u003C/p>\n\u003C/aside>\n\u003Ch2 id=\"setup-and-interaction\" aria-labelledby=\"heading-label-setup-and-interaction\">\u003Cspan id=\"heading-label-setup-and-interaction\">Setup and interaction\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#setup-and-interaction\" aria-label=\"Permalink to Setup and interaction\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw help\u003C/code>\u003C/td>\n\u003Ctd>Show top-level help\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw version\u003C/code> / \u003Ccode>nullclaw --version\u003C/code>\u003C/td>\n\u003Ctd>Show CLI version\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw onboard --interactive\u003C/code>\u003C/td>\n\u003Ctd>Run the interactive setup wizard\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw onboard --api-key sk-... --provider openrouter\u003C/code>\u003C/td>\n\u003Ctd>Quick provider + API key setup\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw onboard --api-key ... --provider ... --model ... --memory ...\u003C/code>\u003C/td>\n\u003Ctd>Set provider, model, and memory backend at once\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent -m &quot;...&quot;\u003C/code>\u003C/td>\n\u003Ctd>Run a single prompt\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent\u003C/code>\u003C/td>\n\u003Ctd>Interactive chat mode\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent -m &quot;...&quot; -s &lt;session&gt;\u003C/code>\u003C/td>\n\u003Ctd>Run a prompt in a named session\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent --provider &lt;name&gt; --model &lt;id&gt; --temperature 0.4\u003C/code>\u003C/td>\n\u003Ctd>Override provider, model, and temperature for one run\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent --workspace /path -m &quot;...&quot;\u003C/code>\u003C/td>\n\u003Ctd>Run against a specific workspace\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw agent --skill news-digest -m &quot;...&quot;\u003C/code>\u003C/td>\n\u003Ctd>Run with a named skill active\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw acp\u003C/code>\u003C/td>\n\u003Ctd>Agent Client Protocol stdio adapter for editors\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw acp --provider openai --model gpt-5.2\u003C/code>\u003C/td>\n\u003Ctd>Pin the ACP adapter to a provider/model\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Cp>Inside interactive mode: \u003Ccode>/model\u003C/code> shows and pins models, \u003Ccode>/config reload\u003C/code> hot-reloads config, \u003Ccode>/bind &lt;agent&gt;\u003C/code> routes the current chat to a named agent, \u003Ccode>/subagents spawn --agent &lt;id&gt;\u003C/code> delegates a one-off task.\u003C/p>\n\u003Ch2 id=\"runtime-and-operations\" aria-labelledby=\"heading-label-runtime-and-operations\">\u003Cspan id=\"heading-label-runtime-and-operations\">Runtime and operations\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#runtime-and-operations\" aria-label=\"Permalink to Runtime and operations\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw gateway\u003C/code>\u003C/td>\n\u003Ctd>Start the long-running runtime (default \u003Ccode>127.0.0.1:3000\u003C/code>)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw gateway --port 8080\u003C/code>\u003C/td>\n\u003Ctd>Override the port\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw gateway --host 0.0.0.0 --port 8080\u003C/code>\u003C/td>\n\u003Ctd>Override host and port\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw gateway --workspace /path\u003C/code>\u003C/td>\n\u003Ctd>Run the gateway against a specific workspace\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw service install|start|stop|restart|status|uninstall\u003C/code>\u003C/td>\n\u003Ctd>Manage the background service\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw status [--json]\u003C/code>\u003C/td>\n\u003Ctd>System status, or a machine-readable runtime snapshot\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw doctor\u003C/code>\u003C/td>\n\u003Ctd>Run diagnostics\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw update --check\u003C/code>\u003C/td>\n\u003Ctd>Check for updates without installing\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw update --yes\u003C/code>\u003C/td>\n\u003Ctd>Install updates without prompting\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw auth login|status|logout openai-codex\u003C/code>\u003C/td>\n\u003Ctd>OAuth device flow (\u003Ccode>auth\u003C/code> currently supports only \u003Ccode>openai-codex\u003C/code>)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw auth login openai-codex --import-codex\u003C/code>\u003C/td>\n\u003Ctd>Import existing Codex CLI credentials instead of a fresh login\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"channels\" aria-labelledby=\"heading-label-channels\">\u003Cspan id=\"heading-label-channels\">Channels\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#channels\" aria-label=\"Permalink to Channels\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw channel list [--json]\u003C/code>\u003C/td>\n\u003Ctd>List known and configured channels\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw channel start [telegram]\u003C/code>\u003C/td>\n\u003Ctd>Start the default or a specific channel\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw channel status\u003C/code>\u003C/td>\n\u003Ctd>Show channel health\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw channel info &lt;type&gt; [--json]\u003C/code>\u003C/td>\n\u003Ctd>Show configured accounts for one channel type\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw channel add &lt;type&gt;\u003C/code> / \u003Ccode>remove &lt;name&gt;\u003C/code>\u003C/td>\n\u003Ctd>Print config guidance for adding/removing a channel\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"cron\" aria-labelledby=\"heading-label-cron\">\u003Cspan id=\"heading-label-cron\">Cron\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#cron\" aria-label=\"Permalink to Cron\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron list [--json]\u003C/code>\u003C/td>\n\u003Ctd>List scheduled tasks\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron get &lt;id&gt; [--json]\u003C/code>\u003C/td>\n\u003Ctd>Show one task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron status [--json]\u003C/code>\u003C/td>\n\u003Ctd>Scheduler status and job counters\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron add &quot;0 * * * *&quot; &quot;command&quot;\u003C/code>\u003C/td>\n\u003Ctd>Add a recurring shell task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron add-agent &quot;0 * * * *&quot; &quot;prompt&quot; [--model ...] [--announce] [--channel ...] [--to ...]\u003C/code>\u003C/td>\n\u003Ctd>Add a recurring agent task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron once 10m &quot;command&quot;\u003C/code>\u003C/td>\n\u003Ctd>One-shot delayed shell task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron once-agent 10m &quot;prompt&quot;\u003C/code>\u003C/td>\n\u003Ctd>One-shot delayed agent task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron run &lt;id&gt;\u003C/code>\u003C/td>\n\u003Ctd>Run a task immediately\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron pause &lt;id&gt;\u003C/code> / \u003Ccode>resume &lt;id&gt;\u003C/code>\u003C/td>\n\u003Ctd>Pause or resume\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron remove &lt;id&gt;\u003C/code>\u003C/td>\n\u003Ctd>Delete a task\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron runs &lt;id&gt;\u003C/code>\u003C/td>\n\u003Ctd>Recent run history\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw cron update &lt;id&gt; --expression ... --command ... --enable/--disable\u003C/code>\u003C/td>\n\u003Ctd>Update an existing task\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"skills-and-history\" aria-labelledby=\"heading-label-skills-and-history\">\u003Cspan id=\"heading-label-skills-and-history\">Skills and history\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#skills-and-history\" aria-label=\"Permalink to Skills and history\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw skills list\u003C/code>\u003C/td>\n\u003Ctd>List installed skills\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw skills install &lt;source&gt;\u003C/code>\u003C/td>\n\u003Ctd>Install from Git URL, local path, or well-known HTTPS endpoint\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw skills install --name &lt;query&gt;\u003C/code>\u003C/td>\n\u003Ctd>Search the skill registry and install the best match\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw skills remove &lt;name&gt;\u003C/code> / \u003Ccode>info &lt;name&gt;\u003C/code>\u003C/td>\n\u003Ctd>Remove a skill / show metadata\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw history list [--limit N] [--offset N] [--json]\u003C/code>\u003C/td>\n\u003Ctd>List conversation sessions\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw history show &lt;session_id&gt; [--json]\u003C/code>\u003C/td>\n\u003Ctd>Show messages for a session\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"memory\" aria-labelledby=\"heading-label-memory\">\u003Cspan id=\"heading-label-memory\">Memory\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#memory\" aria-label=\"Permalink to Memory\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory stats\u003C/code> / \u003Ccode>count\u003C/code>\u003C/td>\n\u003Ctd>Resolved memory config, counters, entry count\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory search &quot;query&quot; --limit 10\u003C/code>\u003C/td>\n\u003Ctd>Run retrieval against memory\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory get &lt;key&gt;\u003C/code> / \u003Ccode>list --category task\u003C/code>\u003C/td>\n\u003Ctd>Inspect entries\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory reindex\u003C/code>\u003C/td>\n\u003Ctd>Rebuild the vector index\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory export-jsonl --limit 1000\u003C/code>\u003C/td>\n\u003Ctd>Export a governed, PII-redacted JSONL dataset\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory hygiene-report --json\u003C/code>\u003C/td>\n\u003Ctd>Dry-run duplicate report (never deletes)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory store\u003C/code>\u003C/td>\n\u003Ctd>Store an entry directly\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory update &lt;key&gt;\u003C/code> / \u003Ccode>delete &lt;key&gt;\u003C/code>\u003C/td>\n\u003Ctd>Update or delete one entry\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory drain-outbox\u003C/code>\u003C/td>\n\u003Ctd>Drain the durable vector outbox queue\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw memory forget &lt;key&gt;\u003C/code>\u003C/td>\n\u003Ctd>Delete one entry\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Cp>Details and defaults: \u003Ca href=\"/docs/configure/memory/\">Memory\u003C/a>.\u003C/p>\n\u003Ch2 id=\"workspace-config-and-models\" aria-labelledby=\"heading-label-workspace-config-and-models\">\u003Cspan id=\"heading-label-workspace-config-and-models\">Workspace, config, and models\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#workspace-config-and-models\" aria-label=\"Permalink to Workspace, config, and models\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw workspace edit AGENTS.md\u003C/code>\u003C/td>\n\u003Ctd>Open a bootstrap markdown file in \u003Ccode>$EDITOR\u003C/code>\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw workspace reset-md --dry-run\u003C/code>\u003C/td>\n\u003Ctd>Preview workspace markdown reset\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw workspace audit [--staged | --commit &lt;sha&gt; | --range a..b] [--json] [--fail-on &lt;level&gt;]\u003C/code>\u003C/td>\n\u003Ctd>Scan for likely secret leaks — see \u003Ca href=\"/docs/operate/security/\">Security\u003C/a>\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw config show [--json]\u003C/code>\u003C/td>\n\u003Ctd>Print the full on-disk config\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw config get &lt;path&gt; [--json]\u003C/code>\u003C/td>\n\u003Ctd>Read one dotted config value\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw config set &lt;path&gt; &lt;value&gt;\u003C/code> / \u003Ccode>unset &lt;path&gt;\u003C/code>\u003C/td>\n\u003Ctd>Write or clear one dotted config value\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw config reload\u003C/code>\u003C/td>\n\u003Ctd>Reload config in the running runtime\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw config validate\u003C/code>\u003C/td>\n\u003Ctd>Check the config file for errors\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw models list|info|summary|benchmark|refresh\u003C/code>\u003C/td>\n\u003Ctd>Inspect and manage the model catalog\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw mcp list\u003C/code> / \u003Ccode>info &lt;name&gt;\u003C/code>\u003C/td>\n\u003Ctd>Inspect configured MCP servers\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw capabilities [--json]\u003C/code>\u003C/td>\n\u003Ctd>Show the runtime capabilities manifest\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw migrate openclaw [--dry-run] [--source PATH]\u003C/code>\u003C/td>\n\u003Ctd>Import memory and config from OpenClaw\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"hardware-and-automation\" aria-labelledby=\"heading-label-hardware-and-automation\">\u003Cspan id=\"heading-label-hardware-and-automation\">Hardware and automation\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#hardware-and-automation\" aria-label=\"Permalink to Hardware and automation\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Command, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Command\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw hardware scan\u003C/code>\u003C/td>\n\u003Ctd>Scan connected hardware\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw hardware flash &lt;firmware&gt; [--target &lt;board&gt;]\u003C/code>\u003C/td>\n\u003Ctd>Flash firmware (currently a placeholder command)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw hardware monitor\u003C/code>\u003C/td>\n\u003Ctd>Monitor devices (currently a placeholder command)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw --export-manifest\u003C/code>\u003C/td>\n\u003Ctd>Export the runtime manifest (used by NullHub-managed installs)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw --list-models --provider &lt;name&gt; [--api-key &lt;key&gt;] [--base-url &lt;url&gt;]\u003C/code>\u003C/td>\n\u003Ctd>Print model info, including custom endpoints\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw --probe-provider-health\u003C/code> / \u003Ccode>--probe-channel-health\u003C/code>\u003C/td>\n\u003Ctd>Health probes for automation\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>nullclaw --from-json\u003C/code>\u003C/td>\n\u003Ctd>JSON-driven entry path\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"build-flags-from-source\" aria-labelledby=\"heading-label-build-flags-from-source\">\u003Cspan id=\"heading-label-build-flags-from-source\">Build flags (from source)\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#build-flags-from-source\" aria-label=\"Permalink to Build flags (from source)\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cp>Passed to \u003Ccode>zig build\u003C/code>; they shape what the binary contains.\u003C/p>\n\u003Cdiv class=\"table-scroll\" role=\"region\" aria-label=\"Data table: Flag, Purpose\" tabindex=\"0\">\u003Ctable>\n\u003Cthead>\n\u003Ctr>\n\u003Cth>Flag\u003C/th>\n\u003Cth>Purpose\u003C/th>\n\u003C/tr>\n\u003C/thead>\n\u003Ctbody>\u003Ctr>\n\u003Ctd>\u003Ccode>-Dchannels=all|none|telegram,...\u003C/code>\u003C/td>\n\u003Ctd>Choose which of the 23 channel integrations are compiled in (default: all; the webhook channel is always on)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>-Dengines=base|all|sqlite,...\u003C/code>\u003C/td>\n\u003Ctd>Choose memory engines from the 12 available (default build ships base + SQLite)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>-Dstatic\u003C/code>\u003C/td>\n\u003Ctd>Fully static link\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>-Dembedded_wasm3\u003C/code>\u003C/td>\n\u003Ctd>Embed the wasm3 WebAssembly runtime (default: true)\u003C/td>\n\u003C/tr>\n\u003Ctr>\n\u003Ctd>\u003Ccode>-Dversion=...\u003C/code>\u003C/td>\n\u003Ctd>Stamp the version string\u003C/td>\n\u003C/tr>\n\u003C/tbody>\n\u003C/table>\n\u003C/div>\n\u003Ch2 id=\"troubleshooting-order\" aria-labelledby=\"heading-label-troubleshooting-order\">\u003Cspan id=\"heading-label-troubleshooting-order\">Troubleshooting order\u003C/span>\u003Ca class=\"heading-anchor\" href=\"#troubleshooting-order\" aria-label=\"Permalink to Troubleshooting order\" data-pagefind-ignore>\u003Cspan aria-hidden=\"true\">#\u003C/span>\u003C/a>\u003C/h2>\n\u003Cp>When something is off, run these in sequence:\u003C/p>\n\u003Cfigure class=\"code-figure\" data-lang=\"bash\">\u003Cpre class=\"shiki null-kitchen\" style=\"background-color:#0a0806;color:#d9d1c3\" tabindex=\"0\">\u003Ccode>\u003Cspan class=\"line\">\u003Cspan style=\"color:#ECE5D8\">nullclaw\u003C/span>\u003Cspan style=\"color:#C9B795\"> doctor\u003C/span>\u003C/span>\n\u003Cspan class=\"line\">\u003Cspan style=\"color:#ECE5D8\">nullclaw\u003C/span>\u003Cspan style=\"color:#C9B795\"> status\u003C/span>\u003C/span>\n\u003Cspan class=\"line\">\u003Cspan style=\"color:#ECE5D8\">nullclaw\u003C/span>\u003Cspan style=\"color:#C9B795\"> channel\u003C/span>\u003Cspan style=\"color:#C9B795\"> status\u003C/span>\u003C/span>\n\u003Cspan class=\"line\">\u003Cspan style=\"color:#ECE5D8\">nullclaw\u003C/span>\u003Cspan style=\"color:#C9B795\"> agent\u003C/span>\u003Cspan style=\"color:#C9B795\"> -m\u003C/span>\u003Cspan style=\"color:#C9B795\"> \"self-check\"\u003C/span>\u003C/span>\n\u003Cspan class=\"line\">\u003Cspan style=\"color:#ECE5D8\">curl\u003C/span>\u003Cspan style=\"color:#C9B795\"> http://127.0.0.1:3000/health\u003C/span>\u003Cspan style=\"color:#877E6F;font-style:italic\">   # if the gateway is involved\u003C/span>\u003C/span>\u003C/code>\u003C/pre>\u003Cbutton class=\"code-copy\" type=\"button\" data-code data-pagefind-ignore aria-live=\"polite\">copy\u003C/button>\u003C/figure>\n",toc:[{id:"setup-and-interaction",text:"Setup and interaction",depth:2},{id:"runtime-and-operations",text:"Runtime and operations",depth:2},{id:"channels",text:"Channels",depth:2},{id:"cron",text:"Cron",depth:2},{id:"skills-and-history",text:"Skills and history",depth:2},{id:"memory",text:"Memory",depth:2},{id:"workspace-config-and-models",text:"Workspace, config, and models",depth:2},{id:"hardware-and-automation",text:"Hardware and automation",depth:2},{id:"build-flags-from-source",text:"Build flags (from source)",depth:2},{id:"troubleshooting-order",text:"Troubleshooting order",depth:2}]},raw:"\nThe full command surface, grouped by task. `nullclaw help` prints the top-level summary; this page expands it and follows the project's own command reference.\n\n> [!NOTE]\n> Pre-1.0: config and CLI may change between releases.\n\n## Setup and interaction\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw help` | Show top-level help |\n| `nullclaw version` / `nullclaw --version` | Show CLI version |\n| `nullclaw onboard --interactive` | Run the interactive setup wizard |\n| `nullclaw onboard --api-key sk-... --provider openrouter` | Quick provider + API key setup |\n| `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | Set provider, model, and memory backend at once |\n| `nullclaw agent -m \"...\"` | Run a single prompt |\n| `nullclaw agent` | Interactive chat mode |\n| `nullclaw agent -m \"...\" -s \u003Csession>` | Run a prompt in a named session |\n| `nullclaw agent --provider \u003Cname> --model \u003Cid> --temperature 0.4` | Override provider, model, and temperature for one run |\n| `nullclaw agent --workspace /path -m \"...\"` | Run against a specific workspace |\n| `nullclaw agent --skill news-digest -m \"...\"` | Run with a named skill active |\n| `nullclaw acp` | Agent Client Protocol stdio adapter for editors |\n| `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model |\n\nInside interactive mode: `/model` shows and pins models, `/config reload` hot-reloads config, `/bind \u003Cagent>` routes the current chat to a named agent, `/subagents spawn --agent \u003Cid>` delegates a one-off task.\n\n## Runtime and operations\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw gateway` | Start the long-running runtime (default `127.0.0.1:3000`) |\n| `nullclaw gateway --port 8080` | Override the port |\n| `nullclaw gateway --host 0.0.0.0 --port 8080` | Override host and port |\n| `nullclaw gateway --workspace /path` | Run the gateway against a specific workspace |\n| `nullclaw service install\\|start\\|stop\\|restart\\|status\\|uninstall` | Manage the background service |\n| `nullclaw status [--json]` | System status, or a machine-readable runtime snapshot |\n| `nullclaw doctor` | Run diagnostics |\n| `nullclaw update --check` | Check for updates without installing |\n| `nullclaw update --yes` | Install updates without prompting |\n| `nullclaw auth login\\|status\\|logout openai-codex` | OAuth device flow (`auth` currently supports only `openai-codex`) |\n| `nullclaw auth login openai-codex --import-codex` | Import existing Codex CLI credentials instead of a fresh login |\n\n## Channels\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw channel list [--json]` | List known and configured channels |\n| `nullclaw channel start [telegram]` | Start the default or a specific channel |\n| `nullclaw channel status` | Show channel health |\n| `nullclaw channel info \u003Ctype> [--json]` | Show configured accounts for one channel type |\n| `nullclaw channel add \u003Ctype>` / `remove \u003Cname>` | Print config guidance for adding/removing a channel |\n\n## Cron\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw cron list [--json]` | List scheduled tasks |\n| `nullclaw cron get \u003Cid> [--json]` | Show one task |\n| `nullclaw cron status [--json]` | Scheduler status and job counters |\n| `nullclaw cron add \"0 * * * *\" \"command\"` | Add a recurring shell task |\n| `nullclaw cron add-agent \"0 * * * *\" \"prompt\" [--model ...] [--announce] [--channel ...] [--to ...]` | Add a recurring agent task |\n| `nullclaw cron once 10m \"command\"` | One-shot delayed shell task |\n| `nullclaw cron once-agent 10m \"prompt\"` | One-shot delayed agent task |\n| `nullclaw cron run \u003Cid>` | Run a task immediately |\n| `nullclaw cron pause \u003Cid>` / `resume \u003Cid>` | Pause or resume |\n| `nullclaw cron remove \u003Cid>` | Delete a task |\n| `nullclaw cron runs \u003Cid>` | Recent run history |\n| `nullclaw cron update \u003Cid> --expression ... --command ... --enable/--disable` | Update an existing task |\n\n## Skills and history\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw skills list` | List installed skills |\n| `nullclaw skills install \u003Csource>` | Install from Git URL, local path, or well-known HTTPS endpoint |\n| `nullclaw skills install --name \u003Cquery>` | Search the skill registry and install the best match |\n| `nullclaw skills remove \u003Cname>` / `info \u003Cname>` | Remove a skill / show metadata |\n| `nullclaw history list [--limit N] [--offset N] [--json]` | List conversation sessions |\n| `nullclaw history show \u003Csession_id> [--json]` | Show messages for a session |\n\n## Memory\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw memory stats` / `count` | Resolved memory config, counters, entry count |\n| `nullclaw memory search \"query\" --limit 10` | Run retrieval against memory |\n| `nullclaw memory get \u003Ckey>` / `list --category task` | Inspect entries |\n| `nullclaw memory reindex` | Rebuild the vector index |\n| `nullclaw memory export-jsonl --limit 1000` | Export a governed, PII-redacted JSONL dataset |\n| `nullclaw memory hygiene-report --json` | Dry-run duplicate report (never deletes) |\n| `nullclaw memory store` | Store an entry directly |\n| `nullclaw memory update \u003Ckey>` / `delete \u003Ckey>` | Update or delete one entry |\n| `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |\n| `nullclaw memory forget \u003Ckey>` | Delete one entry |\n\nDetails and defaults: [Memory](/docs/configure/memory/).\n\n## Workspace, config, and models\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw workspace edit AGENTS.md` | Open a bootstrap markdown file in `$EDITOR` |\n| `nullclaw workspace reset-md --dry-run` | Preview workspace markdown reset |\n| `nullclaw workspace audit [--staged \\| --commit \u003Csha> \\| --range a..b] [--json] [--fail-on \u003Clevel>]` | Scan for likely secret leaks — see [Security](/docs/operate/security/) |\n| `nullclaw config show [--json]` | Print the full on-disk config |\n| `nullclaw config get \u003Cpath> [--json]` | Read one dotted config value |\n| `nullclaw config set \u003Cpath> \u003Cvalue>` / `unset \u003Cpath>` | Write or clear one dotted config value |\n| `nullclaw config reload` | Reload config in the running runtime |\n| `nullclaw config validate` | Check the config file for errors |\n| `nullclaw models list\\|info\\|summary\\|benchmark\\|refresh` | Inspect and manage the model catalog |\n| `nullclaw mcp list` / `info \u003Cname>` | Inspect configured MCP servers |\n| `nullclaw capabilities [--json]` | Show the runtime capabilities manifest |\n| `nullclaw migrate openclaw [--dry-run] [--source PATH]` | Import memory and config from OpenClaw |\n\n## Hardware and automation\n\n| Command | Purpose |\n| --- | --- |\n| `nullclaw hardware scan` | Scan connected hardware |\n| `nullclaw hardware flash \u003Cfirmware> [--target \u003Cboard>]` | Flash firmware (currently a placeholder command) |\n| `nullclaw hardware monitor` | Monitor devices (currently a placeholder command) |\n| `nullclaw --export-manifest` | Export the runtime manifest (used by NullHub-managed installs) |\n| `nullclaw --list-models --provider \u003Cname> [--api-key \u003Ckey>] [--base-url \u003Curl>]` | Print model info, including custom endpoints |\n| `nullclaw --probe-provider-health` / `--probe-channel-health` | Health probes for automation |\n| `nullclaw --from-json` | JSON-driven entry path |\n\n## Build flags (from source)\n\nPassed to `zig build`; they shape what the binary contains.\n\n| Flag | Purpose |\n| --- | --- |\n| `-Dchannels=all\\|none\\|telegram,...` | Choose which of the 23 channel integrations are compiled in (default: all; the webhook channel is always on) |\n| `-Dengines=base\\|all\\|sqlite,...` | Choose memory engines from the 12 available (default build ships base + SQLite) |\n| `-Dstatic` | Fully static link |\n| `-Dembedded_wasm3` | Embed the wasm3 WebAssembly runtime (default: true) |\n| `-Dversion=...` | Stamp the version string |\n\n## Troubleshooting order\n\nWhen something is off, run these in sequence:\n\n```bash\nnullclaw doctor\nnullclaw status\nnullclaw channel status\nnullclaw agent -m \"self-check\"\ncurl http://127.0.0.1:3000/health   # if the gateway is involved\n```\n",dateModified:"2026-07-17",sectionTitle:"Reference",prev:{siteId:"claw",section:"operate",slug:"security",path:"/content/claw/docs/operate/security.md",title:"Security",description:"The layers NullClaw enforces by default, the settings that widen them, and how to audit for leaked secrets.",order:2,verified:"v2026.5.29",sectionTitle:"Operate"},next:null},uses:{params:["section","slug"]}}],
+							form: null,
+							error: null
+						});
+					});
+				}
+			</script>
+		</div>
+	</body>
+</html>
