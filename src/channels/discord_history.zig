@@ -17,6 +17,8 @@ pub const HistoryMessage = struct {
     content: []const u8,
     /// Snowflake id string, used for dedup against persisted history.
     id: []const u8,
+    /// Author user id (snowflake), for role remapping by the caller.
+    author_id: []const u8,
 };
 
 fn authHeader(allocator: Allocator, token: []const u8) ![]u8 {
@@ -86,6 +88,7 @@ pub fn fetchChannelHistory(
             allocator.free(m.role);
             allocator.free(m.content);
             allocator.free(m.id);
+            allocator.free(m.author_id);
         }
         out.deinit(allocator);
     }
@@ -129,6 +132,7 @@ pub fn fetchChannelHistory(
             .role = try allocator.dupe(u8, role),
             .content = try allocator.dupe(u8, content),
             .id = try allocator.dupe(u8, id),
+            .author_id = try allocator.dupe(u8, author_id),
         });
     }
 
