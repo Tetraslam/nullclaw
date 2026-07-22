@@ -1541,8 +1541,10 @@ pub const SessionManager = struct {
         const channel_id = blk: {
             if (conversation_context) |ctx| {
                 if (ctx.delivery_chat_id) |id| if (id.len > 0) break :blk id;
+                if (ctx.peer_id) |id| if (id.len > 0 and (ctx.is_group == null or ctx.is_group == false)) break :blk id;
             }
-            return; // no channel id without an inbound message
+            log.warn("hydration: skip {s} — no delivery_chat_id in conversation context", .{session_key});
+            return;
         };
 
         // Peer user id from session key (...direct:<user>).
