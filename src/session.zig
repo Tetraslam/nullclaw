@@ -1613,8 +1613,39 @@ pub const SessionManager = struct {
                 continue;
             };
         }
+
+        // Also inject a single high-signal transcript block. Some models
+        // under-weight long reconstructed multi-turn histories after a cold
+        // start; this makes the recovered context unmissable.
         if (to_add.items.len > 0) {
-            log.info("hydration: seeded {d} messages ({d}~tokens) into {s}", .{ to_add.items.len, tokens, session_key });
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.allocator);
+            var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+            const w = &aw.writer;
+            w.writeAll(
+                \\[recovered discord dm transcript — these are real prior messages in this conversation, restored after a process restart. treat them as your memory of this thread.]
+                \\
+            ) catch {};
+            for (to_add.items) |m| {
+                const label = if (std.mem.eql(u8, m.author_id, user_id)) "user" else "you (tetrapod)";
+                w.print("{s}: {s}\n\n", .{ label, m.content }) catch {};
+            }
+            buf = aw.toArrayList();
+            if (buf.items.len > 0) {
+                const block = session.agent.allocator.dupe(u8, buf.items) catch null;
+                if (block) |b| {
+                    session.agent.history.append(session.agent.allocator, .{
+                        .role = .user,
+                        .content = b,
+                    }) catch session.agent.allocator.free(b);
+                }
+            }
+            log.info("hydration: seeded {d} messages (+transcript block, {d}~tokens) history_len={d} into {s}", .{
+                to_add.items.len,
+                tokens,
+                session.agent.history.items.len,
+                session_key,
+            });
         } else {
             log.info("hydration: nothing new to seed for {s}", .{session_key});
         }
