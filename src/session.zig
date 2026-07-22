@@ -218,6 +218,8 @@ pub const Session = struct {
     injection_mu: std_compat.sync.Mutex = .{},
     /// Pending mid-turn message; owned by the SessionManager allocator.
     injection_pending: ?[]u8 = null,
+    /// True once Discord DM history has been fetched for this in-memory session.
+    history_hydrated: bool = false,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -1500,10 +1502,9 @@ pub const SessionManager = struct {
             }
         }
 
-        // Hydrate DM history from Discord for cold sessions. This runs after
-        // the store restore so persisted messages are already in history; we
-        // only append Discord messages not already present (dedup by content).
-        self.hydrateDiscordDmHistory(session_key, session);
+        // Hydrate DM history is deferred until the first inbound message of this
+        // in-memory session, when we have the Discord channel_id in hand.
+        // (POST /users/@me/channels 403s for bots without a pre-opened DM.)
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
@@ -1515,47 +1516,56 @@ pub const SessionManager = struct {
     /// How many recent channel messages to pull per hydration attempt.
     const HYDRATE_FETCH_LIMIT: u32 = 100;
 
-    /// For `discord:<acct>:direct:<user_id>` sessions on a cold start, pull
-    /// recent DM history from Discord and append any messages not already in
-    /// the session history (deduped by content), newest-last, up to the token
-    /// budget. Runs synchronously but is a no-op for non-Discord-DM keys and
-    /// swallows all errors (hydration is best-effort, never blocks a turn).
-    fn hydrateDiscordDmHistory(self: *SessionManager, session_key: []const u8, session: *Session) void {
-        // Only Discord DM sessions. Keys look like:
-        //   discord:<acct>:direct:<user_id>
-        //   agent:main:discord:direct:<user_id>   (no account segment)
-        //   agent:main:discord:<acct>:direct:<user_id>
-        const dm_marker = "discord:";
-        const dm_at = std.mem.indexOf(u8, session_key, dm_marker) orelse return;
-        const after_dm = session_key[dm_at + dm_marker.len ..];
-        // Find "direct:" as a whole segment, possibly after an account id.
+    /// On the first inbound message of an in-memory Discord DM session, pull
+    /// recent channel history via REST using the channel_id from the join
+    /// (delivered as conversation_context.delivery_chat_id) and append any
+    /// messages not already in store-restored history. Best-effort; errors never
+    /// block a turn. Skips groups and re-runs.
+    fn hydrateDiscordDmHistory(
+        self: *SessionManager,
+        session_key: []const u8,
+        session: *Session,
+        conversation_context: ?ConversationContext,
+    ) void {
+        if (session.history_hydrated) return;
+        session.history_hydrated = true; // one shot even if fetch fails (avoids retry storms)
+
+        // Only Discord DMs.
+        if (std.mem.indexOf(u8, session_key, "discord:") == null) return;
+        if (std.mem.indexOf(u8, session_key, "direct:") == null) return;
+        // Prefer metadata; fall back to key shape.
+        if (conversation_context) |ctx| {
+            if (ctx.is_group) |g| if (g) return;
+        }
+
+        const channel_id = blk: {
+            if (conversation_context) |ctx| {
+                if (ctx.delivery_chat_id) |id| if (id.len > 0) break :blk id;
+            }
+            return; // no channel id without an inbound message
+        };
+
+        // Peer user id from session key (...direct:<user>).
         const user_id = blk: {
-            if (std.mem.startsWith(u8, after_dm, "direct:"))
-                break :blk after_dm["direct:".len..];
-            const sep = std.mem.indexOf(u8, after_dm, ":direct:") orelse return;
-            break :blk after_dm[sep + ":direct:".len ..];
+            const marker = "direct:";
+            const at = std.mem.indexOf(u8, session_key, marker) orelse return;
+            break :blk session_key[at + marker.len ..];
         };
         if (user_id.len == 0) return;
-
-        log.info("hydration: attempting for peer {s}", .{user_id});
 
         const dc = self.config.channels.discordPrimary() orelse {
             log.warn("hydration: no discord account configured", .{});
             return;
         };
 
-        const channel_id = discord_history.resolveDmChannelId(self.allocator, dc.token, user_id) catch |err| {
-            log.warn("hydration: resolve DM channel failed for {s}: {}", .{ session_key, err });
-            return;
-        };
-        defer self.allocator.free(channel_id);
+        log.info("hydration: fetch channel={s} peer={s}", .{ channel_id, user_id });
 
         const msgs = discord_history.fetchChannelHistory(
             self.allocator,
             dc.token,
             channel_id,
             HYDRATE_FETCH_LIMIT,
-            "", // role field unused; we map by author_id below
+            "",
         ) catch |err| {
             log.warn("hydration: fetch history failed for {s}: {}", .{ session_key, err });
             return;
@@ -1570,14 +1580,12 @@ pub const SessionManager = struct {
             self.allocator.free(msgs);
         }
 
-        // Build a set of existing history contents to dedup against.
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.allocator);
         for (session.agent.history.items) |entry| {
             seen.put(self.allocator, entry.content, {}) catch {};
         }
 
-        // Collect newest-first within budget, then insert chronologically.
         var to_add: std.ArrayListUnmanaged(discord_history.HistoryMessage) = .empty;
         defer to_add.deinit(self.allocator);
         var tokens: u64 = 0;
@@ -1592,7 +1600,6 @@ pub const SessionManager = struct {
             to_add.insert(self.allocator, 0, m) catch break;
         }
 
-        // In a 1:1 DM: peer user_id is "user", everyone else is the bot ("assistant").
         for (to_add.items) |m| {
             const role: providers.Role = if (std.mem.eql(u8, m.author_id, user_id)) .user else .assistant;
             const content = session.agent.allocator.dupe(u8, m.content) catch continue;
@@ -1607,7 +1614,7 @@ pub const SessionManager = struct {
         if (to_add.items.len > 0) {
             log.info("hydration: seeded {d} messages ({d}~tokens) into {s}", .{ to_add.items.len, tokens, session_key });
         } else {
-            log.info("hydration: nothing new to seed for {s} (store already current or empty channel)", .{session_key});
+            log.info("hydration: nothing new to seed for {s}", .{session_key});
         }
     }
 
@@ -1845,6 +1852,7 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
     ) !?[]const u8 {
         const session = try self.getOrCreate(session_key);
+        self.hydrateDiscordDmHistory(session_key, session, conversation_context);
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
@@ -1928,6 +1936,7 @@ pub const SessionManager = struct {
         }
 
         const session = try self.getOrCreate(session_key);
+        self.hydrateDiscordDmHistory(session_key, session, conversation_context);
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
