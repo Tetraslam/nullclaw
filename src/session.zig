@@ -1521,14 +1521,19 @@ pub const SessionManager = struct {
     /// budget. Runs synchronously but is a no-op for non-Discord-DM keys and
     /// swallows all errors (hydration is best-effort, never blocks a turn).
     fn hydrateDiscordDmHistory(self: *SessionManager, session_key: []const u8, session: *Session) void {
-        // Only Discord DM sessions.
-        if (!std.mem.startsWith(u8, session_key, "discord:")) return;
-        const direct_marker = ":direct:";
-        const direct_idx = std.mem.indexOf(u8, session_key, direct_marker) orelse return;
-        const user_id = session_key[direct_idx + direct_marker.len ..];
+        // Only Discord DM sessions (supports both bare and agent-prefixed keys).
+        const direct_marker = "discord:";
+        const discord_idx = std.mem.indexOf(u8, session_key, direct_marker) orelse return;
+        const after_discord = session_key[discord_idx + direct_marker.len ..];
+        const direct_sep = ":direct:";
+        const direct_idx = std.mem.indexOf(u8, after_discord, direct_sep) orelse return;
+        const user_id = after_discord[direct_idx + direct_sep.len ..];
         if (user_id.len == 0) return;
 
-        const dc = self.config.channels.discordPrimary() orelse return;
+        const dc = self.config.channels.discordPrimary() orelse {
+            log.warn("hydration: no discord account configured", .{});
+            return;
+        };
 
         const channel_id = discord_history.resolveDmChannelId(self.allocator, dc.token, user_id) catch |err| {
             log.warn("hydration: resolve DM channel failed for {s}: {}", .{ session_key, err });
@@ -1592,6 +1597,8 @@ pub const SessionManager = struct {
         }
         if (to_add.items.len > 0) {
             log.info("hydration: seeded {d} messages ({d}~tokens) into {s}", .{ to_add.items.len, tokens, session_key });
+        } else {
+            log.info("hydration: nothing new to seed for {s} (store already current or empty channel)", .{session_key});
         }
     }
 
