@@ -1521,14 +1521,23 @@ pub const SessionManager = struct {
     /// budget. Runs synchronously but is a no-op for non-Discord-DM keys and
     /// swallows all errors (hydration is best-effort, never blocks a turn).
     fn hydrateDiscordDmHistory(self: *SessionManager, session_key: []const u8, session: *Session) void {
-        // Only Discord DM sessions (supports both bare and agent-prefixed keys).
-        const direct_marker = "discord:";
-        const discord_idx = std.mem.indexOf(u8, session_key, direct_marker) orelse return;
-        const after_discord = session_key[discord_idx + direct_marker.len ..];
-        const direct_sep = ":direct:";
-        const direct_idx = std.mem.indexOf(u8, after_discord, direct_sep) orelse return;
-        const user_id = after_discord[direct_idx + direct_sep.len ..];
+        // Only Discord DM sessions. Keys look like:
+        //   discord:<acct>:direct:<user_id>
+        //   agent:main:discord:direct:<user_id>   (no account segment)
+        //   agent:main:discord:<acct>:direct:<user_id>
+        const dm_marker = "discord:";
+        const dm_at = std.mem.indexOf(u8, session_key, dm_marker) orelse return;
+        const after_dm = session_key[dm_at + dm_marker.len ..];
+        // Find "direct:" as a whole segment, possibly after an account id.
+        const user_id = blk: {
+            if (std.mem.startsWith(u8, after_dm, "direct:"))
+                break :blk after_dm["direct:".len..];
+            const sep = std.mem.indexOf(u8, after_dm, ":direct:") orelse return;
+            break :blk after_dm[sep + ":direct:".len ..];
+        };
         if (user_id.len == 0) return;
+
+        log.info("hydration: attempting for peer {s}", .{user_id});
 
         const dc = self.config.channels.discordPrimary() orelse {
             log.warn("hydration: no discord account configured", .{});
