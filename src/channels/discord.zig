@@ -2592,7 +2592,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("u-1", msg.sender_id);
     try std.testing.expectEqualStrings("c-1", msg.chat_id);
-    try std.testing.expectEqualStrings("[Discord User]: hello", msg.content);
+    try std.testing.expectEqualStrings("[Discord User (@discord-user)]: hello", msg.content);
     try std.testing.expectEqualStrings("discord:dc-main:channel:c-1", msg.session_key);
     try std.testing.expect(msg.metadata_json != null);
 
