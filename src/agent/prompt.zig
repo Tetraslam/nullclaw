@@ -138,8 +138,8 @@ pub const ConversationContext = struct {
     /// goes from null ↔ non-null.
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
-        // Hash each sender-identifying field (or a sentinel null byte).
-        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.peer_id }) |field| {
+        // Hash sender and destination fields so cached prompts follow the conversation.
+        inline for (.{ self.channel, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.delivery_chat_id, self.peer_id, self.group_id }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -147,6 +147,8 @@ pub const ConversationContext = struct {
             }
             h.update(&.{0xff}); // field separator
         }
+        const group_marker: u8 = if (self.is_group orelse false) 1 else 0;
+        h.update(&.{group_marker});
         return h.final();
     }
 };
@@ -304,13 +306,25 @@ pub fn buildSystemPrompt(
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
 
-    // Conversation context section (Signal-specific for now)
+    // Conversation context section.
     if (ctx.conversation_context) |cc| {
         try w.writeAll("## Conversation Context\n\n");
+        const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
         if (cc.channel) |ch| {
             try w.print("- Channel: {s}\n", .{ch});
         }
-        if (cc.is_group) |ig| {
+        if (is_discord) {
+            if (cc.is_group orelse false) {
+                try w.writeAll("- Conversation location: Discord server channel (not a DM)\n");
+                if (cc.group_id) |gid| try w.print("- Discord server ID: {s}\n", .{gid});
+                if (cc.delivery_chat_id) |cid| try w.print("- Discord channel ID: {s}\n", .{cid});
+                try w.writeAll("- Reply destination: this server channel. Messages and files sent to the current conversation appear here, not in the sender's DMs.\n");
+            } else {
+                try w.writeAll("- Conversation location: Discord direct message\n");
+                if (cc.delivery_chat_id) |cid| try w.print("- Discord DM channel ID: {s}\n", .{cid});
+                try w.writeAll("- Reply destination: this direct-message conversation.\n");
+            }
+        } else if (cc.is_group) |ig| {
             if (ig) {
                 if (cc.group_id) |gid| {
                     try w.print("- Chat type: group\n", .{});
@@ -337,7 +351,6 @@ pub fn buildSystemPrompt(
         }
         // Sender identity fields
         if (cc.sender_id) |sid| {
-            const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
             if (is_discord) {
                 try w.print("- Sender Discord ID: {s}\n", .{sid});
             } else {
@@ -1416,6 +1429,7 @@ test "buildSystemPrompt includes discord sender identity fields" {
             .sender_id = "u-42",
             .sender_username = "discord-user",
             .sender_display_name = "Discord User",
+            .delivery_chat_id = "channel-1",
             .group_id = "guild-1",
             .is_group = true,
         },
@@ -1425,6 +1439,29 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Conversation location: Discord server channel (not a DM)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord server ID: guild-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord channel ID: channel-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "not in the sender's DMs") != null);
+}
+
+test "buildSystemPrompt identifies Discord direct-message destination" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "discord",
+            .delivery_chat_id = "dm-channel-1",
+            .is_group = false,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Conversation location: Discord direct message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord DM channel ID: dm-channel-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord server channel") == null);
 }
 
 test "buildSystemPrompt uses generic sender id label outside discord" {
