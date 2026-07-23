@@ -202,7 +202,7 @@ fn readStagedDiff(allocator: Allocator, cwd: []const u8) ![]u8 {
     defer version.deinit(allocator);
     if (!version.success) return AuditError.GitUnavailable;
 
-    const result = process_util.run(allocator, &.{ "git", "diff", "--cached", "--unified=0", "--no-color", "--", "." }, .{
+    const result = process_util.run(allocator, &.{ "git", "diff", "--no-ext-diff", "--cached", "--unified=0", "--no-color", "--", "." }, .{
         .cwd = cwd,
         .max_output_bytes = MAX_DIFF_BYTES,
     }) catch |err| switch (err) {
@@ -232,7 +232,7 @@ fn readCommitDiff(allocator: Allocator, cwd: []const u8, commit: []const u8) ![]
     defer version.deinit(allocator);
     if (!version.success) return AuditError.GitUnavailable;
 
-    const result = process_util.run(allocator, &.{ "git", "show", "--format=", "--unified=0", "--no-color", commit, "--", "." }, .{
+    const result = process_util.run(allocator, &.{ "git", "show", "--no-ext-diff", "--format=", "--unified=0", "--no-color", commit, "--", "." }, .{
         .cwd = cwd,
         .max_output_bytes = MAX_DIFF_BYTES,
     }) catch |err| switch (err) {
@@ -262,7 +262,7 @@ fn readRangeDiff(allocator: Allocator, cwd: []const u8, range: []const u8) ![]u8
     defer version.deinit(allocator);
     if (!version.success) return AuditError.GitUnavailable;
 
-    const result = process_util.run(allocator, &.{ "git", "diff", "--unified=0", "--no-color", range, "--", "." }, .{
+    const result = process_util.run(allocator, &.{ "git", "diff", "--no-ext-diff", "--unified=0", "--no-color", range, "--", "." }, .{
         .cwd = cwd,
         .max_output_bytes = MAX_DIFF_BYTES,
     }) catch |err| switch (err) {
