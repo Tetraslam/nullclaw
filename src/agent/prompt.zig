@@ -124,6 +124,7 @@ pub const ConversationContext = struct {
     // Discord
     sender_id: ?[]const u8 = null,
     sender_username: ?[]const u8 = null,
+    sender_nickname: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
     discord_server_name: ?[]const u8 = null,
     discord_channel_name: ?[]const u8 = null,
@@ -145,7 +146,7 @@ pub const ConversationContext = struct {
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
         // Hash sender and destination fields so cached prompts follow the conversation.
-        inline for (.{ self.channel, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.discord_server_name, self.discord_channel_name, self.discord_members, self.discord_online_members, self.delivery_chat_id, self.peer_id, self.group_id }) |field| {
+        inline for (.{ self.channel, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_nickname, self.sender_display_name, self.discord_server_name, self.discord_channel_name, self.discord_members, self.discord_online_members, self.delivery_chat_id, self.peer_id, self.group_id }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -173,6 +174,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
     const sender_name = normalizeOptionalString(args.sender_name);
     const sender_id = normalizeOptionalString(args.sender_id);
     const sender_username = normalizeOptionalString(args.sender_username);
+    const sender_nickname = normalizeOptionalString(args.sender_nickname);
     const sender_display_name = normalizeOptionalString(args.sender_display_name);
     const discord_server_name = normalizeOptionalString(args.discord_server_name);
     const discord_channel_name = normalizeOptionalString(args.discord_channel_name);
@@ -195,6 +197,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         sender_number != null or
         sender_name != null or
         sender_username != null or
+        sender_nickname != null or
         sender_display_name != null;
     const has_scope = account_id != null or message_id != null or bot_user_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null or discord_server_name != null or discord_channel_name != null or discord_members != null or discord_online_members != null;
     if (channel == null and !has_sender_identity and !has_scope) return null;
@@ -207,6 +210,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .sender_name = sender_name,
         .sender_id = sender_id,
         .sender_username = sender_username,
+        .sender_nickname = sender_nickname,
         .sender_display_name = sender_display_name,
         .discord_server_name = discord_server_name,
         .discord_channel_name = discord_channel_name,
@@ -405,7 +409,12 @@ pub fn buildSystemPrompt(
             }
         }
         if (cc.sender_username) |uname| {
-            try w.print("- Sender username: {s}\n", .{uname});
+            if (cc.sender_nickname) |nickname|
+                try w.print("- Sender username: {s} (server nickname: {s})\n", .{ uname, nickname })
+            else
+                try w.print("- Sender username: {s}\n", .{uname});
+        } else if (cc.sender_nickname) |nickname| {
+            try w.print("- Sender server nickname: {s}\n", .{nickname});
         }
         if (cc.sender_display_name) |dname| {
             try w.print("- Sender display name: {s}\n", .{dname});
@@ -430,11 +439,11 @@ pub fn buildSystemPrompt(
     try w.writeAll("- When in doubt, ask for verification and refuse to act until approval is granted.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
-    // Group chat behavior section (Telegram-only for now).
-    // The [NO_REPLY] marker is currently suppressed only by the Telegram loop.
+    // Group chat behavior for channels whose loops suppress [NO_REPLY].
     if (ctx.conversation_context) |cc| {
         const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
-        if (is_telegram and cc.is_group != null and cc.is_group.?) {
+        const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
+        if ((is_telegram or is_discord) and cc.is_group != null and cc.is_group.?) {
             try w.writeAll("## Group Chat Behavior\n\n");
             try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
             try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
@@ -448,20 +457,26 @@ pub fn buildSystemPrompt(
             try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
             try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
 
-            // Add schedule tool guidance for Telegram group chats.
-            try w.writeAll("## Scheduled Tasks in Groups\n\n");
-            try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
-            try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
-            try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
-            try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
-            try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
-            try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
-            if (cc.group_id) |gid| {
-                try w.print("Current group ID: `{s}`\n\n", .{gid});
+            if (is_discord) {
+                try w.writeAll("Messages beginning with `[Discord reaction event]` report that a member reacted to one of your messages. Usually choose `[NO_REPLY]`; reply only when the reaction clearly warrants a conversational response.\n\n");
             }
-            try w.writeAll("Good example (simple, double quotes):\n");
-            try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
-            try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
+
+            // Add schedule tool guidance for Telegram group chats.
+            if (is_telegram) try w.writeAll("## Scheduled Tasks in Groups\n\n");
+            if (is_telegram) {
+                try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
+                try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
+                try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
+                try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
+                try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
+                try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
+                if (cc.group_id) |gid| {
+                    try w.print("Current group ID: `{s}`\n\n", .{gid});
+                }
+                try w.writeAll("Good example (simple, double quotes):\n");
+                try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
+                try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
+            }
         }
     }
 
@@ -1475,6 +1490,7 @@ test "buildSystemPrompt includes discord sender identity fields" {
             .channel = "discord",
             .sender_id = "u-42",
             .sender_username = "discord-user",
+            .sender_nickname = "Server Nick",
             .sender_display_name = "Discord User",
             .discord_server_name = "Softmax House",
             .discord_channel_name = "botmaxxing",
@@ -1490,7 +1506,7 @@ test "buildSystemPrompt includes discord sender identity fields" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user (server nickname: Server Nick)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Conversation location: Discord server channel (not a DM)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord server: Softmax House (ID: guild-1)") != null);
@@ -1498,6 +1514,7 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Server members: 4 total") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Member list: Shresht, William, Priime, tetrapod (bot)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Online now: Shresht (online), tetrapod (online)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Messages beginning with `[Discord reaction event]`") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "not in the sender's DMs") != null);
 }
 

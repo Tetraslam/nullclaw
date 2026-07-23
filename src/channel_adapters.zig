@@ -89,6 +89,7 @@ pub const InboundMetadata = struct {
     is_dm: ?bool = null,
     is_group: ?bool = null,
     sender_username: ?[]const u8 = null,
+    sender_nickname: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
     discord_server_name: ?[]const u8 = null,
     discord_channel_name: ?[]const u8 = null,

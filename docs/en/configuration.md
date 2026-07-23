@@ -786,7 +786,7 @@ Discord example:
       "accounts": {
         "default": {
           "token": "YOUR_DISCORD_BOT_TOKEN",
-          "intents": 37635,
+          "intents": 38659,
           "allow_from": ["YOUR_DISCORD_USER_ID"]
         }
       }
@@ -799,7 +799,7 @@ Set `allow_from` explicitly. An omitted or empty `allow_from` list denies inboun
 
 Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
 
-Gateway intents (`intents`) is a bitmask. Default 37635 = GUILDS (1) + GUILD_MEMBERS (2) + GUILD_PRESENCES (256) + GUILD_MESSAGES (512) + MESSAGE_CONTENT (32768) + DIRECT_MESSAGES (4096). The Server Members, Presence, and Message Content intents must also be enabled in the Discord app's Bot settings.
+Gateway intents (`intents`) is a bitmask. Default 38659 = GUILDS (1) + GUILD_MEMBERS (2) + GUILD_PRESENCES (256) + GUILD_MESSAGES (512) + GUILD_MESSAGE_REACTIONS (1024) + MESSAGE_CONTENT (32768) + DIRECT_MESSAGES (4096). The Server Members, Presence, and Message Content intents must also be enabled in the Discord app's Bot settings.
 
 Discord setup flow:
 1. Create application at https://discord.com/developers/applications
@@ -820,12 +820,12 @@ Multi-bot setup uses `accounts` wrapper. Each `account_id` creates an independen
       "accounts": {
         "production": {
           "token": "PRODUCTION_BOT_TOKEN",
-          "intents": 37635,
+          "intents": 38659,
           "allow_from": ["ADMIN_USER_ID"]
         },
         "testing": {
           "token": "TESTING_BOT_TOKEN",
-          "intents": 37635,
+          "intents": 38659,
           "allow_from": ["DEV_USER_ID"]
         }
       }
@@ -870,7 +870,7 @@ Direct message bindings use `peer.kind = "direct"` with user IDs:
 
 Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
-- `intents` (default: 37635) - Gateway intents bitmask
+- `intents` (default: 38659) - Gateway intents bitmask
 - `allow_bots` (default: false) - Allow messages from other bots
 - `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond

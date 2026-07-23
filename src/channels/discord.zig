@@ -107,7 +107,7 @@ pub const DiscordChannel = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     mention_exempt_channels: []const []const u8 = &.{},
-    intents: u32 = 37635, // + GUILD_MEMBERS and GUILD_PRESENCES for Discord context
+    intents: u32 = 38659, // member, presence, message, and reaction context
     bus: ?*bus_mod.Bus = null,
 
     typing_mu: std_compat.sync.Mutex = .{},
@@ -985,15 +985,19 @@ pub const DiscordChannel = struct {
         if (user_value != .object) return error.InvalidDiscordMember;
         const user = user_value.object;
         const id = objectString(user, "id") orelse return error.InvalidDiscordMember;
+        const username = objectString(user, "username") orelse id;
         const base_name = objectString(member, "nick") orelse
             objectString(user, "global_name") orelse
-            objectString(user, "username") orelse
-            id;
+            username;
         const is_bot = if (user.get("bot")) |value| value == .bool and value.bool else false;
-        const name = if (is_bot)
-            try std.fmt.allocPrint(self.allocator, "{s} (bot)", .{base_name})
+        const name = if (!std.mem.eql(u8, base_name, username) and is_bot)
+            try std.fmt.allocPrint(self.allocator, "{s} (@{s}, bot)", .{ base_name, username })
+        else if (!std.mem.eql(u8, base_name, username))
+            try std.fmt.allocPrint(self.allocator, "{s} (@{s})", .{ base_name, username })
+        else if (is_bot)
+            try std.fmt.allocPrint(self.allocator, "{s} (bot)", .{username})
         else
-            try self.allocator.dupe(u8, base_name);
+            try self.allocator.dupe(u8, username);
         return .{ .id = id, .name = name };
     }
 
@@ -1036,12 +1040,14 @@ pub const DiscordChannel = struct {
             member.presence = MemberPresence.fromDiscord(status);
             return;
         }
-        const name = objectString(user_value.object, "global_name") orelse
-            objectString(user_value.object, "username") orelse
-            id;
+        const username = objectString(user_value.object, "username") orelse id;
+        const display_name = objectString(user_value.object, "global_name") orelse username;
         const key = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(key);
-        const owned_name = try self.allocator.dupe(u8, name);
+        const owned_name = if (!std.mem.eql(u8, display_name, username))
+            try std.fmt.allocPrint(self.allocator, "{s} (@{s})", .{ display_name, username })
+        else
+            try self.allocator.dupe(u8, username);
         errdefer self.allocator.free(owned_name);
         try guild.members.put(self.allocator, key, .{
             .name = owned_name,
@@ -1670,6 +1676,10 @@ pub const DiscordChannel = struct {
                     self.handleMessageCreate(root_val) catch |err| {
                         log.warn("Discord: handleMessageCreate error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, event_type, "MESSAGE_REACTION_ADD")) {
+                    self.handleReactionAdd(root_val) catch |err| {
+                        log.warn("Discord: handleReactionAdd error: {}", .{err});
+                    };
                 } else if (std.mem.eql(u8, event_type, "INTERACTION_CREATE")) {
                     self.handleInteractionCreate(root_val) catch |err| {
                         log.warn("Discord: handleInteractionCreate error: {}", .{err});
@@ -1902,6 +1912,10 @@ pub const DiscordChannel = struct {
             .string => |s| if (s.len > 0) s else null,
             else => null,
         } else null;
+        const author_nickname: ?[]const u8 = if (d_obj.get("member")) |member_value| switch (member_value) {
+            .object => |member| objectString(member, "nick"),
+            else => null,
+        } else null;
 
         // Extract author.bot (defaults to false if absent)
         const author_is_bot: bool = if (author_obj.get("bot")) |v| switch (v) {
@@ -1936,9 +1950,16 @@ pub const DiscordChannel = struct {
 
         const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
         if (guild_id != null and control_plane.parseSlashCommand(trimmed_content) == null) {
-            const speaker = author_display_name orelse author_username orelse author_id;
+            const speaker = author_nickname orelse author_display_name orelse author_username orelse author_id;
             content_buf.appendSlice(self.allocator, "[") catch {};
             content_buf.appendSlice(self.allocator, speaker) catch {};
+            if (author_username) |username| {
+                if (!std.mem.eql(u8, speaker, username)) {
+                    content_buf.appendSlice(self.allocator, " (@") catch {};
+                    content_buf.appendSlice(self.allocator, username) catch {};
+                    content_buf.appendSlice(self.allocator, ")") catch {};
+                }
+            }
             content_buf.appendSlice(self.allocator, "]: ") catch {};
         }
         if (content.len > 0) {
@@ -2022,6 +2043,10 @@ pub const DiscordChannel = struct {
             try mw.writeAll(",\"sender_username\":");
             try root.appendJsonStringW(mw, uname);
         }
+        if (author_nickname) |nickname| {
+            try mw.writeAll(",\"sender_nickname\":");
+            try root.appendJsonStringW(mw, nickname);
+        }
         if (author_display_name) |dname| {
             try mw.writeAll(",\"sender_display_name\":");
             try root.appendJsonStringW(mw, dname);
@@ -2049,6 +2074,98 @@ pub const DiscordChannel = struct {
             log.info("discord gw msg published chat={s} bytes={d}", .{ channel_id, final_content.len });
         } else {
             // No bus configured — free the message
+            msg.deinit(self.allocator);
+        }
+    }
+
+    fn handleReactionAdd(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const bot_user_id = self.bot_user_id orelse return;
+        const d_value = root_val.object.get("d") orelse return;
+        if (d_value != .object) return;
+        const d = d_value.object;
+        const message_author_id = objectString(d, "message_author_id") orelse return;
+        if (!std.mem.eql(u8, message_author_id, bot_user_id)) return;
+
+        const user_id = objectString(d, "user_id") orelse return;
+        if (std.mem.eql(u8, user_id, bot_user_id)) return;
+        if (!root.isAllowedScoped("discord channel", self.allow_from, user_id)) return;
+        const channel_id = objectString(d, "channel_id") orelse return;
+        const message_id = objectString(d, "message_id") orelse return;
+        const guild_id = objectString(d, "guild_id") orelse return;
+
+        const member = if (d.get("member")) |value| if (value == .object) value.object else null else null;
+        const user = if (member) |value| if (value.get("user")) |user_value| if (user_value == .object) user_value.object else null else null else null;
+        const username = if (user) |value| objectString(value, "username") else null;
+        const display_name = if (user) |value| objectString(value, "global_name") else null;
+        const nickname = if (member) |value| objectString(value, "nick") else null;
+        const speaker = nickname orelse display_name orelse username orelse user_id;
+
+        const emoji_value = d.get("emoji") orelse return;
+        if (emoji_value != .object) return;
+        const emoji_name = objectString(emoji_value.object, "name") orelse return;
+        const emoji_id = objectString(emoji_value.object, "id");
+
+        var content: std.ArrayListUnmanaged(u8) = .empty;
+        defer content.deinit(self.allocator);
+        var content_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &content);
+        const cw = &content_writer.writer;
+        try cw.writeAll("[Discord reaction event] ");
+        try cw.writeAll(speaker);
+        if (username) |name| {
+            if (!std.mem.eql(u8, speaker, name)) try cw.print(" (@{s})", .{name});
+        }
+        if (emoji_id) |id|
+            try cw.print(" reacted with :{s}: ({s}) to your message {s}.", .{ emoji_name, id, message_id })
+        else
+            try cw.print(" reacted with {s} to your message {s}.", .{ emoji_name, message_id });
+        content = content_writer.toArrayList();
+
+        const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}:channel:{s}", .{ self.account_id, channel_id });
+        defer self.allocator.free(session_key);
+        var metadata: std.ArrayListUnmanaged(u8) = .empty;
+        defer metadata.deinit(self.allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata);
+        const mw = &metadata_writer.writer;
+        try mw.writeAll("{\"is_dm\":false,\"event_type\":\"reaction_add\",\"account_id\":");
+        try root.appendJsonStringW(mw, self.account_id);
+        try mw.writeAll(",\"guild_id\":");
+        try root.appendJsonStringW(mw, guild_id);
+        try mw.writeAll(",\"message_id\":");
+        try root.appendJsonStringW(mw, message_id);
+        try mw.writeAll(",\"bot_user_id\":");
+        try root.appendJsonStringW(mw, bot_user_id);
+        if (username) |name| {
+            try mw.writeAll(",\"sender_username\":");
+            try root.appendJsonStringW(mw, name);
+        }
+        if (nickname) |name| {
+            try mw.writeAll(",\"sender_nickname\":");
+            try root.appendJsonStringW(mw, name);
+        }
+        if (display_name) |name| {
+            try mw.writeAll(",\"sender_display_name\":");
+            try root.appendJsonStringW(mw, name);
+        }
+        try self.appendGuildSnapshotMetadata(mw, guild_id, channel_id);
+        try mw.writeByte('}');
+        metadata = metadata_writer.toArrayList();
+
+        const msg = try bus_mod.makeInboundFull(
+            self.allocator,
+            "discord",
+            user_id,
+            channel_id,
+            content.items,
+            session_key,
+            &.{},
+            metadata.items,
+        );
+        if (self.bus) |event_bus| {
+            event_bus.publishInbound(msg) catch |err| {
+                msg.deinit(self.allocator);
+                return err;
+            };
+        } else {
             msg.deinit(self.allocator);
         }
     }
@@ -2111,13 +2228,14 @@ pub const DiscordChannel = struct {
             return;
         };
 
-        const member_user_obj = if (d_obj.get("member")) |member_val| switch (member_val) {
-            .object => |member_obj| if (member_obj.get("user")) |uval| switch (uval) {
-                .object => |uobj| uobj,
-                else => null,
-            } else null,
+        const member_obj: ?std.json.ObjectMap = if (d_obj.get("member")) |member_val| switch (member_val) {
+            .object => |object| object,
             else => null,
         } else null;
+        const member_user_obj = if (member_obj) |member| if (member.get("user")) |uval| switch (uval) {
+            .object => |uobj| uobj,
+            else => null,
+        } else null else null;
         const direct_user_obj = if (d_obj.get("user")) |user_val| switch (user_val) {
             .object => |uobj| uobj,
             else => null,
@@ -2139,6 +2257,7 @@ pub const DiscordChannel = struct {
             .string => |s| s,
             else => null,
         } else null;
+        const nickname = if (member_obj) |member| objectString(member, "nick") else null;
 
         if (!root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
             self.answerInteraction(interaction_id, interaction_token, "You are not allowed to use this button");
@@ -2179,6 +2298,10 @@ pub const DiscordChannel = struct {
                 if (username) |uname| {
                     try mw.writeAll(",\"sender_username\":");
                     try root.appendJsonStringW(mw, uname);
+                }
+                if (nickname) |name| {
+                    try mw.writeAll(",\"sender_nickname\":");
+                    try root.appendJsonStringW(mw, name);
                 }
                 if (display_name) |dname| {
                     try mw.writeAll(",\"sender_display_name\":");
@@ -2397,7 +2520,7 @@ test "discord isMentioned with user id" {
 
 test "discord intents default" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
-    try std.testing.expectEqual(@as(u32, 37635), ch.intents);
+    try std.testing.expectEqual(@as(u32, 38659), ch.intents);
 }
 
 test "discord initFromConfig passes all fields" {
@@ -2646,7 +2769,7 @@ test "discord natural channel bypasses mention gate and preserves speaker" {
     ch.setBus(&event_bus);
 
     const msg_json =
-        \\{"d":{"id":"msg-42","channel_id":"natural-1","guild_id":"g-2","content":"plain text","author":{"id":"u-2","username":"alice","global_name":"Alice","bot":false}}}
+        \\{"d":{"id":"msg-42","channel_id":"natural-1","guild_id":"g-2","content":"plain text","author":{"id":"u-2","username":"alice","global_name":"Alice","bot":false},"member":{"nick":"Ace"}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
@@ -2654,8 +2777,9 @@ test "discord natural channel bypasses mention gate and preserves speaker" {
     try ch.handleMessageCreate(parsed.value);
     var msg = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
     defer msg.deinit(alloc);
-    try std.testing.expectEqualStrings("[Alice]: plain text", msg.content);
+    try std.testing.expectEqualStrings("[Ace (@alice)]: plain text", msg.content);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"message_id\":\"msg-42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"sender_nickname\":\"Ace\"") != null);
 }
 
 test "discord outbound parser extracts local files and preserves remote media as links" {
@@ -2717,10 +2841,56 @@ test "discord guild snapshot enriches inbound metadata" {
     try std.testing.expectEqualStrings("Softmax House", object.get("discord_server_name").?.string);
     try std.testing.expectEqualStrings("botmaxxing", object.get("discord_channel_name").?.string);
     try std.testing.expectEqual(@as(i64, 3), object.get("discord_member_count").?.integer);
-    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_members").?.string, "William") != null);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_members").?.string, "William (@will)") != null);
     try std.testing.expect(std.mem.indexOf(u8, object.get("discord_members").?.string, "tetrapod (bot)") != null);
     try std.testing.expect(std.mem.indexOf(u8, object.get("discord_online_members").?.string, "shresht (online)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_online_members").?.string, "William (idle)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_online_members").?.string, "William (@will) (idle)") != null);
+}
+
+test "discord reaction on bot message publishes optional event with nickname" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_from = &.{"u-2"},
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const event_json =
+        \\{"d":{"user_id":"u-2","channel_id":"c-1","message_id":"m-1","guild_id":"g-1","message_author_id":"bot-1","member":{"nick":"Prime","user":{"id":"u-2","username":"lucas","global_name":"Lucas"}},"emoji":{"id":null,"name":"👍"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, event_json, .{});
+    defer parsed.deinit();
+    try ch.handleReactionAdd(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("[Discord reaction event] Prime (@lucas) reacted with 👍 to your message m-1.", msg.content);
+    try std.testing.expectEqualStrings("discord:dc-main:channel:c-1", msg.session_key);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"event_type\":\"reaction_add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"sender_nickname\":\"Prime\"") != null);
+}
+
+test "discord reaction ignores messages not authored by bot" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "token", .allow_from = &.{"u-2"} });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const event_json =
+        \\{"d":{"user_id":"u-2","channel_id":"c-1","message_id":"m-1","guild_id":"g-1","message_author_id":"u-3","member":{"user":{"id":"u-2","username":"lucas"}},"emoji":{"id":null,"name":"👍"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, event_json, .{});
+    defer parsed.deinit();
+    try ch.handleReactionAdd(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
 test "discord member list is capped at fifty entries" {
@@ -2893,7 +3063,7 @@ test "discord intent bitmask guilds" {
     // DIRECT_MESSAGES = 4096
     try std.testing.expectEqual(@as(u32, 4096), 4096);
     // Default intents include guild members (2) and guild presences (256).
-    try std.testing.expectEqual(@as(u32, 37635), 1 | 2 | 256 | 512 | 32768 | 4096);
+    try std.testing.expectEqual(@as(u32, 38659), 1 | 2 | 256 | 512 | 1024 | 32768 | 4096);
 }
 
 test "DiscordChannel create + healthCheck + stop leaks zero bytes" {

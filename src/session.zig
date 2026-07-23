@@ -1183,10 +1183,12 @@ pub const SessionManager = struct {
     const TurnToolContext = struct {
         message: ?tools_mod.message.MessageTool.TurnContext = null,
         discord_members: ?tools_mod.discord_members.DiscordMembersTool.TurnContext = null,
+        discord_reaction: ?tools_mod.discord_reaction.DiscordReactionTool.TurnContext = null,
 
         fn restore(self: TurnToolContext) void {
             if (self.message) |previous| tools_mod.message.MessageTool.restoreContext(previous);
             if (self.discord_members) |previous| tools_mod.discord_members.DiscordMembersTool.restoreContext(previous);
+            if (self.discord_reaction) |previous| tools_mod.discord_reaction.DiscordReactionTool.restoreContext(previous);
         }
     };
 
@@ -1230,6 +1232,14 @@ pub const SessionManager = struct {
                 const members_tool: *tools_mod.discord_members.DiscordMembersTool = @ptrCast(@alignCast(tool.ptr));
                 const guild_id = if (conversation_context) |ctx| if (ctx.is_group orelse false) ctx.group_id else null else null;
                 previous.discord_members = members_tool.setContext(account_id, guild_id);
+            } else if (std.mem.eql(u8, tool.name(), "discord_reaction")) {
+                const reaction_tool: *tools_mod.discord_reaction.DiscordReactionTool = @ptrCast(@alignCast(tool.ptr));
+                const is_discord = if (channel) |value| std.ascii.eqlIgnoreCase(value, "discord") else false;
+                previous.discord_reaction = reaction_tool.setContext(
+                    if (is_discord) account_id else null,
+                    if (is_discord) chat_id else null,
+                    if (is_discord) if (conversation_context) |ctx| ctx.message_id else null else null,
+                );
             }
         }
         return previous;

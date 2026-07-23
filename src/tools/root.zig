@@ -117,6 +117,7 @@ pub const cron_run = @import("cron_run.zig");
 pub const cron_update = @import("cron_update.zig");
 pub const message = @import("message.zig");
 pub const discord_members = @import("discord_members.zig");
+pub const discord_reaction = @import("discord_reaction.zig");
 pub const pushover = @import("pushover.zig");
 pub const schema = @import("schema.zig");
 pub const web_search = @import("web_search.zig");
@@ -534,6 +535,10 @@ pub fn allTools(
         const dmt = try allocator.create(discord_members.DiscordMembersTool);
         dmt.* = .{ .accounts = opts.discord_accounts };
         try list.append(allocator, dmt.tool());
+
+        const drt = try allocator.create(discord_reaction.DiscordReactionTool);
+        drt.* = .{ .accounts = opts.discord_accounts };
+        try list.append(allocator, drt.tool());
     }
 
     // Spawn tool (async subagent)

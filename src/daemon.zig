@@ -717,6 +717,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("sender_username")) |v| {
             if (v == .string) parsed.fields.sender_username = v.string;
         }
+        if (pm.value.object.get("sender_nickname")) |v| {
+            if (v == .string) parsed.fields.sender_nickname = v.string;
+        }
         if (pm.value.object.get("sender_display_name")) |v| {
             if (v == .string) parsed.fields.sender_display_name = v.string;
         }
@@ -782,6 +785,7 @@ fn buildInboundConversationContext(
         .account_id = meta.account_id,
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
+        .sender_nickname = meta.sender_nickname,
         .sender_display_name = meta.sender_display_name,
         .discord_server_name = meta.discord_server_name,
         .discord_channel_name = meta.discord_channel_name,
@@ -1146,6 +1150,11 @@ fn makeAssistantReplyOutbound(
     return msg;
 }
 
+fn shouldSuppressInboundReply(context: ?ConversationContext, reply: []const u8) bool {
+    const is_group = if (context) |value| value.is_group orelse false else false;
+    return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+}
+
 const AssistantReplyPayload = struct {
     text: []u8,
     choices: []outbound.Choice,
@@ -1444,6 +1453,11 @@ fn processInboundMessage(
         return;
     };
     defer allocator.free(reply);
+
+    if (shouldSuppressInboundReply(routing_plan.conversation_context, reply)) {
+        log.info("inbound dispatch suppressed optional group reply", .{});
+        return;
+    }
 
     if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
         if (outbound_channel) |channel| {
@@ -2900,11 +2914,12 @@ test "parseInboundMetadata extracts replace_message flag" {
 test "parseInboundMetadata extracts discord sender identity fields" {
     var parsed = parseInboundMetadata(
         std.testing.allocator,
-        "{\"sender_username\":\"discord-user\",\"sender_display_name\":\"Discord User\"}",
+        "{\"sender_username\":\"discord-user\",\"sender_nickname\":\"Server Nick\",\"sender_display_name\":\"Discord User\"}",
     );
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
+    try std.testing.expectEqualStrings("Server Nick", parsed.fields.sender_nickname.?);
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
 }
 
@@ -3038,6 +3053,12 @@ test "makeAssistantReplyOutbound preserves plain replies without choices" {
     try std.testing.expectEqual(@as(usize, 0), msg.choices.len);
     try std.testing.expect(msg.account_id == null);
     try std.testing.expectEqual(@as(u64, 0), msg.draft_id);
+}
+
+test "shouldSuppressInboundReply suppresses marker only in groups" {
+    try std.testing.expect(shouldSuppressInboundReply(.{ .channel = "discord", .is_group = true }, "[NO_REPLY]"));
+    try std.testing.expect(!shouldSuppressInboundReply(.{ .channel = "discord", .is_group = false }, "[NO_REPLY]"));
+    try std.testing.expect(!shouldSuppressInboundReply(.{ .channel = "discord", .is_group = true }, "hello"));
 }
 
 test "makeAssistantReplyOutbound extracts structured choices from assistant reply" {
