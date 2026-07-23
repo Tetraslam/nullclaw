@@ -15,6 +15,7 @@ threadlocal var turn_default_channel: ?[]const u8 = null;
 threadlocal var turn_default_account_id: ?[]const u8 = null;
 threadlocal var turn_default_chat_id: ?[]const u8 = null;
 threadlocal var turn_message_sent: bool = false;
+threadlocal var turn_context_active: bool = false;
 
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
@@ -40,6 +41,7 @@ pub const MessageTool = struct {
         account_id: ?[]const u8,
         chat_id: ?[]const u8,
         message_sent: bool,
+        active: bool,
     };
 
     pub fn tool(self: *MessageTool) Tool {
@@ -56,11 +58,13 @@ pub const MessageTool = struct {
             .account_id = turn_default_account_id,
             .chat_id = turn_default_chat_id,
             .message_sent = turn_message_sent,
+            .active = turn_context_active,
         };
         turn_default_channel = channel;
         turn_default_account_id = account_id;
         turn_default_chat_id = chat_id;
         turn_message_sent = false;
+        turn_context_active = true;
         return previous;
     }
 
@@ -69,12 +73,12 @@ pub const MessageTool = struct {
         turn_default_account_id = previous.account_id;
         turn_default_chat_id = previous.chat_id;
         turn_message_sent = previous.message_sent;
+        turn_context_active = previous.active;
     }
 
     /// Check if a message was sent during this round.
     pub fn hasMessageBeenSent(self: *const MessageTool) bool {
-        _ = self;
-        return turn_message_sent;
+        return if (turn_context_active) turn_message_sent else self.sent_in_round;
     }
 
     pub fn execute(self: *MessageTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -121,7 +125,7 @@ pub const MessageTool = struct {
             return ToolResult.fail("Bus is closed, cannot send message");
         };
 
-        turn_message_sent = true;
+        if (turn_context_active) turn_message_sent = true;
         self.sent_in_round = true;
 
         const result = std.fmt.allocPrint(
