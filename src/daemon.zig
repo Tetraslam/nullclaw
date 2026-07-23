@@ -1301,7 +1301,7 @@ fn tryConsumeInboundViaRoute(
     defer parsed_meta.deinit();
     var routing_plan = buildInboundRoutingPlan(allocator, runtime.config, msg, parsed_meta.fields);
     defer routing_plan.deinit(allocator);
-    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) != .skip) {
+    if (runtime.session_mgr.routeInboundWithContext(routing_plan.session_key, msg.content, routing_plan.conversation_context) != .skip) {
         return false;
     }
     const session_hash = std.hash.Wyhash.hash(0, routing_plan.session_key);
@@ -1375,7 +1375,7 @@ fn processInboundMessage(
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
+    if (runtime.session_mgr.routeInboundWithContext(routing_plan.session_key, msg.content, routing_plan.conversation_context) == .skip) return;
 
     const typing_recipient = sendInboundProcessingIndicator(
         allocator,

@@ -58,6 +58,10 @@ pub const DiscordReactionTool = struct {
         turn_message_id = previous.message_id;
     }
 
+    pub fn updateMessageContext(_: *DiscordReactionTool, message_id: ?[]const u8) void {
+        turn_message_id = message_id;
+    }
+
     fn currentAccount(self: *const DiscordReactionTool) ?config_types.DiscordConfig {
         const account_id = turn_account_id orelse return null;
         for (self.accounts) |candidate| {
@@ -135,6 +139,15 @@ test "DiscordReactionTool normalizes custom emoji markup" {
     try std.testing.expectEqualStrings("wave:123", DiscordReactionTool.normalizeEmoji("<:wave:123>"));
     try std.testing.expectEqualStrings("dance:456", DiscordReactionTool.normalizeEmoji("<a:dance:456>"));
     try std.testing.expectEqualStrings("👍", DiscordReactionTool.normalizeEmoji(" 👍 "));
+}
+
+test "DiscordReactionTool updates the current source message" {
+    var tool = DiscordReactionTool{};
+    const previous = tool.setContext("main", "123456789012345678", "234567890123456789");
+    defer DiscordReactionTool.restoreContext(previous);
+
+    tool.updateMessageContext("345678901234567890");
+    try std.testing.expectEqualStrings("345678901234567890", turn_message_id.?);
 }
 
 test "DiscordReactionTool only uses the current account and channel" {

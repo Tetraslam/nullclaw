@@ -204,6 +204,16 @@ const SessionProviderContext = struct {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Session = struct {
+    const PendingInjection = struct {
+        text: []u8,
+        message_id: ?[]u8,
+
+        fn deinit(self: PendingInjection, allocator: Allocator) void {
+            allocator.free(self.text);
+            if (self.message_id) |message_id| allocator.free(message_id);
+        }
+    };
+
     agent: Agent,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
@@ -217,8 +227,10 @@ pub const Session = struct {
     mutex: std_compat.sync.Mutex,
     /// Protects injection_pending independently of the session turn mutex.
     injection_mu: std_compat.sync.Mutex = .{},
-    /// Pending mid-turn message; owned by the SessionManager allocator.
-    injection_pending: ?[]u8 = null,
+    /// Pending mid-turn message and source boundary; owned by the SessionManager allocator.
+    injection_pending: ?PendingInjection = null,
+    /// Source message for the most recently drained injection. Remains stable while tools run.
+    active_injection_message_id: ?[]u8 = null,
     /// True once Discord DM history has been fetched for this in-memory session.
     history_hydrated: bool = false,
 
@@ -227,32 +239,47 @@ pub const Session = struct {
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
         if (self.owned_memory_session_id) |sid| allocator.free(sid);
-        if (self.injection_pending) |p| allocator.free(p);
+        if (self.injection_pending) |pending| pending.deinit(allocator);
+        if (self.active_injection_message_id) |message_id| allocator.free(message_id);
         allocator.free(self.session_key);
     }
 
     /// Deposit text in the injection buffer (replaces any existing pending injection).
     /// Must be called with the SM allocator, NOT while holding session.mutex.
     pub fn injectMidTurn(self: *Session, allocator: Allocator, text: []const u8) !void {
-        const duped = try allocator.dupe(u8, text);
+        return self.injectMidTurnWithMessageId(allocator, text, null);
+    }
+
+    pub fn injectMidTurnWithMessageId(self: *Session, allocator: Allocator, text: []const u8, message_id: ?[]const u8) !void {
+        const duped_text = try allocator.dupe(u8, text);
+        errdefer allocator.free(duped_text);
+        const duped_message_id = if (message_id) |value| try allocator.dupe(u8, value) else null;
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
-        if (self.injection_pending) |old| allocator.free(old);
-        self.injection_pending = duped;
+        if (self.injection_pending) |old| old.deinit(allocator);
+        self.injection_pending = .{ .text = duped_text, .message_id = duped_message_id };
     }
 
     /// Deposit text only if a turn is still running after the injection lock is held.
     pub fn injectMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
+        return self.injectMidTurnIfRunningWithMessageId(allocator, text, null);
+    }
+
+    pub fn injectMidTurnIfRunningWithMessageId(self: *Session, allocator: Allocator, text: []const u8, message_id: ?[]const u8) !bool {
         if (!self.turn_running.load(.acquire)) return false;
-        const duped = try allocator.dupe(u8, text);
+        const duped_text = try allocator.dupe(u8, text);
+        errdefer allocator.free(duped_text);
+        const duped_message_id = if (message_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (duped_message_id) |value| allocator.free(value);
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
         if (!self.turn_running.load(.acquire)) {
-            allocator.free(duped);
+            allocator.free(duped_text);
+            if (duped_message_id) |value| allocator.free(value);
             return false;
         }
-        if (self.injection_pending) |old| allocator.free(old);
-        self.injection_pending = duped;
+        if (self.injection_pending) |old| old.deinit(allocator);
+        self.injection_pending = .{ .text = duped_text, .message_id = duped_message_id };
         return true;
     }
 
@@ -270,10 +297,19 @@ pub const Session = struct {
         defer self.injection_mu.unlock();
 
         const pending = self.injection_pending orelse return null;
-        const duped = try dst_allocator.dupe(u8, pending);
-        sm_allocator.free(pending);
+        const duped = try dst_allocator.dupe(u8, pending.text);
+        sm_allocator.free(pending.text);
+        if (self.active_injection_message_id) |message_id| sm_allocator.free(message_id);
+        self.active_injection_message_id = pending.message_id;
         self.injection_pending = null;
         return duped;
+    }
+
+    pub fn clearActiveInjectionMessageId(self: *Session, allocator: Allocator) void {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (self.active_injection_message_id) |message_id| allocator.free(message_id);
+        self.active_injection_message_id = null;
     }
 };
 
@@ -1245,6 +1281,14 @@ pub const SessionManager = struct {
         return previous;
     }
 
+    fn updateTurnMessageContext(tools: []const Tool, message_id: ?[]const u8) void {
+        for (tools) |tool| {
+            if (!std.mem.eql(u8, tool.name(), "discord_reaction")) continue;
+            const reaction_tool: *tools_mod.discord_reaction.DiscordReactionTool = @ptrCast(@alignCast(tool.ptr));
+            reaction_tool.updateMessageContext(message_id);
+        }
+    }
+
     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
         if (named_agent) |cfg| {
             if (cfg.workspace_path != null) return true;
@@ -1925,7 +1969,7 @@ pub const SessionManager = struct {
     /// Route and process an inbound message. Returns null when routing consumed
     /// the message via drop/injection and the caller should not send a reply.
     pub fn processInboundMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) !?[]const u8 {
-        if (self.routeInbound(session_key, content) == .skip) return null;
+        if (self.routeInboundWithContext(session_key, content, conversation_context) == .skip) return null;
         return try self.processMessage(session_key, content, conversation_context);
     }
 
@@ -1938,7 +1982,7 @@ pub const SessionManager = struct {
         stream_sink: ?streaming.Sink,
         progress_sink: ?agent_mod.ProgressSink,
     ) !?[]const u8 {
-        if (self.routeInbound(session_key, content) == .skip) return null;
+        if (self.routeInboundWithContext(session_key, content, conversation_context) == .skip) return null;
         return try self.processMessageStreaming(session_key, content, conversation_context, stream_sink, progress_sink);
     }
 
@@ -1959,6 +2003,7 @@ pub const SessionManager = struct {
         defer {
             session.turn_running.store(false, .release);
             session.agent.clearInterruptRequest();
+            session.clearActiveInjectionMessageId(self.allocator);
         }
 
         session.agent.conversation_context = conversation_context;
@@ -2047,6 +2092,7 @@ pub const SessionManager = struct {
         defer {
             session.turn_running.store(false, .release);
             session.agent.clearInterruptRequest();
+            session.clearActiveInjectionMessageId(self.allocator);
         }
 
         // Set conversation context for this turn.
@@ -2097,7 +2143,11 @@ pub const SessionManager = struct {
 
             fn callback(ctx: *anyopaque, agent_alloc: std.mem.Allocator) !?[]u8 {
                 const dc: *@This() = @ptrCast(@alignCast(ctx));
-                return dc.session.drainInjection(dc.sm_allocator, agent_alloc);
+                const injected = try dc.session.drainInjection(dc.sm_allocator, agent_alloc);
+                if (injected != null) {
+                    updateTurnMessageContext(dc.session.agent.tools, dc.session.active_injection_message_id);
+                }
+                return injected;
             }
         };
         var drain_ctx = DrainCtx{ .session = session, .sm_allocator = self.allocator };
@@ -2126,6 +2176,7 @@ pub const SessionManager = struct {
         while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
             const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse break;
             defer self.allocator.free(late_content);
+            updateTurnMessageContext(session.agent.tools, session.active_injection_message_id);
 
             const previous_response = response;
             response = session.agent.turn(late_content) catch |err| {
@@ -2237,10 +2288,19 @@ pub const SessionManager = struct {
 
     /// Deposit a mid-turn injection only if the session is still running.
     fn injectMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8) !bool {
+        return self.injectMidTurnIfRunningWithMessageId(session_key, text, null);
+    }
+
+    fn injectMidTurnIfRunningWithMessageId(
+        self: *SessionManager,
+        session_key: []const u8,
+        text: []const u8,
+        message_id: ?[]const u8,
+    ) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return false;
-        return try session.injectMidTurnIfRunning(self.allocator, text);
+        return try session.injectMidTurnIfRunningWithMessageId(self.allocator, text, message_id);
     }
 
     fn isSessionTurnRunning(self: *SessionManager, session_key: []const u8) bool {
@@ -2258,10 +2318,20 @@ pub const SessionManager = struct {
     /// Apply inbound routing side effects for a message.
     /// Returns .skip when the caller should not start a new turn.
     pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
+        return self.routeInboundWithContext(session_key, content, null);
+    }
+
+    pub fn routeInboundWithContext(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) InboundRouteAction {
         const session_hash = std.hash.Wyhash.hash(0, session_key);
         return switch (inbound_router.route(self.routeInput(session_key))) {
             .inject, .replace_injection => blk: {
-                const injected = self.injectMidTurnIfRunning(session_key, content) catch |err| {
+                const message_id = if (conversation_context) |ctx| ctx.message_id else null;
+                const injected = self.injectMidTurnIfRunningWithMessageId(session_key, content, message_id) catch |err| {
                     log.warn("mid-turn inject failed session=0x{x} err={}", .{ session_hash, err });
                     break :blk .process;
                 };
@@ -4730,6 +4800,33 @@ test "routeInput observes pending mid-turn injection" {
     try testing.expect(!session.hasInjection());
 }
 
+test "latest mid-turn injection keeps its Discord message boundary" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:discord-message";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInboundWithContext(session_key, "first", .{ .channel = "discord", .message_id = "111111111111111111" }),
+    );
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInboundWithContext(session_key, "second", .{ .channel = "discord", .message_id = "222222222222222222" }),
+    );
+
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("second", drained);
+    try testing.expectEqualStrings("222222222222222222", session.active_injection_message_id.?);
+}
+
 test "drainInjection preserves pending message when target allocation fails" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -4839,9 +4936,10 @@ test "processMessageStreaming drains late injection before completing turn" {
     try testing.expectEqualStrings("final response", resp);
     try testing.expectEqual(SessionManager.InboundRouteAction.skip, provider.route_action.?);
     try testing.expectEqual(@as(usize, 2), provider.chat_calls);
-    try testing.expectEqual(@as(usize, 2), provider.user_count);
+    try testing.expectEqual(@as(usize, 3), provider.user_count);
     try testing.expectEqualStrings("initial", provider.userMessage(0));
-    try testing.expectEqualStrings("late message", provider.userMessage(1));
+    try testing.expect(std.mem.indexOf(u8, provider.userMessage(1), "NOT shown to the user") != null);
+    try testing.expectEqualStrings("late message", provider.userMessage(2));
     try testing.expect(!session.hasInjection());
     try testing.expectEqual(@as(u64, 1), session.turn_count);
 }

@@ -509,6 +509,16 @@ pub const Agent = struct {
         }
     }
 
+    fn appendUndeliveredDraftNotice(self: *Agent) !void {
+        try self.appendOwnedHistoryMessage(.{
+            .role = .user,
+            .content = try self.allocator.dupe(
+                u8,
+                "SYSTEM: The assistant response immediately above was intercepted before delivery and was NOT shown to the user. Treat it as an undelivered draft. Apply the new user message next; unless that message explicitly cancels or replaces the original task, finish the original task and deliver its complete answer after handling the new request. Never claim that this draft was posted.",
+            ),
+        });
+    }
+
     /// Initialize agent from a loaded Config.
     pub fn fromConfig(
         allocator: std.mem.Allocator,
@@ -2612,6 +2622,7 @@ pub const Agent = struct {
                             .role = .assistant,
                             .content = try self.dupeForHistory(display_text),
                         });
+                        try self.appendUndeliveredDraftNotice();
                         const safe_injected = try self.redactOwnedForHistory(injected);
                         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_injected });
                         self.trimHistory();
