@@ -26,7 +26,9 @@ pub const MessageTool = struct {
     default_chat_id: ?[]const u8 = null,
     /// Tracks whether a message was sent during the current agent turn.
     sent_in_round: bool = false,
-    allocator: std.mem.Allocator = undefined,
+    /// Long-lived allocator shared with the bus consumer. Tool result text still
+    /// uses the per-execution allocator supplied to execute().
+    allocator: ?std.mem.Allocator = null,
 
     pub const tool_name = "message";
     pub const tool_description = "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation. Content supports attachment markers like [FILE:/abs/path], [DOCUMENT:/abs/path], [IMAGE:/abs/path] on marker-aware channels.";
@@ -113,15 +115,16 @@ pub const MessageTool = struct {
             }
             break :blk null;
         };
+        const message_allocator = self.allocator orelse allocator;
         const msg = if (account_id) |target_account|
-            bus.makeOutboundWithAccount(allocator, channel, target_account, chat_id, content) catch
+            bus.makeOutboundWithAccount(message_allocator, channel, target_account, chat_id, content) catch
                 return ToolResult.fail("Failed to create outbound message")
         else
-            bus.makeOutbound(allocator, channel, chat_id, content) catch
+            bus.makeOutbound(message_allocator, channel, chat_id, content) catch
                 return ToolResult.fail("Failed to create outbound message");
 
         event_bus.publishOutbound(msg) catch {
-            msg.deinit(allocator);
+            msg.deinit(message_allocator);
             return ToolResult.fail("Bus is closed, cannot send message");
         };
 
@@ -330,4 +333,25 @@ test "MessageTool closed bus fails gracefully" {
     const result = try mt.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expectEqualStrings("Bus is closed, cannot send message", result.error_msg.?);
+}
+
+test "MessageTool bus payload uses its long-lived allocator" {
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var mt = MessageTool{
+        .event_bus = &event_bus,
+        .allocator = testing.allocator,
+        .default_channel = "discord",
+        .default_chat_id = "room1",
+    };
+
+    const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(arena.allocator(), parsed.value.object);
+    try testing.expect(result.success);
+
+    var msg = event_bus.consumeOutbound().?;
+    msg.deinit(testing.allocator);
 }

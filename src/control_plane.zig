@@ -25,7 +25,8 @@ pub const HELP_TEXT =
     \\Session:
     \\  /menu, /help, /commands
     \\  /new, /reset [model], /restart [model]
-    \\  /thread  Archive this conversation and start fresh
+    \\  !thread  Archive this conversation and start fresh
+    \\  !unthread  Restore full channel history on the next message
     \\  /status, /whoami, /id, /compact
     \\  /stop, /abort
     \\
@@ -105,7 +106,8 @@ pub fn buildTelegramDeleteBotCommandsJson(
 
 pub fn parseSlashCommand(message: []const u8) ?SlashCommand {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
-    if (trimmed.len <= 1 or trimmed[0] != '/') return null;
+    if (trimmed.len <= 1 or (trimmed[0] != '/' and trimmed[0] != '!')) return null;
+    const bang_command = trimmed[0] == '!';
 
     const body = trimmed[1..];
     var split_idx: usize = 0;
@@ -118,6 +120,7 @@ pub fn parseSlashCommand(message: []const u8) ?SlashCommand {
     const raw_name = body[0..split_idx];
     const name = slashCommandName(raw_name);
     if (name.len == 0) return null;
+    if (bang_command and !std.ascii.eqlIgnoreCase(name, "thread") and !std.ascii.eqlIgnoreCase(name, "unthread")) return null;
 
     var rest = body[split_idx..];
     if (rest.len > 0 and rest[0] == ':') {
@@ -128,6 +131,14 @@ pub fn parseSlashCommand(message: []const u8) ?SlashCommand {
         .name = name,
         .arg = std.mem.trim(u8, rest, " \t"),
     };
+}
+
+test "parseSlashCommand accepts Discord-safe thread commands only" {
+    const thread = parseSlashCommand("!thread") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("thread", thread.name);
+    const unthread = parseSlashCommand(" !unthread ") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("unthread", unthread.name);
+    try std.testing.expect(parseSlashCommand("!hello") == null);
 }
 
 pub fn isSlashName(cmd: SlashCommand, expected: []const u8) bool {

@@ -5,6 +5,7 @@ const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const fs_compat = @import("../fs_compat.zig");
 const interaction_choices = @import("../interactions/choices.zig");
+const control_plane = @import("../control_plane.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 
@@ -1589,7 +1590,7 @@ pub const DiscordChannel = struct {
         defer content_buf.deinit(self.allocator);
 
         const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
-        if (guild_id != null and (trimmed_content.len == 0 or trimmed_content[0] != '/')) {
+        if (guild_id != null and control_plane.parseSlashCommand(trimmed_content) == null) {
             const speaker = author_display_name orelse author_username orelse author_id;
             content_buf.appendSlice(self.allocator, "[") catch {};
             content_buf.appendSlice(self.allocator, speaker) catch {};

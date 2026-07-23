@@ -51,6 +51,7 @@ pub const TurnInputPlan = struct {
 const SlashCommandKind = enum {
     new_reset,
     thread,
+    unthread,
     restart,
     help,
     status,
@@ -98,6 +99,7 @@ const SlashCommandKind = enum {
 fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
     if (isSlashName(cmd, "thread")) return .thread;
+    if (isSlashName(cmd, "unthread")) return .unthread;
     if (isSlashName(cmd, "restart")) return .restart;
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
     if (isSlashName(cmd, "status")) return .status;
@@ -143,7 +145,12 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
 }
 
 fn slashCommandClearsSession(kind: SlashCommandKind) bool {
-    return kind == .new_reset or kind == .thread or kind == .restart;
+    return kind == .new_reset or kind == .thread or kind == .unthread or kind == .restart;
+}
+
+pub fn rehydratesSession(message: []const u8) bool {
+    const cmd = parseSlashCommand(message) orelse return false;
+    return classifySlashCommand(cmd) == .unthread;
 }
 
 pub fn planTurnInput(message: []const u8) TurnInputPlan {
@@ -1044,10 +1051,19 @@ test "planTurnInput keeps known slash commands local-only" {
 }
 
 test "planTurnInput routes thread through archive handler and persistence clear" {
-    const plan = planTurnInput("/thread");
+    const plan = planTurnInput("!thread");
     try std.testing.expect(plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput routes unthread through restore handler and rehydration" {
+    const plan = planTurnInput("!unthread");
+    try std.testing.expect(plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+    try std.testing.expect(rehydratesSession("!unthread"));
+    try std.testing.expect(!rehydratesSession("!thread"));
 }
 
 test "planTurnInput keeps /menu on local-only path" {
@@ -3998,6 +4014,19 @@ fn handleThreadCommand(self: anytype) ![]const u8 {
     return try self.allocator.dupe(u8, "New thread started. The previous conversation is archived and searchable.");
 }
 
+fn handleUnthreadCommand(self: anytype) ![]const u8 {
+    const session_key = if (@hasField(@TypeOf(self.*), "runtime_session_id"))
+        self.runtime_session_id orelse self.memory_session_id orelse return try self.allocator.dupe(u8, "Cannot restore channel history without a session key.")
+    else if (@hasField(@TypeOf(self.*), "memory_session_id"))
+        self.memory_session_id orelse return try self.allocator.dupe(u8, "Cannot restore channel history without a session key.")
+    else
+        return try self.allocator.dupe(u8, "Channel history restoration is unavailable in this runtime.");
+
+    try thread_boundary.remove(self.allocator, self.workspace_dir, session_key);
+    clearSessionState(self);
+    return try self.allocator.dupe(u8, "Thread boundary removed. Full channel history will be restored on your next message.");
+}
+
 fn handleSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     const sub = it.next() orelse return try std.fmt.allocPrint(self.allocator, "Session TTL: {s}", .{if (self.session_ttl_secs) |_| "set" else "off"});
@@ -5488,6 +5517,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             return try self.allocator.dupe(u8, "Session cleared.");
         },
         .thread => return try handleThreadCommand(self),
+        .unthread => return try handleUnthreadCommand(self),
         .restart => {
             clearSessionState(self);
             resetRuntimeCommandState(self);

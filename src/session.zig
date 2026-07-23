@@ -1664,7 +1664,7 @@ pub const SessionManager = struct {
             var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
             const w = &aw.writer;
             w.writeAll(
-                \\[recovered discord transcript — these are real prior messages in this conversation, restored after a process restart. treat them as your memory of this thread.]
+                \\[recovered discord transcript - silent context only. answer the current incoming message naturally. do not announce that history was recovered, inventory people or topics from it, revive old unanswered requests, or mention anything from it unless directly relevant to the current message.]
                 \\
             ) catch {};
             for (to_add.items) |m| {
@@ -1959,6 +1959,7 @@ pub const SessionManager = struct {
                 store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
             }
         }
+        if (agent_mod.commands.rehydratesSession(content)) session.history_hydrated = false;
 
         return maybe_response;
     }
@@ -2140,6 +2141,7 @@ pub const SessionManager = struct {
                 .total_tokens = session.agent.total_tokens,
             }, session_key, persisted_content orelse content, persisted_response orelse response);
         }
+        if (agent_mod.commands.rehydratesSession(content)) session.history_hydrated = false;
 
         if (self.config.diagnostics.log_message_payloads) {
             var preview = safeMessageLogPreview(self.allocator, response);

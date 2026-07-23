@@ -58,6 +58,19 @@ pub fn load(
     return result;
 }
 
+pub fn remove(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    session_key: []const u8,
+) !void {
+    const path = try boundaryPath(allocator, workspace_dir, session_key);
+    defer allocator.free(path);
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
 test "thread boundary save and load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -69,4 +82,7 @@ test "thread boundary save and load" {
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(loaded);
     try std.testing.expectEqualStrings("123456", loaded);
+
+    try remove(std.testing.allocator, workspace, "agent:main:discord:channel:42");
+    try std.testing.expect(load(std.testing.allocator, workspace, "agent:main:discord:channel:42") == null);
 }
