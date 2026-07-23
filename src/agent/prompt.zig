@@ -125,6 +125,12 @@ pub const ConversationContext = struct {
     sender_id: ?[]const u8 = null,
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
+    discord_server_name: ?[]const u8 = null,
+    discord_channel_name: ?[]const u8 = null,
+    discord_members: ?[]const u8 = null,
+    discord_online_members: ?[]const u8 = null,
+    discord_member_count: ?u64 = null,
+    discord_members_truncated: ?bool = null,
     // Shared
     message_id: ?[]const u8 = null,
     bot_user_id: ?[]const u8 = null,
@@ -139,7 +145,7 @@ pub const ConversationContext = struct {
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
         // Hash sender and destination fields so cached prompts follow the conversation.
-        inline for (.{ self.channel, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.delivery_chat_id, self.peer_id, self.group_id }) |field| {
+        inline for (.{ self.channel, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.discord_server_name, self.discord_channel_name, self.discord_members, self.discord_online_members, self.delivery_chat_id, self.peer_id, self.group_id }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -149,6 +155,11 @@ pub const ConversationContext = struct {
         }
         const group_marker: u8 = if (self.is_group orelse false) 1 else 0;
         h.update(&.{group_marker});
+        var count_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count_buf, self.discord_member_count orelse 0, .little);
+        h.update(&count_buf);
+        const truncated_marker: u8 = if (self.discord_members_truncated orelse false) 1 else 0;
+        h.update(&.{truncated_marker});
         return h.final();
     }
 };
@@ -163,6 +174,10 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
     const sender_id = normalizeOptionalString(args.sender_id);
     const sender_username = normalizeOptionalString(args.sender_username);
     const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const discord_server_name = normalizeOptionalString(args.discord_server_name);
+    const discord_channel_name = normalizeOptionalString(args.discord_channel_name);
+    const discord_members = normalizeOptionalString(args.discord_members);
+    const discord_online_members = normalizeOptionalString(args.discord_online_members);
     const message_id = normalizeOptionalString(args.message_id);
     const bot_user_id = normalizeOptionalString(args.bot_user_id);
     const delivery_chat_id = normalizeOptionalString(args.delivery_chat_id);
@@ -181,7 +196,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         sender_name != null or
         sender_username != null or
         sender_display_name != null;
-    const has_scope = account_id != null or message_id != null or bot_user_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null;
+    const has_scope = account_id != null or message_id != null or bot_user_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null or discord_server_name != null or discord_channel_name != null or discord_members != null or discord_online_members != null;
     if (channel == null and !has_sender_identity and !has_scope) return null;
 
     return .{
@@ -193,6 +208,12 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .sender_id = sender_id,
         .sender_username = sender_username,
         .sender_display_name = sender_display_name,
+        .discord_server_name = discord_server_name,
+        .discord_channel_name = discord_channel_name,
+        .discord_members = discord_members,
+        .discord_online_members = discord_online_members,
+        .discord_member_count = args.discord_member_count,
+        .discord_members_truncated = args.discord_members_truncated,
         .message_id = message_id,
         .bot_user_id = bot_user_id,
         .delivery_chat_id = delivery_chat_id,
@@ -316,9 +337,35 @@ pub fn buildSystemPrompt(
         if (is_discord) {
             if (cc.is_group orelse false) {
                 try w.writeAll("- Conversation location: Discord server channel (not a DM)\n");
-                if (cc.group_id) |gid| try w.print("- Discord server ID: {s}\n", .{gid});
-                if (cc.delivery_chat_id) |cid| try w.print("- Discord channel ID: {s}\n", .{cid});
+                if (cc.discord_server_name) |name| {
+                    if (cc.group_id) |gid|
+                        try w.print("- Discord server: {s} (ID: {s})\n", .{ name, gid })
+                    else
+                        try w.print("- Discord server: {s}\n", .{name});
+                } else if (cc.group_id) |gid| {
+                    try w.print("- Discord server ID: {s}\n", .{gid});
+                }
+                if (cc.discord_channel_name) |name| {
+                    if (cc.delivery_chat_id) |cid|
+                        try w.print("- Discord channel: #{s} (ID: {s})\n", .{ name, cid })
+                    else
+                        try w.print("- Discord channel: #{s}\n", .{name});
+                } else if (cc.delivery_chat_id) |cid| {
+                    try w.print("- Discord channel ID: {s}\n", .{cid});
+                }
+                if (cc.discord_member_count) |count| {
+                    try w.print("- Server members: {d} total", .{count});
+                    if (cc.discord_members_truncated orelse false) try w.writeAll(" (list truncated to 50)");
+                    try w.writeByte('\n');
+                }
+                if (cc.discord_members) |members| try w.print("- Member list: {s}\n", .{members});
+                if (cc.discord_online_members) |online| {
+                    try w.print("- Online now: {s}\n", .{online});
+                } else {
+                    try w.writeAll("- Online now: nobody in the current presence snapshot\n");
+                }
                 try w.writeAll("- Reply destination: this server channel. Messages and files sent to the current conversation appear here, not in the sender's DMs.\n");
+                try w.writeAll("- Treat server/member/presence details as silent context. Mention or enumerate them only when the user asks.\n");
             } else {
                 try w.writeAll("- Conversation location: Discord direct message\n");
                 if (cc.delivery_chat_id) |cid| try w.print("- Discord DM channel ID: {s}\n", .{cid});
@@ -1429,6 +1476,12 @@ test "buildSystemPrompt includes discord sender identity fields" {
             .sender_id = "u-42",
             .sender_username = "discord-user",
             .sender_display_name = "Discord User",
+            .discord_server_name = "Softmax House",
+            .discord_channel_name = "botmaxxing",
+            .discord_members = "Shresht, William, Priime, tetrapod (bot)",
+            .discord_online_members = "Shresht (online), tetrapod (online)",
+            .discord_member_count = 4,
+            .discord_members_truncated = false,
             .delivery_chat_id = "channel-1",
             .group_id = "guild-1",
             .is_group = true,
@@ -1440,8 +1493,11 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Conversation location: Discord server channel (not a DM)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord server ID: guild-1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord channel ID: channel-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord server: Softmax House (ID: guild-1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Discord channel: #botmaxxing (ID: channel-1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Server members: 4 total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Member list: Shresht, William, Priime, tetrapod (bot)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Online now: Shresht (online), tetrapod (online)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "not in the sender's DMs") != null);
 }
 

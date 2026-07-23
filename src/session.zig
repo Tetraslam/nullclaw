@@ -1180,11 +1180,21 @@ pub const SessionManager = struct {
         ) catch null;
     }
 
+    const TurnToolContext = struct {
+        message: ?tools_mod.message.MessageTool.TurnContext = null,
+        discord_members: ?tools_mod.discord_members.DiscordMembersTool.TurnContext = null,
+
+        fn restore(self: TurnToolContext) void {
+            if (self.message) |previous| tools_mod.message.MessageTool.restoreContext(previous);
+            if (self.discord_members) |previous| tools_mod.discord_members.DiscordMembersTool.restoreContext(previous);
+        }
+    };
+
     fn setTurnToolContext(
         tools: []const Tool,
         session_key: []const u8,
         conversation_context: ?ConversationContext,
-    ) ?tools_mod.message.MessageTool.TurnContext {
+    ) TurnToolContext {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
         const chat_id = if (conversation_context) |ctx|
             ctx.delivery_chat_id orelse parsePeerIdFromSessionKey(session_key)
@@ -1208,17 +1218,21 @@ pub const SessionManager = struct {
             break :blk chat_id;
         } else chat_id;
 
-        var previous_message_context: ?tools_mod.message.MessageTool.TurnContext = null;
+        var previous = TurnToolContext{};
         for (tools) |tool| {
             if (std.mem.eql(u8, tool.name(), "schedule")) {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
                 schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, null);
             } else if (std.mem.eql(u8, tool.name(), "message")) {
                 const message_tool: *tools_mod.message.MessageTool = @ptrCast(@alignCast(tool.ptr));
-                previous_message_context = message_tool.setContext(channel, account_id, chat_id);
+                previous.message = message_tool.setContext(channel, account_id, chat_id);
+            } else if (std.mem.eql(u8, tool.name(), "discord_members")) {
+                const members_tool: *tools_mod.discord_members.DiscordMembersTool = @ptrCast(@alignCast(tool.ptr));
+                const guild_id = if (conversation_context) |ctx| if (ctx.is_group orelse false) ctx.group_id else null else null;
+                previous.discord_members = members_tool.setContext(account_id, guild_id);
             }
         }
-        return previous_message_context;
+        return previous;
     }
 
     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
@@ -1313,6 +1327,7 @@ pub const SessionManager = struct {
             .allowed_paths = self.config.autonomy.allowed_paths,
             .policy = self.policy,
             .subagent_manager = self.subagent_manager,
+            .discord_accounts = self.config.channels.discord,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = self.config.memory.backend,
             .sandbox_backend = self.config.security.sandbox.backend,
@@ -1940,8 +1955,8 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
         session.agent.runtime_session_id = session_key;
         defer session.agent.runtime_session_id = null;
-        const previous_message_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
-        defer if (previous_message_context) |previous| tools_mod.message.MessageTool.restoreContext(previous);
+        const previous_tool_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        defer previous_tool_context.restore();
 
         const maybe_response = try session.agent.handleSlashCommand(content);
         if (maybe_response == null) return null;
@@ -2029,8 +2044,8 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
         session.agent.runtime_session_id = session_key;
         defer session.agent.runtime_session_id = null;
-        const previous_message_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
-        defer if (previous_message_context) |previous| tools_mod.message.MessageTool.restoreContext(previous);
+        const previous_tool_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        defer previous_tool_context.restore();
 
         const prev_stream_callback = session.agent.stream_callback;
         const prev_stream_ctx = session.agent.stream_ctx;

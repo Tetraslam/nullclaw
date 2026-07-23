@@ -39,6 +39,61 @@ const PendingInteraction = struct {
     }
 };
 
+const MemberPresence = enum {
+    offline,
+    online,
+    idle,
+    dnd,
+
+    fn fromDiscord(raw: []const u8) MemberPresence {
+        if (std.mem.eql(u8, raw, "online")) return .online;
+        if (std.mem.eql(u8, raw, "idle")) return .idle;
+        if (std.mem.eql(u8, raw, "dnd")) return .dnd;
+        return .offline;
+    }
+
+    fn label(self: MemberPresence) []const u8 {
+        return switch (self) {
+            .offline => "offline",
+            .online => "online",
+            .idle => "idle",
+            .dnd => "dnd",
+        };
+    }
+};
+
+const GuildMemberSnapshot = struct {
+    name: []u8,
+    presence: MemberPresence = .offline,
+
+    fn deinit(self: *const GuildMemberSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+    }
+};
+
+const GuildSnapshot = struct {
+    name: []u8,
+    member_count: usize = 0,
+    channels: std.StringHashMapUnmanaged([]u8) = .empty,
+    members: std.StringHashMapUnmanaged(GuildMemberSnapshot) = .empty,
+
+    fn deinit(self: *GuildSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        var channels = self.channels.iterator();
+        while (channels.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
+            allocator.free(entry.value_ptr.*);
+        }
+        self.channels.deinit(allocator);
+        var members = self.members.iterator();
+        while (members.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(allocator);
+        }
+        self.members.deinit(allocator);
+    }
+};
+
 /// Discord channel — connects via WebSocket gateway, sends via REST API.
 /// Splits messages at 2000 chars (Discord limit).
 pub const DiscordChannel = struct {
@@ -52,13 +107,14 @@ pub const DiscordChannel = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     mention_exempt_channels: []const []const u8 = &.{},
-    intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
+    intents: u32 = 37635, // + GUILD_MEMBERS and GUILD_PRESENCES for Discord context
     bus: ?*bus_mod.Bus = null,
 
     typing_mu: std_compat.sync.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
     interaction_mu: std_compat.sync.Mutex = .{},
     pending_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty,
+    guild_snapshots: std.StringHashMapUnmanaged(GuildSnapshot) = .empty,
     interaction_seq: Atomic(u64) = Atomic(u64).init(1),
 
     // Gateway state
@@ -908,6 +964,273 @@ pub const DiscordChannel = struct {
         pending.deinit(self.allocator);
     }
 
+    fn deinitGuildSnapshots(self: *DiscordChannel) void {
+        var guilds = self.guild_snapshots.iterator();
+        while (guilds.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.guild_snapshots.deinit(self.allocator);
+        self.guild_snapshots = .empty;
+    }
+
+    fn objectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+        const value = object.get(key) orelse return null;
+        if (value != .string or value.string.len == 0) return null;
+        return value.string;
+    }
+
+    fn memberDisplayName(self: *DiscordChannel, member: std.json.ObjectMap) !struct { id: []const u8, name: []u8 } {
+        const user_value = member.get("user") orelse return error.InvalidDiscordMember;
+        if (user_value != .object) return error.InvalidDiscordMember;
+        const user = user_value.object;
+        const id = objectString(user, "id") orelse return error.InvalidDiscordMember;
+        const base_name = objectString(member, "nick") orelse
+            objectString(user, "global_name") orelse
+            objectString(user, "username") orelse
+            id;
+        const is_bot = if (user.get("bot")) |value| value == .bool and value.bool else false;
+        const name = if (is_bot)
+            try std.fmt.allocPrint(self.allocator, "{s} (bot)", .{base_name})
+        else
+            try self.allocator.dupe(u8, base_name);
+        return .{ .id = id, .name = name };
+    }
+
+    fn upsertChannel(self: *DiscordChannel, guild: *GuildSnapshot, channel_object: std.json.ObjectMap) !void {
+        const id = objectString(channel_object, "id") orelse return;
+        const name = objectString(channel_object, "name") orelse return;
+        if (guild.channels.getEntry(id)) |entry| {
+            const replacement = try self.allocator.dupe(u8, name);
+            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = replacement;
+            return;
+        }
+        const key = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(key);
+        const value = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(value);
+        try guild.channels.put(self.allocator, key, value);
+    }
+
+    fn upsertMember(self: *DiscordChannel, guild: *GuildSnapshot, member: std.json.ObjectMap) !bool {
+        const parsed = try self.memberDisplayName(member);
+        if (guild.members.getPtr(parsed.id)) |existing| {
+            self.allocator.free(existing.name);
+            existing.name = parsed.name;
+            return false;
+        }
+        const key = try self.allocator.dupe(u8, parsed.id);
+        errdefer self.allocator.free(key);
+        errdefer self.allocator.free(parsed.name);
+        try guild.members.put(self.allocator, key, .{ .name = parsed.name });
+        return true;
+    }
+
+    fn applyPresence(self: *DiscordChannel, guild: *GuildSnapshot, presence: std.json.ObjectMap) !void {
+        const user_value = presence.get("user") orelse return;
+        if (user_value != .object) return;
+        const id = objectString(user_value.object, "id") orelse return;
+        const status = objectString(presence, "status") orelse "offline";
+        if (guild.members.getPtr(id)) |member| {
+            member.presence = MemberPresence.fromDiscord(status);
+            return;
+        }
+        const name = objectString(user_value.object, "global_name") orelse
+            objectString(user_value.object, "username") orelse
+            id;
+        const key = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(key);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try guild.members.put(self.allocator, key, .{
+            .name = owned_name,
+            .presence = MemberPresence.fromDiscord(status),
+        });
+    }
+
+    fn cacheGuildCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_value = root_val.object.get("d") orelse return;
+        if (d_value != .object) return;
+        const d = d_value.object;
+        const id = objectString(d, "id") orelse return;
+        const name = objectString(d, "name") orelse id;
+
+        var snapshot = GuildSnapshot{ .name = try self.allocator.dupe(u8, name) };
+        errdefer snapshot.deinit(self.allocator);
+        if (d.get("member_count")) |value| {
+            if (value == .integer and value.integer > 0) snapshot.member_count = @intCast(value.integer);
+        }
+        inline for (.{ "channels", "threads" }) |field| {
+            if (d.get(field)) |value| {
+                if (value == .array) {
+                    for (value.array.items) |item| {
+                        if (item == .object) try self.upsertChannel(&snapshot, item.object);
+                    }
+                }
+            }
+        }
+        if (d.get("members")) |value| {
+            if (value == .array) {
+                for (value.array.items) |item| {
+                    if (item == .object) _ = try self.upsertMember(&snapshot, item.object);
+                }
+            }
+        }
+        if (d.get("presences")) |value| {
+            if (value == .array) {
+                for (value.array.items) |item| {
+                    if (item == .object) try self.applyPresence(&snapshot, item.object);
+                }
+            }
+        }
+        if (snapshot.member_count == 0) snapshot.member_count = snapshot.members.count();
+
+        if (self.guild_snapshots.fetchRemove(id)) |existing| {
+            self.allocator.free(@constCast(existing.key));
+            var old = existing.value;
+            old.deinit(self.allocator);
+        }
+        const key = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(key);
+        try self.guild_snapshots.put(self.allocator, key, snapshot);
+    }
+
+    fn updateGuildSnapshot(self: *DiscordChannel, event_type: []const u8, root_val: std.json.Value) !void {
+        const d_value = root_val.object.get("d") orelse return;
+        if (d_value != .object) return;
+        const d = d_value.object;
+
+        if (std.mem.eql(u8, event_type, "GUILD_CREATE")) return self.cacheGuildCreate(root_val);
+        if (std.mem.eql(u8, event_type, "GUILD_DELETE")) {
+            const id = objectString(d, "id") orelse return;
+            if (self.guild_snapshots.fetchRemove(id)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                var snapshot = removed.value;
+                snapshot.deinit(self.allocator);
+            }
+            return;
+        }
+
+        const guild_id = if (std.mem.eql(u8, event_type, "GUILD_UPDATE"))
+            objectString(d, "id") orelse return
+        else
+            objectString(d, "guild_id") orelse return;
+        const guild = self.guild_snapshots.getPtr(guild_id) orelse return;
+        if (std.mem.eql(u8, event_type, "GUILD_UPDATE")) {
+            const name = objectString(d, "name") orelse return;
+            const replacement = try self.allocator.dupe(u8, name);
+            self.allocator.free(guild.name);
+            guild.name = replacement;
+        } else if (std.mem.eql(u8, event_type, "CHANNEL_CREATE") or
+            std.mem.eql(u8, event_type, "CHANNEL_UPDATE") or
+            std.mem.eql(u8, event_type, "THREAD_CREATE") or
+            std.mem.eql(u8, event_type, "THREAD_UPDATE"))
+        {
+            try self.upsertChannel(guild, d);
+        } else if (std.mem.eql(u8, event_type, "CHANNEL_DELETE") or std.mem.eql(u8, event_type, "THREAD_DELETE")) {
+            const id = objectString(d, "id") orelse return;
+            if (guild.channels.fetchRemove(id)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                self.allocator.free(removed.value);
+            }
+        } else if (std.mem.eql(u8, event_type, "GUILD_MEMBER_ADD") or std.mem.eql(u8, event_type, "GUILD_MEMBER_UPDATE")) {
+            const added = try self.upsertMember(guild, d);
+            if (added and std.mem.eql(u8, event_type, "GUILD_MEMBER_ADD")) guild.member_count += 1;
+        } else if (std.mem.eql(u8, event_type, "GUILD_MEMBER_REMOVE")) {
+            const user_value = d.get("user") orelse return;
+            if (user_value != .object) return;
+            const id = objectString(user_value.object, "id") orelse return;
+            if (guild.members.fetchRemove(id)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                var member = removed.value;
+                member.deinit(self.allocator);
+            }
+            if (guild.member_count > 0) guild.member_count -= 1;
+        } else if (std.mem.eql(u8, event_type, "PRESENCE_UPDATE")) {
+            try self.applyPresence(guild, d);
+        } else if (std.mem.eql(u8, event_type, "GUILD_MEMBERS_CHUNK")) {
+            if (d.get("members")) |value| {
+                if (value == .array) {
+                    for (value.array.items) |item| {
+                        if (item == .object) _ = try self.upsertMember(guild, item.object);
+                    }
+                }
+            }
+            if (d.get("presences")) |value| {
+                if (value == .array) {
+                    for (value.array.items) |item| {
+                        if (item == .object) try self.applyPresence(guild, item.object);
+                    }
+                }
+            }
+        }
+    }
+
+    fn requestMissingGuildMembers(self: *DiscordChannel, ws: *websocket.WsClient, root_val: std.json.Value) void {
+        const d_value = root_val.object.get("d") orelse return;
+        if (d_value != .object) return;
+        const guild_id = objectString(d_value.object, "id") orelse return;
+        const guild = self.guild_snapshots.getPtr(guild_id) orelse return;
+        if (guild.members.count() >= @min(guild.member_count, 50)) return;
+
+        var request_buf: [512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&request_buf);
+        writer.writeAll("{\"op\":8,\"d\":{\"guild_id\":") catch return;
+        root.appendJsonStringW(&writer, guild_id) catch return;
+        writer.writeAll(",\"query\":\"\",\"limit\":50,\"presences\":true,\"nonce\":\"nullclaw-context\"}}") catch return;
+        ws.writeText(writer.buffered()) catch |err| {
+            log.warn("Discord: member snapshot request failed for guild={s}: {}", .{ guild_id, err });
+        };
+    }
+
+    fn formatMemberList(self: *DiscordChannel, guild: *const GuildSnapshot, online_only: bool) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var count: usize = 0;
+        var members = guild.members.iterator();
+        while (members.next()) |entry| {
+            const member = entry.value_ptr.*;
+            if (online_only and member.presence == .offline) continue;
+            if (count == 50) break;
+            if (count > 0) try out.appendSlice(self.allocator, ", ");
+            try out.appendSlice(self.allocator, member.name);
+            if (online_only) {
+                try out.appendSlice(self.allocator, " (");
+                try out.appendSlice(self.allocator, member.presence.label());
+                try out.append(self.allocator, ')');
+            }
+            count += 1;
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendGuildSnapshotMetadata(
+        self: *DiscordChannel,
+        writer: *std.Io.Writer,
+        guild_id: []const u8,
+        channel_id: []const u8,
+    ) !void {
+        const guild = self.guild_snapshots.getPtr(guild_id) orelse return;
+        try writer.writeAll(",\"discord_server_name\":");
+        try root.appendJsonStringW(writer, guild.name);
+        if (guild.channels.get(channel_id)) |channel_name| {
+            try writer.writeAll(",\"discord_channel_name\":");
+            try root.appendJsonStringW(writer, channel_name);
+        }
+        try writer.print(",\"discord_member_count\":{d}", .{guild.member_count});
+        const members = try self.formatMemberList(guild, false);
+        defer self.allocator.free(members);
+        try writer.writeAll(",\"discord_members\":");
+        try root.appendJsonStringW(writer, members);
+        const displayed_count = @min(guild.members.count(), 50);
+        try writer.print(",\"discord_members_truncated\":{s}", .{if (guild.member_count > displayed_count) "true" else "false"});
+        const online = try self.formatMemberList(guild, true);
+        defer self.allocator.free(online);
+        try writer.writeAll(",\"discord_online_members\":");
+        try root.appendJsonStringW(writer, online);
+    }
+
     fn sendRichMessage(self: *DiscordChannel, channel_id: []const u8, payload: root.Channel.OutboundPayload) !void {
         var media = try self.allocator.alloc([]const u8, payload.attachments.len);
         defer self.allocator.free(media);
@@ -1038,6 +1361,7 @@ pub const DiscordChannel = struct {
             t.join();
             self.gateway_thread = null;
         }
+        self.deinitGuildSnapshots();
         // Free session state
         if (self.session_id) |s| {
             self.allocator.free(s);
@@ -1350,6 +1674,27 @@ pub const DiscordChannel = struct {
                     self.handleInteractionCreate(root_val) catch |err| {
                         log.warn("Discord: handleInteractionCreate error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, event_type, "GUILD_CREATE") or
+                    std.mem.eql(u8, event_type, "GUILD_UPDATE") or
+                    std.mem.eql(u8, event_type, "GUILD_DELETE") or
+                    std.mem.eql(u8, event_type, "CHANNEL_CREATE") or
+                    std.mem.eql(u8, event_type, "CHANNEL_UPDATE") or
+                    std.mem.eql(u8, event_type, "CHANNEL_DELETE") or
+                    std.mem.eql(u8, event_type, "THREAD_CREATE") or
+                    std.mem.eql(u8, event_type, "THREAD_UPDATE") or
+                    std.mem.eql(u8, event_type, "THREAD_DELETE") or
+                    std.mem.eql(u8, event_type, "GUILD_MEMBER_ADD") or
+                    std.mem.eql(u8, event_type, "GUILD_MEMBER_UPDATE") or
+                    std.mem.eql(u8, event_type, "GUILD_MEMBER_REMOVE") or
+                    std.mem.eql(u8, event_type, "GUILD_MEMBERS_CHUNK") or
+                    std.mem.eql(u8, event_type, "PRESENCE_UPDATE"))
+                {
+                    self.updateGuildSnapshot(event_type, root_val) catch |err| {
+                        log.warn("Discord: guild snapshot update failed for {s}: {}", .{ event_type, err });
+                    };
+                    if (std.mem.eql(u8, event_type, "GUILD_CREATE")) {
+                        self.requestMissingGuildMembers(ws, root_val);
+                    }
                 }
             },
             1 => { // HEARTBEAT — server requests immediate heartbeat
@@ -1663,6 +2008,7 @@ pub const DiscordChannel = struct {
         if (guild_id) |gid| {
             try mw.writeAll(",\"guild_id\":");
             try root.appendJsonStringW(mw, gid);
+            try self.appendGuildSnapshotMetadata(mw, gid, channel_id);
         }
         if (message_id) |mid| {
             try mw.writeAll(",\"message_id\":");
@@ -2051,7 +2397,7 @@ test "discord isMentioned with user id" {
 
 test "discord intents default" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
-    try std.testing.expectEqual(@as(u32, 37377), ch.intents);
+    try std.testing.expectEqual(@as(u32, 37635), ch.intents);
 }
 
 test "discord initFromConfig passes all fields" {
@@ -2337,6 +2683,68 @@ test "discord outbound parser accepts brackets in attachment paths" {
     try std.testing.expectEqualStrings("/tmp/chart[1].png", parsed.files[0]);
 }
 
+test "discord guild snapshot enriches inbound metadata" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_from = &.{"u-1"},
+    });
+    defer ch.deinitGuildSnapshots();
+    ch.setBus(&event_bus);
+
+    const guild_json =
+        \\{"d":{"id":"g-1","name":"Softmax House","member_count":3,"channels":[{"id":"c-1","name":"botmaxxing"}],"members":[{"user":{"id":"u-1","username":"shresht"}},{"nick":"William","user":{"id":"u-2","username":"will"}},{"user":{"id":"bot-1","username":"tetrapod","bot":true}}],"presences":[{"user":{"id":"u-1"},"status":"online"},{"user":{"id":"u-2"},"status":"idle"}]}}
+    ;
+    const guild_parsed = try std.json.parseFromSlice(std.json.Value, alloc, guild_json, .{});
+    defer guild_parsed.deinit();
+    try ch.updateGuildSnapshot("GUILD_CREATE", guild_parsed.value);
+
+    const message_json =
+        \\{"d":{"id":"m-1","channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","username":"shresht"}}}
+    ;
+    const message_parsed = try std.json.parseFromSlice(std.json.Value, alloc, message_json, .{});
+    defer message_parsed.deinit();
+    try ch.handleMessageCreate(message_parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(alloc);
+    const metadata = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer metadata.deinit();
+    const object = metadata.value.object;
+    try std.testing.expectEqualStrings("Softmax House", object.get("discord_server_name").?.string);
+    try std.testing.expectEqualStrings("botmaxxing", object.get("discord_channel_name").?.string);
+    try std.testing.expectEqual(@as(i64, 3), object.get("discord_member_count").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_members").?.string, "William") != null);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_members").?.string, "tetrapod (bot)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_online_members").?.string, "shresht (online)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, object.get("discord_online_members").?.string, "William (idle)") != null);
+}
+
+test "discord member list is capped at fifty entries" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "token" });
+    var guild = GuildSnapshot{
+        .name = try alloc.dupe(u8, "Guild"),
+        .member_count = 51,
+    };
+    defer guild.deinit(alloc);
+
+    for (0..51) |index| {
+        const key = try std.fmt.allocPrint(alloc, "u-{d}", .{index});
+        errdefer alloc.free(key);
+        const name = try std.fmt.allocPrint(alloc, "member-{d}", .{index});
+        errdefer alloc.free(name);
+        try guild.members.put(alloc, key, .{ .name = name });
+    }
+
+    const members = try ch.formatMemberList(&guild, false);
+    defer alloc.free(members);
+    try std.testing.expectEqual(@as(usize, 49), std.mem.count(u8, members, ", "));
+}
+
 test "discord handleMessageCreate require_mention accepts reply to bot message" {
     const alloc = std.testing.allocator;
     var event_bus = bus_mod.Bus.init();
@@ -2484,8 +2892,8 @@ test "discord intent bitmask guilds" {
     try std.testing.expectEqual(@as(u32, 32768), 32768);
     // DIRECT_MESSAGES = 4096
     try std.testing.expectEqual(@as(u32, 4096), 4096);
-    // Default intents = 1|512|32768|4096 = 37377
-    try std.testing.expectEqual(@as(u32, 37377), 1 | 512 | 32768 | 4096);
+    // Default intents include guild members (2) and guild presences (256).
+    try std.testing.expectEqual(@as(u32, 37635), 1 | 2 | 256 | 512 | 32768 | 4096);
 }
 
 test "DiscordChannel create + healthCheck + stop leaks zero bytes" {

@@ -646,7 +646,7 @@ pub const DiscordConfig = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     mention_exempt_channels: []const []const u8 = &.{},
-    intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
+    intents: u32 = 37635, // + GUILD_MEMBERS and GUILD_PRESENCES for Discord context
 };
 
 pub const SlackReceiveMode = enum {

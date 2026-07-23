@@ -720,6 +720,24 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("sender_display_name")) |v| {
             if (v == .string) parsed.fields.sender_display_name = v.string;
         }
+        if (pm.value.object.get("discord_server_name")) |v| {
+            if (v == .string) parsed.fields.discord_server_name = v.string;
+        }
+        if (pm.value.object.get("discord_channel_name")) |v| {
+            if (v == .string) parsed.fields.discord_channel_name = v.string;
+        }
+        if (pm.value.object.get("discord_members")) |v| {
+            if (v == .string) parsed.fields.discord_members = v.string;
+        }
+        if (pm.value.object.get("discord_online_members")) |v| {
+            if (v == .string) parsed.fields.discord_online_members = v.string;
+        }
+        if (pm.value.object.get("discord_member_count")) |v| {
+            if (v == .integer and v.integer >= 0) parsed.fields.discord_member_count = @intCast(v.integer);
+        }
+        if (pm.value.object.get("discord_members_truncated")) |v| {
+            if (v == .bool) parsed.fields.discord_members_truncated = v.bool;
+        }
     }
     return parsed;
 }
@@ -765,6 +783,12 @@ fn buildInboundConversationContext(
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
+        .discord_server_name = meta.discord_server_name,
+        .discord_channel_name = meta.discord_channel_name,
+        .discord_members = meta.discord_members,
+        .discord_online_members = meta.discord_online_members,
+        .discord_member_count = meta.discord_member_count,
+        .discord_members_truncated = meta.discord_members_truncated,
         .message_id = meta.message_id,
         .bot_user_id = meta.bot_user_id,
         .delivery_chat_id = if (msg.chat_id.len > 0) msg.chat_id else null,
@@ -2882,6 +2906,21 @@ test "parseInboundMetadata extracts discord sender identity fields" {
 
     try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
+}
+
+test "parseInboundMetadata extracts discord guild snapshot fields" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"discord_server_name\":\"Softmax House\",\"discord_channel_name\":\"botmaxxing\",\"discord_members\":\"Shresht, William\",\"discord_online_members\":\"Shresht (online)\",\"discord_member_count\":2,\"discord_members_truncated\":false}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Softmax House", parsed.fields.discord_server_name.?);
+    try std.testing.expectEqualStrings("botmaxxing", parsed.fields.discord_channel_name.?);
+    try std.testing.expectEqualStrings("Shresht, William", parsed.fields.discord_members.?);
+    try std.testing.expectEqualStrings("Shresht (online)", parsed.fields.discord_online_members.?);
+    try std.testing.expectEqual(@as(u64, 2), parsed.fields.discord_member_count.?);
+    try std.testing.expect(!parsed.fields.discord_members_truncated.?);
 }
 
 test "buildInboundConversationContext preserves discord identity metadata" {

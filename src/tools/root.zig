@@ -116,6 +116,7 @@ pub const cron_runs = @import("cron_runs.zig");
 pub const cron_run = @import("cron_run.zig");
 pub const cron_update = @import("cron_update.zig");
 pub const message = @import("message.zig");
+pub const discord_members = @import("discord_members.zig");
 pub const pushover = @import("pushover.zig");
 pub const schema = @import("schema.zig");
 pub const web_search = @import("web_search.zig");
@@ -364,6 +365,7 @@ pub fn allTools(
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         event_bus: ?*@import("../bus.zig").Bus = null,
+        discord_accounts: []const config_types.DiscordConfig = &.{},
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
@@ -526,6 +528,12 @@ pub fn allTools(
         const mt = try allocator.create(message.MessageTool);
         mt.* = .{ .event_bus = event_bus, .allocator = allocator };
         try list.append(allocator, mt.tool());
+    }
+
+    if (opts.discord_accounts.len > 0) {
+        const dmt = try allocator.create(discord_members.DiscordMembersTool);
+        dmt.* = .{ .accounts = opts.discord_accounts };
+        try list.append(allocator, dmt.tool());
     }
 
     // Spawn tool (async subagent)

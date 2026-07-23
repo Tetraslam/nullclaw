@@ -90,6 +90,12 @@ pub const InboundMetadata = struct {
     is_group: ?bool = null,
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
+    discord_server_name: ?[]const u8 = null,
+    discord_channel_name: ?[]const u8 = null,
+    discord_members: ?[]const u8 = null,
+    discord_online_members: ?[]const u8 = null,
+    discord_member_count: ?u64 = null,
+    discord_members_truncated: ?bool = null,
 };
 
 pub const InboundRouteInput = struct {

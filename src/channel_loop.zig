@@ -1362,6 +1362,7 @@ pub const ChannelRuntime = struct {
             .policy = security_policy,
             .subagent_manager = subagent_manager,
             .event_bus = event_bus,
+            .discord_accounts = config.channels.discord,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
             .sandbox_backend = config.security.sandbox.backend,
