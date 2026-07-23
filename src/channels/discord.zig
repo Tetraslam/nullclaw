@@ -358,7 +358,17 @@ pub const DiscordChannel = struct {
         auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, "{}", &.{auth_header}, null) catch return;
+        const resolve_entry = root.http_util.buildSafeResolveEntryForRemoteUrl(self.allocator, url) catch return;
+        defer if (resolve_entry) |entry| self.allocator.free(entry);
+        const resp = root.http_util.curlPostWithProxyAndResolve(
+            self.allocator,
+            url,
+            "{}",
+            &.{auth_header},
+            null,
+            "5",
+            resolve_entry,
+        ) catch return;
         self.allocator.free(resp);
     }
 
@@ -1072,6 +1082,8 @@ pub const DiscordChannel = struct {
                     else => return,
                 };
 
+                log.info("discord gw dispatch t={s} seq={d}", .{ event_type, self.sequence.load(.acquire) });
+
                 if (std.mem.eql(u8, event_type, "READY")) {
                     self.handleReady(root_val) catch |err| {
                         log.warn("Discord: handleReady error: {}", .{err});
@@ -1295,6 +1307,7 @@ pub const DiscordChannel = struct {
 
         // Filter 1: bot author
         if (author_is_bot and !self.allow_bots) {
+            log.info("discord gw msg drop: bot author channel={s}", .{channel_id});
             return;
         }
 
@@ -1302,12 +1315,14 @@ pub const DiscordChannel = struct {
         if (self.require_mention and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid) and !isReplyToBot(d_obj, bot_uid)) {
+                log.info("discord gw msg drop: mention required channel={s}", .{channel_id});
                 return;
             }
         }
 
         // Filter 3: allow_from allowlist
         if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
+            log.info("discord gw msg drop: allow_from rejected author={s}", .{author_id});
             return;
         }
 
@@ -1409,7 +1424,9 @@ pub const DiscordChannel = struct {
             b.publishInbound(msg) catch |err| {
                 log.warn("Discord: failed to publish inbound message: {}", .{err});
                 msg.deinit(self.allocator);
+                return;
             };
+            log.info("discord gw msg published chat={s} bytes={d}", .{ channel_id, final_content.len });
         } else {
             // No bus configured — free the message
             msg.deinit(self.allocator);

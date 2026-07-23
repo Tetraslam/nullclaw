@@ -30,6 +30,7 @@ const memory_mod = @import("memory/root.zig");
 const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
+const agent_mod = @import("agent/root.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
@@ -1052,6 +1053,31 @@ const StreamingOutboundCtx = struct {
     emitted_chunk: bool = false,
 };
 
+const ProgressAckCtx = struct {
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    sent: bool = false,
+};
+
+fn publishProgressAck(ctx_ptr: *anyopaque, _: agent_mod.ProgressHint) void {
+    const ctx: *ProgressAckCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.sent) return;
+    ctx.sent = true;
+
+    const text = "on it, i'm working on that now.";
+    const out = if (ctx.account_id) |aid|
+        bus_mod.makeOutboundWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, text)
+    else
+        bus_mod.makeOutbound(ctx.allocator, ctx.channel, ctx.chat_id, text);
+    var message = out catch return;
+    ctx.event_bus.publishOutbound(message) catch {
+        message.deinit(ctx.allocator);
+    };
+}
+
 fn nextOutboundDraftId() u64 {
     return outbound_draft_id_counter.fetchAdd(1, .monotonic);
 }
@@ -1248,11 +1274,38 @@ fn publishInboundToWorkerQueue(
     try worker_queues[shard_index].publish(msg);
 }
 
-fn pollDebouncedInbound(
-    _: std.mem.Allocator,
+/// Route inject/drop on the dispatcher thread before parking the message on a
+/// session-sharded worker FIFO. Same-session messages share one worker, and that
+/// worker blocks inside processInboundMessage for the whole agent turn — so if a
+/// mid-turn steer only routes after dequeue, turn_running is already false and
+/// queue_mode=latest never injects (it starts a fresh turn instead).
+/// Returns true when the message was fully consumed (injected or dropped).
+fn tryConsumeInboundViaRoute(
+    allocator: std.mem.Allocator,
+    runtime: *channel_loop.ChannelRuntime,
+    msg: *const bus_mod.InboundMessage,
+) bool {
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+    var routing_plan = buildInboundRoutingPlan(allocator, runtime.config, msg, parsed_meta.fields);
+    defer routing_plan.deinit(allocator);
+    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) != .skip) {
+        return false;
+    }
+    const session_hash = std.hash.Wyhash.hash(0, routing_plan.session_key);
+    log.info(
+        "inbound pre-dispatch route skip channel={s} session=0x{x} bytes={d}",
+        .{ msg.channel, session_hash, msg.content.len },
+    );
+    return true;
+}
+
+fn pollDebouncedInboundWithRouting(
+    allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
     debouncer: *inbound_debounce.InboundDebouncer,
     ready_messages: *std.ArrayListUnmanaged(bus_mod.InboundMessage),
+    runtime: ?*channel_loop.ChannelRuntime,
 ) DebouncedInboundPollResult {
     const timeout_ms = debouncer.nextPollTimeoutMs(inbound_debounce.nowMs());
     const maybe_msg = event_bus.consumeInboundTimeout(timeout_ms) catch |err| switch (err) {
@@ -1264,6 +1317,12 @@ fn pollDebouncedInbound(
         },
     };
     if (maybe_msg) |msg| {
+        if (runtime) |rt| {
+            if (tryConsumeInboundViaRoute(allocator, rt, &msg)) {
+                msg.deinit(allocator);
+                return .idle;
+            }
+        }
         debouncer.push(msg, inbound_debounce.nowMs(), ready_messages) catch |push_err| {
             log.warn("inbound debounce push failed: {}", .{push_err});
         };
@@ -1274,6 +1333,15 @@ fn pollDebouncedInbound(
         log.warn("inbound debounce flush failed: {}", .{flush_err});
     };
     return if (ready_messages.items.len > 0) .ready else .closed;
+}
+
+fn pollDebouncedInbound(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    debouncer: *inbound_debounce.InboundDebouncer,
+    ready_messages: *std.ArrayListUnmanaged(bus_mod.InboundMessage),
+) DebouncedInboundPollResult {
+    return pollDebouncedInboundWithRouting(allocator, event_bus, debouncer, ready_messages, null);
 }
 
 fn processInboundMessage(
@@ -1330,6 +1398,17 @@ fn processInboundMessage(
         .chat_id = routing_plan.outbound_chat_id,
         .draft_id = outbound_draft_id,
     };
+    var progress_ack_ctx = ProgressAckCtx{
+        .allocator = allocator,
+        .event_bus = event_bus,
+        .channel = routing_plan.outbound_channel,
+        .account_id = routing_plan.outbound_account_id,
+        .chat_id = routing_plan.outbound_chat_id,
+    };
+    const progress_sink = agent_mod.ProgressSink{
+        .callback = publishProgressAck,
+        .ctx = @ptrCast(&progress_ack_ctx),
+    };
     var stream_sink: ?streaming.Sink = null;
     var outbound_tag_filter: streaming.TagFilter = undefined;
     if (use_streaming_outbound) {
@@ -1350,7 +1429,7 @@ fn processInboundMessage(
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
-        null,
+        progress_sink,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1500,7 +1579,7 @@ fn inboundDispatcherThread(
 
     while (true) {
         if (debouncer.enabled()) {
-            switch (pollDebouncedInbound(allocator, event_bus, &debouncer, &ready_messages)) {
+            switch (pollDebouncedInboundWithRouting(allocator, event_bus, &debouncer, &ready_messages, runtime)) {
                 .ready => {},
                 .idle => continue,
                 .closed => break,
@@ -1515,6 +1594,10 @@ fn inboundDispatcherThread(
 
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
+            if (tryConsumeInboundViaRoute(allocator, runtime, &msg)) {
+                msg.deinit(allocator);
+                continue;
+            }
             if (worker_count > 0) {
                 publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
                     msg.deinit(allocator);
@@ -1531,6 +1614,10 @@ fn inboundDispatcherThread(
     debouncer.flushAll(&ready_messages) catch {};
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
+        if (tryConsumeInboundViaRoute(allocator, runtime, &msg)) {
+            msg.deinit(allocator);
+            continue;
+        }
         if (worker_count > 0) {
             publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
                 msg.deinit(allocator);

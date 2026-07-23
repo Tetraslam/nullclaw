@@ -2191,7 +2191,14 @@ pub const SessionManager = struct {
                     log.warn("mid-turn inject failed session=0x{x} err={}", .{ session_hash, err });
                     break :blk .process;
                 };
-                break :blk if (injected) .skip else .process;
+                if (injected) {
+                    log.info(
+                        "mid-turn inject session=0x{x} bytes={d} queue_mode={s}",
+                        .{ session_hash, content.len, self.routeInput(session_key).queue_mode.toSlice() },
+                    );
+                    break :blk .skip;
+                }
+                break :blk .process;
             },
             .drop => blk: {
                 if (!self.isSessionTurnRunning(session_key)) break :blk .process;
