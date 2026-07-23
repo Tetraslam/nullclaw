@@ -353,6 +353,21 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     return .{ .proxy_arena = proxy_arena, .client = client };
 }
 
+fn responseMayHaveBody(method: std.http.Method, status_code: u16) bool {
+    if (method == .HEAD) return false;
+    if (status_code >= 100 and status_code < 200) return false;
+    return status_code != 204 and status_code != 205 and status_code != 304;
+}
+
+test "responses forbidden from carrying bodies skip body reads" {
+    try std.testing.expect(!responseMayHaveBody(.HEAD, 200));
+    try std.testing.expect(!responseMayHaveBody(.PUT, 204));
+    try std.testing.expect(!responseMayHaveBody(.POST, 205));
+    try std.testing.expect(!responseMayHaveBody(.GET, 304));
+    try std.testing.expect(responseMayHaveBody(.GET, 200));
+    try std.testing.expect(responseMayHaveBody(.POST, 400));
+}
+
 pub fn httpRequestWithStatusAndHeaders(
     allocator: Allocator,
     method: std.http.Method,
@@ -401,6 +416,14 @@ pub fn httpRequestWithStatusAndHeaders(
     var response = try req.receiveHead(&redirect_buffer);
     const response_headers = try allocator.dupe(u8, response.head.bytes);
     errdefer allocator.free(response_headers);
+    const status_code: u16 = @intFromEnum(response.head.status);
+    if (!responseMayHaveBody(method, status_code)) {
+        return .{
+            .status_code = status_code,
+            .headers = response_headers,
+            .body = try allocator.dupe(u8, ""),
+        };
+    }
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -423,7 +446,7 @@ pub fn httpRequestWithStatusAndHeaders(
 
     const response_body = aw.writer.buffer[0..aw.writer.end];
     return .{
-        .status_code = @as(u16, @intFromEnum(response.head.status)),
+        .status_code = status_code,
         .headers = response_headers,
         .body = try allocator.dupe(u8, response_body),
     };
