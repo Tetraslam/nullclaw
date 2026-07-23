@@ -2907,6 +2907,11 @@ const ProgressCollector = struct {
 };
 
 const ProbeTool = struct {
+    calls: usize = 0,
+    session_mgr: ?*SessionManager = null,
+    session_key: []const u8 = "",
+    inject_on_execute: bool = false,
+
     pub const tool_name = "probe";
     pub const tool_description = "Test probe tool";
     pub const tool_params = "{}";
@@ -2916,9 +2921,101 @@ const ProbeTool = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    pub fn execute(_: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+    pub fn execute(self: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.calls += 1;
+        if (self.inject_on_execute) {
+            _ = self.session_mgr.?.routeInbound(self.session_key, "steer after tool");
+        }
         return .{ .success = true, .output = try allocator.dupe(u8, "probe ok") };
     }
+};
+
+const ToolSteeringProvider = struct {
+    session_mgr: *SessionManager,
+    session_key: []const u8,
+    inject_before_tool: bool = false,
+    chat_calls: usize = 0,
+    user_count: usize = 0,
+    user_lens: [6]usize = [_]usize{0} ** 6,
+    user_bufs: [6][160]u8 = undefined,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *ToolSteeringProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "final response");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *ToolSteeringProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.user_count = 0;
+        for (request.messages) |message| {
+            if (message.role != .user or self.user_count >= self.user_bufs.len) continue;
+            const idx = self.user_count;
+            const len = @min(message.content.len, self.user_bufs[idx].len);
+            @memcpy(self.user_bufs[idx][0..len], message.content[0..len]);
+            self.user_lens[idx] = len;
+            self.user_count += 1;
+        }
+        if (self.chat_calls == 1) {
+            if (self.inject_before_tool) {
+                _ = self.session_mgr.routeInbound(self.session_key, "steer before tool");
+            }
+            const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-probe-1"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            tool_calls[1] = .{
+                .id = try allocator.dupe(u8, "call-probe-2"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "planning"),
+                .tool_calls = tool_calls,
+            };
+        }
+        return .{ .content = try allocator.dupe(u8, "final response") };
+    }
+
+    fn userMessage(self: *const ToolSteeringProvider, index: usize) []const u8 {
+        return self.user_bufs[index][0..self.user_lens[index]];
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "tool_steering";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
 };
 
 const SummaryFailureProvider = struct {
@@ -4747,6 +4844,95 @@ test "processMessageStreaming drains late injection before completing turn" {
     try testing.expectEqualStrings("late message", provider.userMessage(1));
     try testing.expect(!session.hasInjection());
     try testing.expectEqual(@as(u64, 1), session.turn_count);
+}
+
+test "steering during reasoning cancels proposed tools before execution" {
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    const session_key = "inject:before-tool";
+    var sm: SessionManager = undefined;
+    var provider = ToolSteeringProvider{
+        .session_mgr = &sm,
+        .session_key = session_key,
+        .inject_before_tool = true,
+    };
+    var probe = ProbeTool{};
+    const tools = [_]Tool{probe.tool()};
+    sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+
+    const response = try sm.processMessage(session_key, "initial", null);
+    defer testing.allocator.free(response);
+
+    try testing.expectEqualStrings("final response", response);
+    try testing.expectEqual(@as(usize, 0), probe.calls);
+    try testing.expectEqual(@as(usize, 2), provider.chat_calls);
+    var saw_steering = false;
+    var saw_cancelled_tool = false;
+    for (0..provider.user_count) |index| {
+        const message = provider.userMessage(index);
+        if (std.mem.eql(u8, message, "steer before tool")) saw_steering = true;
+        if (std.mem.indexOf(u8, message, "Cancelled before execution") != null) saw_cancelled_tool = true;
+    }
+    try testing.expect(saw_steering);
+    try testing.expect(saw_cancelled_tool);
+}
+
+test "steering during a tool resumes after that tool and cancels the rest" {
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    const session_key = "inject:after-tool";
+    var sm: SessionManager = undefined;
+    var provider = ToolSteeringProvider{
+        .session_mgr = &sm,
+        .session_key = session_key,
+    };
+    var probe = ProbeTool{
+        .session_mgr = &sm,
+        .session_key = session_key,
+        .inject_on_execute = true,
+    };
+    const tools = [_]Tool{probe.tool()};
+    sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+
+    const response = try sm.processMessage(session_key, "initial", null);
+    defer testing.allocator.free(response);
+
+    try testing.expectEqualStrings("final response", response);
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(@as(usize, 2), provider.chat_calls);
+    var saw_steering = false;
+    var saw_tool_result = false;
+    for (0..provider.user_count) |index| {
+        const message = provider.userMessage(index);
+        if (std.mem.eql(u8, message, "steer after tool")) saw_steering = true;
+        if (std.mem.indexOf(u8, message, "probe ok") != null) saw_tool_result = true;
+    }
+    try testing.expect(saw_steering);
+    try testing.expect(saw_tool_result);
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

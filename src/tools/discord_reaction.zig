@@ -110,7 +110,9 @@ pub const DiscordReactionTool = struct {
         defer allocator.free(url);
         const auth = try std.fmt.allocPrint(allocator, "Authorization: Bot {s}", .{account.token});
         defer allocator.free(auth);
-        const response = http_util.httpRequest(allocator, method, url, null, &.{auth}, null, null) catch
+        // std.http's bodiless path rejects PUT; Discord expects an empty PUT body.
+        const body: ?[]const u8 = if (method == .PUT) "" else null;
+        const response = http_util.httpRequest(allocator, method, url, body, &.{auth}, null, null) catch
             return ToolResult.fail("Discord reaction request failed");
         defer allocator.free(response);
 

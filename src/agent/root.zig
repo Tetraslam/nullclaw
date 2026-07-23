@@ -493,6 +493,22 @@ pub const Agent = struct {
         return null;
     }
 
+    fn appendSteeringCancelledToolResults(
+        self: *Agent,
+        results: *std.ArrayListUnmanaged(ToolExecutionResult),
+        calls: []const ParsedToolCall,
+        start: usize,
+    ) !void {
+        for (calls[start..]) |call| {
+            try results.append(self.allocator, .{
+                .name = call.name,
+                .output = "Cancelled before execution because the user added steering context. Reconsider this call after reading the following user message.",
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            });
+        }
+    }
+
     /// Initialize agent from a loaded Config.
     pub fn fromConfig(
         allocator: std.mem.Allocator,
@@ -2713,13 +2729,25 @@ pub const Agent = struct {
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
             const batch_updates_tools_md = tool_call_batch_updates_tools_md(arena, parsed_calls);
+            var steering_owned: ?[]u8 = null;
+            defer if (steering_owned) |steering| self.allocator.free(steering);
+
+            if (injection_followups < MAX_MID_TURN_INJECTION_FOLLOWUPS) {
+                steering_owned = try self.drainPendingInjection();
+            }
 
             const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
             if (self.log_tool_calls) {
                 log.info("tool-call batch session=0x{x} count={d}", .{ session_hash, parsed_calls.len });
             }
 
-            for (parsed_calls, 0..) |call, idx| {
+            var call_index: usize = 0;
+            while (call_index < parsed_calls.len and steering_owned == null) : (call_index += 1) {
+                const call = parsed_calls[call_index];
+                if (injection_followups < MAX_MID_TURN_INJECTION_FOLLOWUPS) {
+                    steering_owned = try self.drainPendingInjection();
+                    if (steering_owned != null) break;
+                }
                 if (self.isInterruptRequested()) {
                     self.freeResponseFields(&response);
                     return self.interruptedReply();
@@ -2728,7 +2756,7 @@ pub const Agent = struct {
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
-                        .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
+                        .{ session_hash, call_index + 1, call.name, call.tool_call_id orelse "-" },
                     );
                 }
 
@@ -2765,7 +2793,7 @@ pub const Agent = struct {
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                        .{ session_hash, call_index + 1, call.name, result.success, tool_duration },
                     );
                 }
 
@@ -2791,6 +2819,18 @@ pub const Agent = struct {
                 self.observer.recordEvent(&tool_event);
 
                 try results_buf.append(self.allocator, result);
+
+                if (injection_followups < MAX_MID_TURN_INJECTION_FOLLOWUPS) {
+                    steering_owned = try self.drainPendingInjection();
+                    if (steering_owned != null) {
+                        call_index += 1;
+                        break;
+                    }
+                }
+            }
+
+            if (steering_owned != null and call_index < parsed_calls.len) {
+                try self.appendSteeringCancelledToolResults(&results_buf, parsed_calls, call_index);
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -2813,6 +2853,15 @@ pub const Agent = struct {
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
+
+            if (steering_owned) |steering| {
+                steering_owned = null;
+                const safe_steering = try self.redactOwnedForHistory(steering);
+                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_steering });
+                self.trimHistory();
+                injection_followups += 1;
+                continue;
+            }
         }
 
         // ── Graceful degradation: tool iterations exhausted ──────────
