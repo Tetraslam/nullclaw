@@ -17,6 +17,7 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
+const bus_mod = @import("bus.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
@@ -1287,6 +1288,10 @@ pub const ChannelRuntime = struct {
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
+        return initWithEventBus(allocator, config, null);
+    }
+
+    pub fn initWithEventBus(allocator: std.mem.Allocator, config: *const Config, event_bus: ?*bus_mod.Bus) !*ChannelRuntime {
         var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
         errdefer runtime_provider.deinit();
 
@@ -1356,6 +1361,7 @@ pub const ChannelRuntime = struct {
             .allowed_paths = config.autonomy.allowed_paths,
             .policy = security_policy,
             .subagent_manager = subagent_manager,
+            .event_bus = event_bus,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
             .sandbox_backend = config.security.sandbox.backend,

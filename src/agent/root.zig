@@ -382,6 +382,9 @@ pub const Agent = struct {
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn.
     conversation_context: ?prompt.ConversationContext = null,
+    /// Exact SessionManager key for the current turn. Unlike memory_session_id,
+    /// this retains the channel/peer suffix for dedicated agent runtimes.
+    runtime_session_id: ?[]const u8 = null,
     /// Session-scoped active skill applied to subsequent user messages until cleared.
     active_skill_name: ?[]const u8 = null,
     active_skill_name_owned: bool = false,

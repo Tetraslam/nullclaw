@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
+const fs_compat = @import("../fs_compat.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -49,6 +50,7 @@ pub const DiscordChannel = struct {
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
+    mention_exempt_channels: []const []const u8 = &.{},
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
@@ -81,6 +83,9 @@ pub const DiscordChannel = struct {
     };
 
     pub const MAX_MESSAGE_LEN: usize = 2000;
+    const MAX_UPLOAD_FILES: usize = 10;
+    const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
+    const MAX_UPLOAD_TOTAL_BYTES: usize = 50 * 1024 * 1024;
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
@@ -126,6 +131,7 @@ pub const DiscordChannel = struct {
             .account_id = cfg.account_id,
             .allow_from = cfg.allow_from,
             .require_mention = cfg.require_mention,
+            .mention_exempt_channels = cfg.mention_exempt_channels,
             .intents = cfg.intents,
         };
     }
@@ -309,6 +315,13 @@ pub const DiscordChannel = struct {
         return false;
     }
 
+    fn isMentionExemptChannel(self: *const DiscordChannel, channel_id: []const u8) bool {
+        for (self.mention_exempt_channels) |allowed| {
+            if (std.mem.eql(u8, allowed, channel_id)) return true;
+        }
+        return false;
+    }
+
     fn isReplyToBot(d_obj: std.json.ObjectMap, bot_user_id: []const u8) bool {
         if (bot_user_id.len == 0) return false;
         const message_type = d_obj.get("type") orelse return false;
@@ -343,6 +356,233 @@ pub const DiscordChannel = struct {
         while (it.next()) |chunk| {
             try self.sendChunk(channel_id, chunk);
         }
+    }
+
+    const ParsedOutboundMessage = struct {
+        text: []u8,
+        files: [][]const u8,
+
+        fn deinit(self: *const ParsedOutboundMessage, allocator: std.mem.Allocator) void {
+            allocator.free(self.text);
+            allocator.free(self.files);
+        }
+    };
+
+    fn isAttachmentMarkerKind(kind: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(kind, "image") or
+            std.ascii.eqlIgnoreCase(kind, "photo") or
+            std.ascii.eqlIgnoreCase(kind, "document") or
+            std.ascii.eqlIgnoreCase(kind, "file") or
+            std.ascii.eqlIgnoreCase(kind, "video") or
+            std.ascii.eqlIgnoreCase(kind, "audio") or
+            std.ascii.eqlIgnoreCase(kind, "voice");
+    }
+
+    fn isRemoteAttachment(target: []const u8) bool {
+        return std.mem.startsWith(u8, target, "https://") or std.mem.startsWith(u8, target, "http://");
+    }
+
+    fn matchingBracket(text: []const u8, open: usize) ?usize {
+        var depth: usize = 1;
+        var cursor = open + 1;
+        while (cursor < text.len) : (cursor += 1) {
+            switch (text[cursor]) {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if (depth == 0) return cursor;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn appendAttachmentTarget(
+        allocator: std.mem.Allocator,
+        text: *std.ArrayListUnmanaged(u8),
+        files: *std.ArrayListUnmanaged([]const u8),
+        target: []const u8,
+    ) !void {
+        if (isRemoteAttachment(target)) {
+            if (text.items.len > 0 and text.items[text.items.len - 1] != '\n') try text.append(allocator, '\n');
+            try text.appendSlice(allocator, target);
+            return;
+        }
+        if (files.items.len >= MAX_UPLOAD_FILES) return error.TooManyAttachments;
+        try files.append(allocator, target);
+    }
+
+    fn parseOutboundMessage(
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        media: []const []const u8,
+    ) !ParsedOutboundMessage {
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer text.deinit(allocator);
+        var files: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer files.deinit(allocator);
+
+        var cursor: usize = 0;
+        while (cursor < content.len) {
+            const open = std.mem.indexOfPos(u8, content, cursor, "[") orelse {
+                try text.appendSlice(allocator, content[cursor..]);
+                break;
+            };
+            try text.appendSlice(allocator, content[cursor..open]);
+            const close = matchingBracket(content, open) orelse {
+                try text.appendSlice(allocator, content[open..]);
+                break;
+            };
+            const marker = content[open + 1 .. close];
+            const colon = std.mem.indexOfScalar(u8, marker, ':');
+            if (colon) |at| {
+                const target = std.mem.trim(u8, marker[at + 1 ..], " ");
+                if (target.len > 0 and isAttachmentMarkerKind(marker[0..at])) {
+                    try appendAttachmentTarget(allocator, &text, &files, target);
+                    cursor = close + 1;
+                    continue;
+                }
+            }
+            try text.appendSlice(allocator, content[open .. close + 1]);
+            cursor = close + 1;
+        }
+        for (media) |target| try appendAttachmentTarget(allocator, &text, &files, target);
+
+        const trimmed = std.mem.trim(u8, text.items, " \t\r\n");
+        const owned_text = try allocator.dupe(u8, trimmed);
+        errdefer allocator.free(owned_text);
+        const owned_files = try files.toOwnedSlice(allocator);
+        text.deinit(allocator);
+        return .{ .text = owned_text, .files = owned_files };
+    }
+
+    fn safeUploadFilename(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        const basename = std_compat.fs.path.basename(path);
+        const source = if (basename.len > 0) basename else "attachment";
+        const result = try allocator.dupe(u8, source);
+        for (result) |*ch| {
+            if (ch.* < 0x20 or ch.* == 0x7f or ch.* == '"' or ch.* == '\\') ch.* = '_';
+        }
+        return result;
+    }
+
+    fn appendFmt(
+        list: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        comptime format: []const u8,
+        args: anytype,
+    ) !void {
+        var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, list);
+        try allocating.writer.print(format, args);
+        list.* = allocating.toArrayList();
+    }
+
+    fn sendMultipart(
+        self: *DiscordChannel,
+        channel_id: []const u8,
+        text: []const u8,
+        files: []const []const u8,
+        components_json: ?[]const u8,
+    ) !void {
+        if (files.len == 0) return error.NoAttachments;
+        if (files.len > MAX_UPLOAD_FILES) return error.TooManyAttachments;
+
+        var filenames: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (filenames.items) |name| self.allocator.free(name);
+            filenames.deinit(self.allocator);
+        }
+        var file_data: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (file_data.items) |data| self.allocator.free(data);
+            file_data.deinit(self.allocator);
+        }
+        var total_file_bytes: usize = 0;
+        for (files) |path| {
+            const name = try safeUploadFilename(self.allocator, path);
+            filenames.append(self.allocator, name) catch |err| {
+                self.allocator.free(name);
+                return err;
+            };
+            const data = try fs_compat.readFileAlloc(std_compat.fs.cwd(), self.allocator, path, MAX_UPLOAD_FILE_BYTES);
+            total_file_bytes = std.math.add(usize, total_file_bytes, data.len) catch {
+                self.allocator.free(data);
+                return error.AttachmentsTooLarge;
+            };
+            if (total_file_bytes > MAX_UPLOAD_TOTAL_BYTES) {
+                self.allocator.free(data);
+                return error.AttachmentsTooLarge;
+            }
+            file_data.append(self.allocator, data) catch |err| {
+                self.allocator.free(data);
+                return err;
+            };
+        }
+
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.appendSlice(self.allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&payload, self.allocator, text);
+        try payload.appendSlice(self.allocator, ",\"attachments\":[");
+        for (filenames.items, 0..) |name, index| {
+            if (index > 0) try payload.append(self.allocator, ',');
+            try appendFmt(&payload, self.allocator, "{{\"id\":{d},\"filename\":", .{index});
+            try root.json_util.appendJsonString(&payload, self.allocator, name);
+            try payload.append(self.allocator, '}');
+        }
+        try payload.append(self.allocator, ']');
+        if (components_json) |components| {
+            try payload.appendSlice(self.allocator, ",\"components\":");
+            try payload.appendSlice(self.allocator, components);
+        }
+        try payload.append(self.allocator, '}');
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+        var boundary_buf: [64]u8 = undefined;
+        const boundary = try std.fmt.bufPrint(&boundary_buf, "nullclaw-{x}-{x}", .{
+            std_compat.crypto.random.int(u64),
+            std_compat.crypto.random.int(u64),
+        });
+        try appendFmt(&body, self.allocator, "--{s}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
+        try body.appendSlice(self.allocator, payload.items);
+        try body.appendSlice(self.allocator, "\r\n");
+        for (file_data.items, filenames.items, 0..) |data, name, index| {
+            try appendFmt(
+                &body,
+                self.allocator,
+                "--{s}\r\nContent-Disposition: form-data; name=\"files[{d}]\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+                .{ boundary, index, name },
+            );
+            try body.appendSlice(self.allocator, data);
+            try body.appendSlice(self.allocator, "\r\n");
+        }
+        try appendFmt(&body, self.allocator, "--{s}--\r\n", .{boundary});
+
+        var url_buf: [256]u8 = undefined;
+        const url = try sendUrl(&url_buf, channel_id);
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
+        var content_type_buf: [128]u8 = undefined;
+        const content_type = try std.fmt.bufPrint(&content_type_buf, "multipart/form-data; boundary={s}", .{boundary});
+        const resp = root.http_util.httpRequest(self.allocator, .POST, url, body.items, &.{auth_writer.buffered()}, content_type, null) catch |err| {
+            log.err("Discord API multipart POST failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        self.allocator.free(resp);
+    }
+
+    fn sendMessageWithMedia(self: *DiscordChannel, channel_id: []const u8, content: []const u8, media: []const []const u8) !void {
+        const parsed = try parseOutboundMessage(self.allocator, content, media);
+        defer parsed.deinit(self.allocator);
+        if (parsed.files.len == 0) return self.sendMessage(channel_id, parsed.text);
+        if (parsed.text.len > MAX_MESSAGE_LEN) {
+            try self.sendMessage(channel_id, parsed.text);
+            return self.sendMultipart(channel_id, "", parsed.files, null);
+        }
+        return self.sendMultipart(channel_id, parsed.text, parsed.files, null);
     }
 
     /// Send a Discord typing indicator (best-effort, errors ignored).
@@ -668,8 +908,15 @@ pub const DiscordChannel = struct {
     }
 
     fn sendRichMessage(self: *DiscordChannel, channel_id: []const u8, payload: root.Channel.OutboundPayload) !void {
-        if (payload.attachments.len > 0) return error.NotSupported;
-        if (payload.choices.len == 0) return self.sendMessage(channel_id, payload.text);
+        var media = try self.allocator.alloc([]const u8, payload.attachments.len);
+        defer self.allocator.free(media);
+        for (payload.attachments, 0..) |attachment, index| media[index] = attachment.target;
+
+        if (payload.choices.len == 0) return self.sendMessageWithMedia(channel_id, payload.text, media);
+
+        const parsed = try parseOutboundMessage(self.allocator, payload.text, media);
+        defer parsed.deinit(self.allocator);
+        if (parsed.text.len > MAX_MESSAGE_LEN) return error.MessageTooLong;
 
         var directive = try self.buildChoicesDirectiveFromPayload(payload.choices);
         defer directive.deinit(self.allocator);
@@ -679,13 +926,19 @@ pub const DiscordChannel = struct {
         const components_json = try self.buildComponentsJson(directive, token);
         defer self.allocator.free(components_json);
 
+        if (parsed.files.len > 0) {
+            try self.sendMultipart(channel_id, parsed.text, parsed.files, components_json);
+            try self.registerPendingInteraction(token, channel_id, directive);
+            return;
+        }
+
         var url_buf: [256]u8 = undefined;
         const url = try sendUrl(&url_buf, channel_id);
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(self.allocator);
         try body.appendSlice(self.allocator, "{\"content\":");
-        try root.json_util.appendJsonString(&body, self.allocator, payload.text);
+        try root.json_util.appendJsonString(&body, self.allocator, parsed.text);
         try body.appendSlice(self.allocator, ",\"components\":");
         try body.appendSlice(self.allocator, components_json);
         try body.appendSlice(self.allocator, "}");
@@ -799,9 +1052,9 @@ pub const DiscordChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+        try self.sendMessageWithMedia(target, message, media);
     }
 
     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
@@ -1263,6 +1516,11 @@ pub const DiscordChannel = struct {
             else => null,
         } else null;
 
+        const message_id: ?[]const u8 = if (d_obj.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
         // Extract author object
         const author_obj = if (d_obj.get("author")) |v| switch (v) {
             .object => |o| o,
@@ -1295,7 +1553,7 @@ pub const DiscordChannel = struct {
 
         // Extract author.global_name (Discord display name)
         const author_display_name: ?[]const u8 = if (author_obj.get("global_name")) |v| switch (v) {
-            .string => |s| s,
+            .string => |s| if (s.len > 0) s else null,
             else => null,
         } else null;
 
@@ -1312,7 +1570,7 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 2: require_mention for guild (non-DM) messages
-        if (self.require_mention and guild_id != null) {
+        if (self.require_mention and guild_id != null and !self.isMentionExemptChannel(channel_id)) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid) and !isReplyToBot(d_obj, bot_uid)) {
                 log.info("discord gw msg drop: mention required channel={s}", .{channel_id});
@@ -1330,6 +1588,13 @@ pub const DiscordChannel = struct {
         var content_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer content_buf.deinit(self.allocator);
 
+        const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
+        if (guild_id != null and (trimmed_content.len == 0 or trimmed_content[0] != '/')) {
+            const speaker = author_display_name orelse author_username orelse author_id;
+            content_buf.appendSlice(self.allocator, "[") catch {};
+            content_buf.appendSlice(self.allocator, speaker) catch {};
+            content_buf.appendSlice(self.allocator, "]: ") catch {};
+        }
         if (content.len > 0) {
             content_buf.appendSlice(self.allocator, content) catch {};
         }
@@ -1397,6 +1662,14 @@ pub const DiscordChannel = struct {
         if (guild_id) |gid| {
             try mw.writeAll(",\"guild_id\":");
             try root.appendJsonStringW(mw, gid);
+        }
+        if (message_id) |mid| {
+            try mw.writeAll(",\"message_id\":");
+            try root.appendJsonStringW(mw, mid);
+        }
+        if (self.bot_user_id) |bot_uid| {
+            try mw.writeAll(",\"bot_user_id\":");
+            try root.appendJsonStringW(mw, bot_uid);
         }
         if (author_username) |uname| {
             try mw.writeAll(",\"sender_username\":");
@@ -2009,6 +2282,58 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
 
     try ch.handleMessageCreate(parsed.value);
     try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord natural channel bypasses mention gate and preserves speaker" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+        .mention_exempt_channels = &.{"natural-1"},
+        .allow_from = &.{"u-2"},
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"id":"msg-42","channel_id":"natural-1","guild_id":"g-2","content":"plain text","author":{"id":"u-2","username":"alice","global_name":"Alice","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    var msg = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("[Alice]: plain text", msg.content);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"message_id\":\"msg-42\"") != null);
+}
+
+test "discord outbound parser extracts local files and preserves remote media as links" {
+    const alloc = std.testing.allocator;
+    const media = [_][]const u8{"https://example.com/report.pdf"};
+    const parsed = try DiscordChannel.parseOutboundMessage(
+        alloc,
+        "result\n[IMAGE:/tmp/chart.png]",
+        &media,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("result\nhttps://example.com/report.pdf", parsed.text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.files.len);
+    try std.testing.expectEqualStrings("/tmp/chart.png", parsed.files[0]);
+}
+
+test "discord outbound parser accepts brackets in attachment paths" {
+    const alloc = std.testing.allocator;
+    const parsed = try DiscordChannel.parseOutboundMessage(alloc, "[IMAGE:/tmp/chart[1].png]", &.{});
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("", parsed.text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.files.len);
+    try std.testing.expectEqualStrings("/tmp/chart[1].png", parsed.files[0]);
 }
 
 test "discord handleMessageCreate require_mention accepts reply to bot message" {

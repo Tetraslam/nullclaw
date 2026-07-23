@@ -11,6 +11,11 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const bus = @import("../bus.zig");
 
+threadlocal var turn_default_channel: ?[]const u8 = null;
+threadlocal var turn_default_account_id: ?[]const u8 = null;
+threadlocal var turn_default_chat_id: ?[]const u8 = null;
+threadlocal var turn_message_sent: bool = false;
+
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
     event_bus: ?*bus.Bus = null,
@@ -25,10 +30,17 @@ pub const MessageTool = struct {
     pub const tool_name = "message";
     pub const tool_description = "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation. Content supports attachment markers like [FILE:/abs/path], [DOCUMENT:/abs/path], [IMAGE:/abs/path] on marker-aware channels.";
     pub const tool_params =
-        \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
+        \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"account_id":{"type":"string","description":"Target channel account. Defaults to the current account when sending to the current channel."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
+
+    pub const TurnContext = struct {
+        channel: ?[]const u8,
+        account_id: ?[]const u8,
+        chat_id: ?[]const u8,
+        message_sent: bool,
+    };
 
     pub fn tool(self: *MessageTool) Tool {
         return .{
@@ -38,15 +50,31 @@ pub const MessageTool = struct {
     }
 
     /// Set the context for the current turn (called before agent.turn).
-    pub fn setContext(self: *MessageTool, channel: ?[]const u8, chat_id: ?[]const u8) void {
-        self.default_channel = channel;
-        self.default_chat_id = chat_id;
-        self.sent_in_round = false;
+    pub fn setContext(_: *MessageTool, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8) TurnContext {
+        const previous = TurnContext{
+            .channel = turn_default_channel,
+            .account_id = turn_default_account_id,
+            .chat_id = turn_default_chat_id,
+            .message_sent = turn_message_sent,
+        };
+        turn_default_channel = channel;
+        turn_default_account_id = account_id;
+        turn_default_chat_id = chat_id;
+        turn_message_sent = false;
+        return previous;
+    }
+
+    pub fn restoreContext(previous: TurnContext) void {
+        turn_default_channel = previous.channel;
+        turn_default_account_id = previous.account_id;
+        turn_default_chat_id = previous.chat_id;
+        turn_message_sent = previous.message_sent;
     }
 
     /// Check if a message was sent during this round.
     pub fn hasMessageBeenSent(self: *const MessageTool) bool {
-        return self.sent_in_round;
+        _ = self;
+        return turn_message_sent;
     }
 
     pub fn execute(self: *MessageTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -56,25 +84,44 @@ pub const MessageTool = struct {
         if (std.mem.trim(u8, content, " \t\n\r").len == 0)
             return ToolResult.fail("'content' must not be empty");
 
-        const channel = root.getString(args, "channel") orelse
-            (self.default_channel orelse
+        const explicit_channel = root.getString(args, "channel");
+        const channel = explicit_channel orelse
+            (turn_default_channel orelse self.default_channel orelse
                 return ToolResult.fail("No channel specified and no default channel set"));
 
-        const chat_id = root.getString(args, "chat_id") orelse
-            (self.default_chat_id orelse
-                return ToolResult.fail("No chat_id specified and no default chat_id set"));
+        const chat_id = root.getString(args, "chat_id") orelse blk: {
+            if (explicit_channel != null) {
+                const default_channel = turn_default_channel orelse self.default_channel;
+                if (default_channel == null or !std.mem.eql(u8, channel, default_channel.?)) {
+                    return ToolResult.fail("No chat_id specified for the target channel");
+                }
+            }
+            break :blk turn_default_chat_id orelse self.default_chat_id orelse
+                return ToolResult.fail("No chat_id specified and no default chat_id set");
+        };
 
         const event_bus = self.event_bus orelse
             return ToolResult.fail("Message tool not connected to event bus");
 
-        const msg = bus.makeOutbound(allocator, channel, chat_id, content) catch
-            return ToolResult.fail("Failed to create outbound message");
+        const account_id = root.getString(args, "account_id") orelse blk: {
+            if (turn_default_channel) |default_channel| {
+                if (std.mem.eql(u8, channel, default_channel)) break :blk turn_default_account_id;
+            }
+            break :blk null;
+        };
+        const msg = if (account_id) |target_account|
+            bus.makeOutboundWithAccount(allocator, channel, target_account, chat_id, content) catch
+                return ToolResult.fail("Failed to create outbound message")
+        else
+            bus.makeOutbound(allocator, channel, chat_id, content) catch
+                return ToolResult.fail("Failed to create outbound message");
 
         event_bus.publishOutbound(msg) catch {
             msg.deinit(allocator);
             return ToolResult.fail("Bus is closed, cannot send message");
         };
 
+        turn_message_sent = true;
         self.sent_in_round = true;
 
         const result = std.fmt.allocPrint(
@@ -176,13 +223,24 @@ test "MessageTool execute with explicit channel overrides default" {
 }
 
 test "MessageTool setContext and hasMessageBeenSent" {
-    var mt = MessageTool{};
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus };
     try testing.expect(!mt.hasMessageBeenSent());
 
-    mt.setContext("telegram", "c1");
-    try testing.expectEqualStrings("telegram", mt.default_channel.?);
-    try testing.expectEqualStrings("c1", mt.default_chat_id.?);
+    const previous = mt.setContext("telegram", "main", "c1");
+    defer MessageTool.restoreContext(previous);
     try testing.expect(!mt.hasMessageBeenSent());
+
+    const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+
+    var msg = event_bus.consumeOutbound().?;
+    defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("main", msg.account_id.?);
 }
 
 test "MessageTool sent_in_round is set after successful send" {
@@ -203,12 +261,45 @@ test "MessageTool sent_in_round is set after successful send" {
     try testing.expect(mt.hasMessageBeenSent());
 
     // Reset on setContext
-    mt.setContext("discord", "c2");
+    const previous = mt.setContext("discord", "main", "c2");
+    defer MessageTool.restoreContext(previous);
     try testing.expect(!mt.hasMessageBeenSent());
 
     // Consume bus message
     var msg = event_bus.consumeOutbound().?;
     msg.deinit(testing.allocator);
+}
+
+test "MessageTool explicit cross-channel send does not inherit current account" {
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus };
+    const previous = mt.setContext("discord", "discord-main", "room1");
+    defer MessageTool.restoreContext(previous);
+
+    const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"telegram\",\"chat_id\":\"chat1\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+
+    var msg = event_bus.consumeOutbound().?;
+    defer msg.deinit(testing.allocator);
+    try testing.expect(msg.account_id == null);
+}
+
+test "MessageTool explicit cross-channel send requires chat id" {
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus };
+    const previous = mt.setContext("discord", "discord-main", "room1");
+    defer MessageTool.restoreContext(previous);
+
+    const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"telegram\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("No chat_id specified for the target channel", result.error_msg.?);
 }
 
 test "MessageTool no channel and no default fails" {

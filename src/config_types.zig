@@ -645,6 +645,7 @@ pub const DiscordConfig = struct {
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
+    mention_exempt_channels: []const []const u8 = &.{},
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 
@@ -1195,6 +1196,14 @@ pub const ChannelsConfig = struct {
     }
     pub fn discordPrimary(self: *const ChannelsConfig) ?DiscordConfig {
         return primaryAccount(DiscordConfig, self.discord);
+    }
+    pub fn discordAccount(self: *const ChannelsConfig, account_id: ?[]const u8) ?DiscordConfig {
+        if (account_id) |wanted| {
+            for (self.discord) |account| {
+                if (std.mem.eql(u8, account.account_id, wanted)) return account;
+            }
+        }
+        return self.discordPrimary();
     }
     pub fn slackPrimary(self: *const ChannelsConfig) ?SlackConfig {
         return primaryAccount(SlackConfig, self.slack);

@@ -6975,7 +6975,7 @@ test "parse telegram accounts accepts numeric group_allow_from" {
 test "parse discord accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "require_mention": true}}}}}
+        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "require_mention": true, "mention_exempt_channels": ["67890"]}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6985,11 +6985,14 @@ test "parse discord accounts" {
     try std.testing.expectEqualStrings("disc-tok", dc.token);
     try std.testing.expectEqualStrings("12345", dc.guild_id.?);
     try std.testing.expect(dc.require_mention);
+    try std.testing.expectEqualStrings("67890", dc.mention_exempt_channels[0]);
     allocator.free(dc.account_id);
     allocator.free(dc.token);
     allocator.free(dc.guild_id.?);
     for (dc.allow_from) |u| allocator.free(u);
     allocator.free(dc.allow_from);
+    for (dc.mention_exempt_channels) |channel| allocator.free(channel);
+    allocator.free(dc.mention_exempt_channels);
     allocator.free(cfg.channels.discord);
 }
 

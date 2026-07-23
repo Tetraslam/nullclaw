@@ -25,6 +25,7 @@ pub const HELP_TEXT =
     \\Session:
     \\  /menu, /help, /commands
     \\  /new, /reset [model], /restart [model]
+    \\  /thread  Archive this conversation and start fresh
     \\  /status, /whoami, /id, /compact
     \\  /stop, /abort
     \\

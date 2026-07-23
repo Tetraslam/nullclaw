@@ -23,6 +23,7 @@ const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
 const util = @import("../util.zig");
 const cost_mod = @import("../cost.zig");
+const thread_boundary = @import("../thread_boundary.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -49,6 +50,7 @@ pub const TurnInputPlan = struct {
 
 const SlashCommandKind = enum {
     new_reset,
+    thread,
     restart,
     help,
     status,
@@ -95,6 +97,7 @@ const SlashCommandKind = enum {
 
 fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
+    if (isSlashName(cmd, "thread")) return .thread;
     if (isSlashName(cmd, "restart")) return .restart;
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
     if (isSlashName(cmd, "status")) return .status;
@@ -140,7 +143,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
 }
 
 fn slashCommandClearsSession(kind: SlashCommandKind) bool {
-    return kind == .new_reset or kind == .restart;
+    return kind == .new_reset or kind == .thread or kind == .restart;
 }
 
 pub fn planTurnInput(message: []const u8) TurnInputPlan {
@@ -1036,6 +1039,13 @@ test "planTurnInput keeps unknown slash-prefixed text on llm path" {
 test "planTurnInput keeps known slash commands local-only" {
     const plan = planTurnInput("/help");
     try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput routes thread through archive handler and persistence clear" {
+    const plan = planTurnInput("/thread");
+    try std.testing.expect(plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);
 }
@@ -3941,6 +3951,53 @@ fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(self.allocator, "Session exported to: {s}", .{path});
 }
 
+fn handleThreadCommand(self: anytype) ![]const u8 {
+    const session_key = if (@hasField(@TypeOf(self.*), "runtime_session_id"))
+        self.runtime_session_id orelse self.memory_session_id orelse return try self.allocator.dupe(u8, "Cannot start a thread without a session key.")
+    else if (@hasField(@TypeOf(self.*), "memory_session_id"))
+        self.memory_session_id orelse return try self.allocator.dupe(u8, "Cannot start a thread without a session key.")
+    else
+        return try self.allocator.dupe(u8, "Thread archives are unavailable in this runtime.");
+
+    const memory = if (@hasField(@TypeOf(self.*), "mem"))
+        self.mem orelse return try self.allocator.dupe(u8, "Cannot archive this thread: memory is unavailable.")
+    else
+        return try self.allocator.dupe(u8, "Cannot archive this thread: memory is unavailable.");
+
+    var transcript: std.ArrayListUnmanaged(u8) = .empty;
+    defer transcript.deinit(self.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &transcript);
+    const w = &aw.writer;
+    for (self.history.items) |entry| {
+        const role = switch (entry.role) {
+            .user => "user",
+            .assistant => "tetrapod",
+            else => continue,
+        };
+        try w.print("{s}: {s}\n\n", .{ role, entry.content });
+    }
+    transcript = aw.toArrayList();
+
+    const timestamp = std_compat.time.timestamp();
+    const key = try std.fmt.allocPrint(self.allocator, "archive:conversation:{x}:{d}", .{ std.hash.Wyhash.hash(0, session_key), timestamp });
+    defer self.allocator.free(key);
+    try memory.store(key, transcript.items, .{ .custom = "archive" }, null);
+    if (@hasField(@TypeOf(self.*), "mem_rt")) {
+        if (self.mem_rt) |rt| rt.syncVectorAfterStore(self.allocator, key, transcript.items, null);
+    }
+
+    if (self.conversation_context) |ctx| {
+        if (ctx.channel != null and std.mem.eql(u8, ctx.channel.?, "discord")) {
+            const message_id = ctx.message_id orelse
+                return try self.allocator.dupe(u8, "Cannot start a Discord thread without a message boundary.");
+            try thread_boundary.save(self.allocator, self.workspace_dir, session_key, message_id);
+        }
+    }
+
+    clearSessionState(self);
+    return try self.allocator.dupe(u8, "New thread started. The previous conversation is archived and searchable.");
+}
+
 fn handleSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     const sub = it.next() orelse return try std.fmt.allocPrint(self.allocator, "Session TTL: {s}", .{if (self.session_ttl_secs) |_| "set" else "off"});
@@ -5430,6 +5487,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             }
             return try self.allocator.dupe(u8, "Session cleared.");
         },
+        .thread => return try handleThreadCommand(self),
         .restart => {
             clearSessionState(self);
             resetRuntimeCommandState(self);

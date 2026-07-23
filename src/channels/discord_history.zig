@@ -19,6 +19,9 @@ pub const HistoryMessage = struct {
     id: []const u8,
     /// Author user id (snowflake), for role remapping by the caller.
     author_id: []const u8,
+    /// Best available Discord display name for shared-channel transcripts.
+    author_name: []const u8,
+    is_bot: bool,
 };
 
 fn authHeader(allocator: Allocator, token: []const u8) ![]u8 {
@@ -89,6 +92,7 @@ pub fn fetchChannelHistory(
             allocator.free(m.content);
             allocator.free(m.id);
             allocator.free(m.author_id);
+            allocator.free(m.author_name);
         }
         out.deinit(allocator);
     }
@@ -125,7 +129,22 @@ pub fn fetchChannelHistory(
             else => continue,
         };
 
-        const is_bot = std.mem.eql(u8, author_id, bot_user_id);
+        const author_name: []const u8 = blk: {
+            if (author.object.get("global_name")) |name| {
+                if (name == .string and name.string.len > 0) break :blk name.string;
+            }
+            if (author.object.get("username")) |name| {
+                if (name == .string and name.string.len > 0) break :blk name.string;
+            }
+            break :blk author_id;
+        };
+
+        const is_bot = if (bot_user_id.len > 0)
+            std.mem.eql(u8, author_id, bot_user_id)
+        else if (author.object.get("bot")) |bot|
+            bot == .bool and bot.bool
+        else
+            false;
         const role: []const u8 = if (is_bot) "assistant" else "user";
 
         try out.append(allocator, .{
@@ -133,6 +152,8 @@ pub fn fetchChannelHistory(
             .content = try allocator.dupe(u8, content),
             .id = try allocator.dupe(u8, id),
             .author_id = try allocator.dupe(u8, author_id),
+            .author_name = try allocator.dupe(u8, author_name),
+            .is_bot = is_bot,
         });
     }
 

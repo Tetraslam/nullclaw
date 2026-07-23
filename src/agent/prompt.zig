@@ -126,6 +126,8 @@ pub const ConversationContext = struct {
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
     // Shared
+    message_id: ?[]const u8 = null,
+    bot_user_id: ?[]const u8 = null,
     delivery_chat_id: ?[]const u8 = null,
     peer_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
@@ -159,6 +161,8 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
     const sender_id = normalizeOptionalString(args.sender_id);
     const sender_username = normalizeOptionalString(args.sender_username);
     const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const message_id = normalizeOptionalString(args.message_id);
+    const bot_user_id = normalizeOptionalString(args.bot_user_id);
     const delivery_chat_id = normalizeOptionalString(args.delivery_chat_id);
     const peer_id = normalizeOptionalString(args.peer_id);
     const is_group = args.is_group;
@@ -175,7 +179,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         sender_name != null or
         sender_username != null or
         sender_display_name != null;
-    const has_scope = account_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null;
+    const has_scope = account_id != null or message_id != null or bot_user_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null;
     if (channel == null and !has_sender_identity and !has_scope) return null;
 
     return .{
@@ -187,6 +191,8 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .sender_id = sender_id,
         .sender_username = sender_username,
         .sender_display_name = sender_display_name,
+        .message_id = message_id,
+        .bot_user_id = bot_user_id,
         .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .group_id = group_id,

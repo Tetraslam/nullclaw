@@ -30,7 +30,6 @@ const memory_mod = @import("memory/root.zig");
 const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
-const agent_mod = @import("agent/root.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
@@ -688,6 +687,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("message_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.message_id = v.string;
         }
+        if (pm.value.object.get("bot_user_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.bot_user_id = v.string;
+        }
         if (pm.value.object.get("replace_message")) |v| {
             if (v == .bool) parsed.fields.replace_message = v.bool;
         }
@@ -763,6 +765,8 @@ fn buildInboundConversationContext(
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
+        .message_id = meta.message_id,
+        .bot_user_id = meta.bot_user_id,
         .delivery_chat_id = if (msg.chat_id.len > 0) msg.chat_id else null,
         .peer_id = meta.peer_id orelse if (derived_peer) |peer| peer.id else if (has_scope) msg.chat_id else null,
         .group_id = group_id,
@@ -1052,31 +1056,6 @@ const StreamingOutboundCtx = struct {
     draft_id: u64 = 0,
     emitted_chunk: bool = false,
 };
-
-const ProgressAckCtx = struct {
-    allocator: std.mem.Allocator,
-    event_bus: *bus_mod.Bus,
-    channel: []const u8,
-    account_id: ?[]const u8,
-    chat_id: []const u8,
-    sent: bool = false,
-};
-
-fn publishProgressAck(ctx_ptr: *anyopaque, _: agent_mod.ProgressHint) void {
-    const ctx: *ProgressAckCtx = @ptrCast(@alignCast(ctx_ptr));
-    if (ctx.sent) return;
-    ctx.sent = true;
-
-    const text = "on it, i'm working on that now.";
-    const out = if (ctx.account_id) |aid|
-        bus_mod.makeOutboundWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, text)
-    else
-        bus_mod.makeOutbound(ctx.allocator, ctx.channel, ctx.chat_id, text);
-    var message = out catch return;
-    ctx.event_bus.publishOutbound(message) catch {
-        message.deinit(ctx.allocator);
-    };
-}
 
 fn nextOutboundDraftId() u64 {
     return outbound_draft_id_counter.fetchAdd(1, .monotonic);
@@ -1398,17 +1377,6 @@ fn processInboundMessage(
         .chat_id = routing_plan.outbound_chat_id,
         .draft_id = outbound_draft_id,
     };
-    var progress_ack_ctx = ProgressAckCtx{
-        .allocator = allocator,
-        .event_bus = event_bus,
-        .channel = routing_plan.outbound_channel,
-        .account_id = routing_plan.outbound_account_id,
-        .chat_id = routing_plan.outbound_chat_id,
-    };
-    const progress_sink = agent_mod.ProgressSink{
-        .callback = publishProgressAck,
-        .ctx = @ptrCast(&progress_ack_ctx),
-    };
     var stream_sink: ?streaming.Sink = null;
     var outbound_tag_filter: streaming.TagFilter = undefined;
     if (use_streaming_outbound) {
@@ -1429,7 +1397,7 @@ fn processInboundMessage(
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
-        progress_sink,
+        null,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1776,7 +1744,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
                 .{config.default_provider},
             ) catch {};
         } else {
-            channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
+            channel_rt = channel_loop.ChannelRuntime.initWithEventBus(allocator, config, &event_bus) catch |err| blk: {
                 state.markError("channels", @errorName(err));
                 health.markComponentError("channels", "runtime init failed");
                 stdout.print(

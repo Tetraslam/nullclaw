@@ -79,6 +79,7 @@ pub const InboundMetadata = struct {
     peer_kind: ?agent_routing.ChatType = null,
     peer_id: ?[]const u8 = null,
     message_id: ?[]const u8 = null,
+    bot_user_id: ?[]const u8 = null,
     replace_message: ?bool = null,
     guild_id: ?[]const u8 = null,
     team_id: ?[]const u8 = null,

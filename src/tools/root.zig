@@ -363,6 +363,7 @@ pub fn allTools(
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
+        event_bus: ?*@import("../bus.zig").Bus = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
@@ -520,6 +521,12 @@ pub fn allTools(
     const scht = try allocator.create(schedule.ScheduleTool);
     scht.* = .{};
     try list.append(allocator, scht.tool());
+
+    if (opts.event_bus) |event_bus| {
+        const mt = try allocator.create(message.MessageTool);
+        mt.* = .{ .event_bus = event_bus };
+        try list.append(allocator, mt.tool());
+    }
 
     // Spawn tool (async subagent)
     const sp = try allocator.create(spawn.SpawnTool);

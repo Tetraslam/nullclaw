@@ -39,6 +39,7 @@ const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const discord_history = @import("channels/discord_history.zig");
+const thread_boundary = @import("thread_boundary.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const log = std.log.scoped(.session);
@@ -1183,7 +1184,7 @@ pub const SessionManager = struct {
         tools: []const Tool,
         session_key: []const u8,
         conversation_context: ?ConversationContext,
-    ) void {
+    ) ?tools_mod.message.MessageTool.TurnContext {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
         const chat_id = if (conversation_context) |ctx|
             ctx.delivery_chat_id orelse parsePeerIdFromSessionKey(session_key)
@@ -1207,12 +1208,17 @@ pub const SessionManager = struct {
             break :blk chat_id;
         } else chat_id;
 
+        var previous_message_context: ?tools_mod.message.MessageTool.TurnContext = null;
         for (tools) |tool| {
             if (std.mem.eql(u8, tool.name(), "schedule")) {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
                 schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, null);
+            } else if (std.mem.eql(u8, tool.name(), "message")) {
+                const message_tool: *tools_mod.message.MessageTool = @ptrCast(@alignCast(tool.ptr));
+                previous_message_context = message_tool.setContext(channel, account_id, chat_id);
             }
         }
+        return previous_message_context;
     }
 
     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
@@ -1502,7 +1508,7 @@ pub const SessionManager = struct {
             }
         }
 
-        // Hydrate DM history is deferred until the first inbound message of this
+        // Discord history hydration is deferred until the first inbound message of this
         // in-memory session, when we have the Discord channel_id in hand.
         // (POST /users/@me/channels 403s for bots without a pre-opened DM.)
 
@@ -1510,18 +1516,40 @@ pub const SessionManager = struct {
         return session;
     }
 
-    /// Token budget for hydrated DM history (~128k tokens, well under the
+    /// Token budget for hydrated Discord history (~128k tokens, well under the
     /// model's context so we don't run full-context on every cold start).
     const HYDRATE_MAX_TOKENS: u64 = 128_000;
     /// How many recent channel messages to pull per hydration attempt.
     const HYDRATE_FETCH_LIMIT: u32 = 100;
 
-    /// On the first inbound message of an in-memory Discord DM session, pull
+    fn historyContainsDiscordMessage(
+        session: *Session,
+        message: discord_history.HistoryMessage,
+        is_group: bool,
+    ) bool {
+        const expected_role: providers.Role = if (message.is_bot) .assistant else .user;
+        for (session.agent.history.items) |entry| {
+            if (entry.role != expected_role) continue;
+            if (!is_group or message.is_bot) {
+                if (std.mem.eql(u8, entry.content, message.content)) return true;
+                continue;
+            }
+            const prefix_len = message.author_name.len + 4; // [name]:
+            if (entry.content.len != prefix_len + message.content.len) continue;
+            if (entry.content[0] != '[') continue;
+            if (!std.mem.eql(u8, entry.content[1 .. 1 + message.author_name.len], message.author_name)) continue;
+            if (!std.mem.eql(u8, entry.content[1 + message.author_name.len .. prefix_len], "]: ")) continue;
+            if (std.mem.eql(u8, entry.content[prefix_len..], message.content)) return true;
+        }
+        return false;
+    }
+
+    /// On the first inbound message of an in-memory Discord session, pull
     /// recent channel history via REST using the channel_id from the join
     /// (delivered as conversation_context.delivery_chat_id) and append any
     /// messages not already in store-restored history. Best-effort; errors never
-    /// block a turn. Skips groups and re-runs.
-    fn hydrateDiscordDmHistory(
+    /// block a turn. Guild hydration is limited to configured natural channels.
+    fn hydrateDiscordHistory(
         self: *SessionManager,
         session_key: []const u8,
         session: *Session,
@@ -1530,44 +1558,52 @@ pub const SessionManager = struct {
         if (session.history_hydrated) return;
         session.history_hydrated = true; // one shot even if fetch fails (avoids retry storms)
 
-        // Only Discord DMs.
+        // Only Discord sessions.
         if (std.mem.indexOf(u8, session_key, "discord:") == null) return;
-        if (std.mem.indexOf(u8, session_key, "direct:") == null) return;
-        // Prefer metadata; fall back to key shape.
-        if (conversation_context) |ctx| {
-            if (ctx.is_group) |g| if (g) return;
-        }
+        const is_group = if (conversation_context) |ctx| ctx.is_group orelse false else false;
 
         const channel_id = blk: {
             if (conversation_context) |ctx| {
                 if (ctx.delivery_chat_id) |id| if (id.len > 0) break :blk id;
-                if (ctx.peer_id) |id| if (id.len > 0 and (ctx.is_group == null or ctx.is_group == false)) break :blk id;
+                if (ctx.peer_id) |id| if (id.len > 0) break :blk id;
             }
             log.warn("hydration: skip {s} — no delivery_chat_id in conversation context", .{session_key});
             return;
         };
 
-        // Peer user id from session key (...direct:<user>).
-        const user_id = blk: {
+        // Peer user id from DM session keys (...direct:<user>).
+        const user_id: ?[]const u8 = if (!is_group) blk: {
             const marker = "direct:";
             const at = std.mem.indexOf(u8, session_key, marker) orelse return;
             break :blk session_key[at + marker.len ..];
-        };
-        if (user_id.len == 0) return;
+        } else null;
+        if (user_id) |id| if (id.len == 0) return;
 
-        const dc = self.config.channels.discordPrimary() orelse {
+        const account_id = if (conversation_context) |ctx| ctx.account_id else null;
+        const dc = self.config.channels.discordAccount(account_id) orelse {
             log.warn("hydration: no discord account configured", .{});
             return;
         };
 
-        log.info("hydration: fetch channel={s} peer={s}", .{ channel_id, user_id });
+        if (is_group) {
+            var natural_channel = false;
+            for (dc.mention_exempt_channels) |allowed| {
+                if (std.mem.eql(u8, allowed, channel_id)) {
+                    natural_channel = true;
+                    break;
+                }
+            }
+            if (!natural_channel) return;
+        }
+
+        log.info("hydration: fetch channel={s} scope={s}", .{ channel_id, if (is_group) "guild" else "dm" });
 
         const msgs = discord_history.fetchChannelHistory(
             self.allocator,
             dc.token,
             channel_id,
             HYDRATE_FETCH_LIMIT,
-            "",
+            if (conversation_context) |ctx| ctx.bot_user_id orelse "" else "",
         ) catch |err| {
             log.warn("hydration: fetch history failed for {s}: {}", .{ session_key, err });
             return;
@@ -1578,24 +1614,26 @@ pub const SessionManager = struct {
                 self.allocator.free(m.content);
                 self.allocator.free(m.id);
                 self.allocator.free(m.author_id);
+                self.allocator.free(m.author_name);
             }
             self.allocator.free(msgs);
-        }
-
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen.deinit(self.allocator);
-        for (session.agent.history.items) |entry| {
-            seen.put(self.allocator, entry.content, {}) catch {};
         }
 
         var to_add: std.ArrayListUnmanaged(discord_history.HistoryMessage) = .empty;
         defer to_add.deinit(self.allocator);
         var tokens: u64 = 0;
+        const boundary = thread_boundary.load(self.allocator, session.agent.workspace_dir, session_key);
+        defer if (boundary) |value| self.allocator.free(value);
         var i: usize = msgs.len;
         while (i > 0 and tokens < HYDRATE_MAX_TOKENS) {
             i -= 1;
             const m = msgs[i];
-            if (seen.contains(m.content)) continue;
+            if (boundary) |value| {
+                const message_num = std.fmt.parseInt(u64, m.id, 10) catch continue;
+                const boundary_num = std.fmt.parseInt(u64, value, 10) catch continue;
+                if (message_num <= boundary_num) continue;
+            }
+            if (historyContainsDiscordMessage(session, m, is_group)) continue;
             const t = discord_history.estimateTokens(m.content);
             if (tokens + t > HYDRATE_MAX_TOKENS) break;
             tokens += t;
@@ -1603,8 +1641,11 @@ pub const SessionManager = struct {
         }
 
         for (to_add.items) |m| {
-            const role: providers.Role = if (std.mem.eql(u8, m.author_id, user_id)) .user else .assistant;
-            const content = session.agent.allocator.dupe(u8, m.content) catch continue;
+            const role: providers.Role = if (m.is_bot) .assistant else .user;
+            const content = if (is_group and !m.is_bot)
+                std.fmt.allocPrint(session.agent.allocator, "[{s}]: {s}", .{ m.author_name, m.content }) catch continue
+            else
+                session.agent.allocator.dupe(u8, m.content) catch continue;
             session.agent.history.append(session.agent.allocator, .{
                 .role = role,
                 .content = content,
@@ -1623,11 +1664,11 @@ pub const SessionManager = struct {
             var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
             const w = &aw.writer;
             w.writeAll(
-                \\[recovered discord dm transcript — these are real prior messages in this conversation, restored after a process restart. treat them as your memory of this thread.]
+                \\[recovered discord transcript — these are real prior messages in this conversation, restored after a process restart. treat them as your memory of this thread.]
                 \\
             ) catch {};
             for (to_add.items) |m| {
-                const label = if (std.mem.eql(u8, m.author_id, user_id)) "user" else "you (tetrapod)";
+                const label = if (m.is_bot) "you (tetrapod)" else if (is_group) m.author_name else "user";
                 w.print("{s}: {s}\n\n", .{ label, m.content }) catch {};
             }
             buf = aw.toArrayList();
@@ -1885,7 +1926,7 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
     ) !?[]const u8 {
         const session = try self.getOrCreate(session_key);
-        self.hydrateDiscordDmHistory(session_key, session, conversation_context);
+        self.hydrateDiscordHistory(session_key, session, conversation_context);
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
@@ -1897,7 +1938,10 @@ pub const SessionManager = struct {
 
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
-        setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        session.agent.runtime_session_id = session_key;
+        defer session.agent.runtime_session_id = null;
+        const previous_message_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        defer if (previous_message_context) |previous| tools_mod.message.MessageTool.restoreContext(previous);
 
         const maybe_response = try session.agent.handleSlashCommand(content);
         if (maybe_response == null) return null;
@@ -1969,7 +2013,7 @@ pub const SessionManager = struct {
         }
 
         const session = try self.getOrCreate(session_key);
-        self.hydrateDiscordDmHistory(session_key, session, conversation_context);
+        self.hydrateDiscordHistory(session_key, session, conversation_context);
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
@@ -1982,7 +2026,10 @@ pub const SessionManager = struct {
         // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
-        setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        session.agent.runtime_session_id = session_key;
+        defer session.agent.runtime_session_id = null;
+        const previous_message_context = setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        defer if (previous_message_context) |previous| tools_mod.message.MessageTool.restoreContext(previous);
 
         const prev_stream_callback = session.agent.stream_callback;
         const prev_stream_ctx = session.agent.stream_ctx;
@@ -4722,7 +4769,7 @@ test "setTurnToolContext prefers delivery chat target over direct peer session i
 
     // Regression: Discord DM sessions are keyed by author ID, but scheduled
     // delivery must target the DM channel ID for outbound sends.
-    SessionManager.setTurnToolContext(&tools, "agent:main:discord:direct:user-42", conversation_context);
+    _ = SessionManager.setTurnToolContext(&tools, "agent:main:discord:direct:user-42", conversation_context);
     defer schedule_tool.setContext(null, null, null, null, null, null);
 
     const parsed = try tools_mod.parseTestArgs("{\"action\":\"once\",\"delay\":\"1m\",\"prompt\":\"ping\"}");
