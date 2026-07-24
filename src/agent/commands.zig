@@ -3997,8 +3997,12 @@ fn handleThreadCommand(self: anytype) ![]const u8 {
     const timestamp = std_compat.time.timestamp();
     const key = try std.fmt.allocPrint(self.allocator, "archive:conversation:{x}:{d}", .{ std.hash.Wyhash.hash(0, session_key), timestamp });
     defer self.allocator.free(key);
-    try memory.store(key, transcript.items, .{ .custom = "archive" }, null);
-    if (@hasField(@TypeOf(self.*), "mem_rt")) {
+    var archived = true;
+    memory.store(key, transcript.items, .{ .custom = "archive" }, null) catch |err| {
+        archived = false;
+        log.warn("thread archive store failed: {}", .{err});
+    };
+    if (archived and @hasField(@TypeOf(self.*), "mem_rt")) {
         if (self.mem_rt) |rt| rt.syncVectorAfterStore(self.allocator, key, transcript.items, null);
     }
 
@@ -4011,7 +4015,10 @@ fn handleThreadCommand(self: anytype) ![]const u8 {
     }
 
     clearSessionState(self);
-    return try self.allocator.dupe(u8, "New thread started. The previous conversation is archived and searchable.");
+    return try self.allocator.dupe(u8, if (archived)
+        "New thread started. The previous conversation is archived and searchable."
+    else
+        "New thread started. The previous conversation could not be archived, but the session was cleared.");
 }
 
 fn handleUnthreadCommand(self: anytype) ![]const u8 {
