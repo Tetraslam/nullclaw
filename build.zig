@@ -9,15 +9,15 @@ const VendoredFileHash = struct {
 const VENDORED_SQLITE_HASHES = [_]VendoredFileHash{
     .{
         .path = "vendor/sqlite3/sqlite3.c",
-        .sha256_hex = "dc58f0b5b74e8416cc29b49163a00d6b8bf08a24dd4127652beaaae307bd1839",
+        .sha256_hex = "87497ab605bedd0dbee27a209c1eeff8c89b229b13f921a7efdbb81a13f779fd",
     },
     .{
         .path = "vendor/sqlite3/sqlite3.h",
-        .sha256_hex = "05c48cbf0a0d7bda2b6d0145ac4f2d3a5e9e1cb98b5d4fa9d88ef620e1940046",
+        .sha256_hex = "4ff81af4849acabc76fc8349abb926814395072617ca18e08800abf734ab7612",
     },
     .{
         .path = "vendor/sqlite3/sqlite3ext.h",
-        .sha256_hex = "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
+        .sha256_hex = "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
     },
 };
 

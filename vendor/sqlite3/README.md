@@ -1,6 +1,6 @@
 # vendored sqlite3 package
 
-This directory vendors the Zig `sqlite3` build package and SQLite 3.51.0
+This directory vendors the Zig `sqlite3` build package and SQLite 3.53.3
 amalgamation sources used by nullclaw.
 
 Why vendored:
@@ -11,8 +11,8 @@ Why vendored:
 
 Contents:
 - `build.zig` and `build.zig.zon` based on `allyourcodebase/sqlite3` and patched to library-only mode for nullclaw
-- `sqlite3.c`, `sqlite3.h`, `sqlite3ext.h` from SQLite 3.51.0 amalgamation
+- `sqlite3.c`, `sqlite3.h`, `sqlite3ext.h` from SQLite 3.53.3 amalgamation
 
 Upstream references:
 - Zig wrapper: https://github.com/allyourcodebase/sqlite3
-- SQLite source: https://sqlite.org/2025/sqlite-amalgamation-3510000.zip
+- SQLite source: https://sqlite.org/2026/sqlite-amalgamation-3530300.zip

@@ -229,6 +229,7 @@ pub const SqliteMemory = struct {
 
         var self_ = Self{ .db = db, .allocator = allocator };
         errdefer self_.deinit();
+        try self_.checkIntegrity();
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
@@ -240,6 +241,32 @@ pub const SqliteMemory = struct {
         if (self.db) |db| {
             _ = c.sqlite3_close(db);
             self.db = null;
+        }
+    }
+
+    fn checkIntegrity(self: *Self) !void {
+        const sql = "PRAGMA quick_check(1);";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const prepare_rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (prepare_rc != c.SQLITE_OK) {
+            self.logExecFailure("integrity check prepare", sql, prepare_rc, null);
+            return error.DatabaseCorrupt;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const step_rc = c.sqlite3_step(stmt);
+        if (step_rc != c.SQLITE_ROW) {
+            self.logExecFailure("integrity check step", sql, step_rc, null);
+            return error.DatabaseCorrupt;
+        }
+
+        const raw = c.sqlite3_column_text(stmt.?, 0);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+        if (raw == null) return error.DatabaseCorrupt;
+        const result: []const u8 = @as([*]const u8, @ptrCast(raw))[0..len];
+        if (!std.mem.eql(u8, result, "ok")) {
+            log.warn("sqlite integrity check failed: {s}", .{result});
+            return error.DatabaseCorrupt;
         }
     }
 
@@ -268,7 +295,7 @@ pub const SqliteMemory = struct {
         }
         const pragmas = [_][:0]const u8{
             journal_pragma,
-            "PRAGMA synchronous  = NORMAL;",
+            "PRAGMA synchronous  = FULL;",
             "PRAGMA temp_store   = MEMORY;",
             "PRAGMA cache_size   = -2000;",
         };
@@ -2662,7 +2689,7 @@ test "SqliteMemory.init on non-sqlite file errors and frees the partially-opened
         defer opened.deinit();
         return error.TestExpectedError;
     } else |err| switch (err) {
-        error.MigrationFailed, error.PrepareFailed => {},
+        error.DatabaseCorrupt, error.MigrationFailed, error.PrepareFailed => {},
         else => return err,
     }
 }
