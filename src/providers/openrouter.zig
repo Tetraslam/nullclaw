@@ -109,6 +109,51 @@ pub const OpenRouterProvider = struct {
         return error.NoResponseContent;
     }
 
+    const ParsedToolFunction = struct {
+        name: []u8,
+        arguments: []u8,
+    };
+
+    fn dupeToolArguments(allocator: std.mem.Allocator, value: ?std.json.Value) ![]u8 {
+        const arguments = value orelse return allocator.dupe(u8, "{}");
+        return switch (arguments) {
+            .string => |string| allocator.dupe(u8, string),
+            .object, .array => std.json.Stringify.valueAlloc(allocator, arguments, .{}),
+            else => allocator.dupe(u8, "{}"),
+        };
+    }
+
+    fn parseToolFunction(allocator: std.mem.Allocator, func_obj: std.json.ObjectMap) !ParsedToolFunction {
+        const name_value = func_obj.get("name");
+        const raw_name = if (name_value) |name| if (name == .string) name.string else "" else "";
+        const trimmed_name = std.mem.trim(u8, raw_name, " \t\r\n");
+
+        if (std.mem.startsWith(u8, trimmed_name, "{")) {
+            if (std.json.parseFromSlice(std.json.Value, allocator, trimmed_name, .{}) catch null) |nested| {
+                defer nested.deinit();
+                if (nested.value == .object) {
+                    if (nested.value.object.get("name")) |nested_name| {
+                        if (nested_name == .string and nested_name.string.len > 0) {
+                            const name = try allocator.dupe(u8, nested_name.string);
+                            errdefer allocator.free(name);
+                            const nested_arguments = nested.value.object.get("arguments");
+                            const arguments = try dupeToolArguments(
+                                allocator,
+                                if (nested_arguments != null) nested_arguments else func_obj.get("arguments"),
+                            );
+                            return .{ .name = name, .arguments = arguments };
+                        }
+                    }
+                }
+            }
+        }
+
+        const name = try allocator.dupe(u8, raw_name);
+        errdefer allocator.free(name);
+        const arguments = try dupeToolArguments(allocator, func_obj.get("arguments"));
+        return .{ .name = name, .arguments = arguments };
+    }
+
     /// Parse a native tool-calling response into ChatResponse.
     pub fn parseNativeResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -182,13 +227,12 @@ pub const OpenRouterProvider = struct {
 
                         if (tc_obj.get("function")) |func| {
                             const func_obj = func.object;
-                            const name = if (func_obj.get("name")) |n| (if (n == .string) try allocator.dupe(u8, n.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
-                            const arguments = if (func_obj.get("arguments")) |a| (if (a == .string) try allocator.dupe(u8, a.string) else try allocator.dupe(u8, "{}")) else try allocator.dupe(u8, "{}");
+                            const parsed_function = try parseToolFunction(allocator, func_obj);
 
                             try tool_calls_list.append(allocator, .{
                                 .id = id,
-                                .name = name,
-                                .arguments = arguments,
+                                .name = parsed_function.name,
+                                .arguments = parsed_function.arguments,
                             });
                         }
                     }
@@ -1077,4 +1121,17 @@ test "parseNativeResponse tool_calls null does not crash" {
     }
     try std.testing.expectEqualStrings("pong", response.content.?);
     try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+}
+
+test "parseNativeResponse unwraps serialized tool call from function name" {
+    const body =
+        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}","arguments":"{}"}}]}}],"model":"z-ai/glm-5.2"}
+    ;
+    const alloc = std.testing.allocator;
+    var response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), response.tool_calls.len);
+    try std.testing.expectEqualStrings("shell", response.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", response.tool_calls[0].arguments);
 }
