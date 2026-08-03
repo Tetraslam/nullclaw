@@ -2805,10 +2805,30 @@ pub const Agent = struct {
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
-                    log.info(
-                        "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, call_index + 1, call.name, result.success, tool_duration },
-                    );
+                    if (result.success) {
+                        log.info(
+                            "tool-call done session=0x{x} index={d} name={s} success=true duration_ms={d}",
+                            .{ session_hash, call_index + 1, call.name, tool_duration },
+                        );
+                    } else {
+                        const safe_args = self.diagnosticText(arena, call.arguments_json);
+                        const safe_error = self.safeToolDiagnosticText(arena, result.output);
+                        const args_preview = previewText(safe_args, 512);
+                        const error_preview = previewText(safe_error, 512);
+                        log.info(
+                            "tool-call done session=0x{x} index={d} name={s} success=false duration_ms={d} args={f}{s} error={f}{s}",
+                            .{
+                                session_hash,
+                                call_index + 1,
+                                call.name,
+                                tool_duration,
+                                std.json.fmt(args_preview.slice, .{}),
+                                if (args_preview.truncated) " [truncated]" else "",
+                                std.json.fmt(error_preview.slice, .{}),
+                                if (error_preview.truncated) " [truncated]" else "",
+                            },
+                        );
+                    }
                 }
 
                 var tool_args_buf: [1024]u8 = undefined;
