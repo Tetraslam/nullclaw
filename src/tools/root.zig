@@ -5,6 +5,7 @@
 //! scheduling, delegation, browser, and image tools.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
@@ -471,7 +472,7 @@ pub fn allTools(
     try list.append(allocator, feh.tool());
 
     const gt = try allocator.create(git.GitTool);
-    gt.* = .{ .workspace_dir = workspace_dir };
+    gt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, gt.tool());
 
     // Tools without workspace_dir
@@ -1151,6 +1152,32 @@ test "all tools wire bootstrap provider into bootstrap-aware file tools for sqli
     try std.testing.expectEqualStrings("name: Igor\nrole: coder", appended);
     try std.testing.expect(checked_read);
     try std.testing.expect(checked_append);
+}
+
+test "all tools wire allowed paths into git tool" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("workspace");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("repo");
+
+    const root_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "workspace" });
+    defer std.testing.allocator.free(ws_path);
+    const repo_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "repo" });
+    defer std.testing.allocator.free(repo_path);
+
+    const tools = try allTools(std.testing.allocator, ws_path, .{ .allowed_paths = &.{repo_path} });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "git_operations")) continue;
+        const git_tool: *git.GitTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expectEqual(@as(usize, 1), git_tool.allowed_paths.len);
+        try std.testing.expectEqualStrings(repo_path, git_tool.allowed_paths[0]);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "all tools wires subagent manager into spawn tool" {
