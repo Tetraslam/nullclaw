@@ -2577,10 +2577,13 @@ pub const Agent = struct {
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
             const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
+            const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
+
+            if (parsed_calls.len > 0 or trimmed_display_text.len > 0) {
+                empty_response_retry_count = 0;
+            }
 
             if (parsed_calls.len == 0) {
-                const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
-
                 if (trimmed_display_text.len == 0) {
                     self.freeResponseFields(&response);
                     if (empty_response_retry_count < 1 and
@@ -9942,6 +9945,92 @@ test "Agent retries empty final response once before succeeding" {
     try std.testing.expectEqualStrings("recovered", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_empty_retry_prompt);
+}
+
+test "Agent resets empty response retry after model progress" {
+    const SeparatedEmptyProvider = struct {
+        call_count: usize = 0,
+        empty_retry_prompts: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            var i = request.messages.len;
+            while (i > 0) {
+                i -= 1;
+                if (request.messages[i].role == .user) {
+                    if (std.mem.indexOf(u8, request.messages[i].content, "previous reply was empty") != null) {
+                        self.empty_retry_prompts += 1;
+                    }
+                    break;
+                }
+            }
+
+            const content = switch (self.call_count) {
+                1, 3 => "",
+                2 => "I'll check now.",
+                else => "recovered",
+            };
+            return .{
+                .content = try allocator.dupe(u8, content),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "separated-empty-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SeparatedEmptyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SeparatedEmptyProvider.chatWithSystem,
+        .chat = SeparatedEmptyProvider.chat,
+        .supportsNativeTools = SeparatedEmptyProvider.supportsNativeTools,
+        .getName = SeparatedEmptyProvider.getName,
+        .deinit = SeparatedEmptyProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.empty_retry_prompts);
 }
 
 test "Agent returns NoResponseContent after repeated empty final responses" {
