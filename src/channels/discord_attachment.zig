@@ -88,10 +88,17 @@ fn validSnowflake(value: []const u8) bool {
     return true;
 }
 
-fn safeReceiptToken(value: []const u8) bool {
+fn validMetadataValue(value: []const u8) bool {
     if (value.len == 0 or value.len > 128) return false;
-    for (value) |ch| if (ch < 0x20 or ch == 0x7f or ch == ';' or ch == '[' or ch == ']') return false;
+    for (value) |ch| if (ch < 0x20 or ch == 0x7f) return false;
     return true;
+}
+
+fn writeReceiptValue(writer: *std.Io.Writer, value: []const u8) !void {
+    for (value) |ch| switch (ch) {
+        ';', '[', ']' => try writer.writeByte('_'),
+        else => try writer.writeByte(ch),
+    };
 }
 
 pub fn isAllowedUrl(url: []const u8) bool {
@@ -104,17 +111,30 @@ pub fn isAllowedUrl(url: []const u8) bool {
         std.ascii.eqlIgnoreCase(host, "media.discordapp.net");
 }
 
+fn attachmentIdFromUrl(url: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const path_start = std.mem.indexOfScalarPos(u8, url, scheme_end + 3, '/') orelse return null;
+    const query_start = std.mem.indexOfScalarPos(u8, url, path_start, '?') orelse url.len;
+    var segments = std.mem.splitScalar(u8, url[path_start + 1 .. query_start], '/');
+    if (!std.mem.eql(u8, segments.next() orelse return null, "attachments")) return null;
+    if (!validSnowflake(segments.next() orelse return null)) return null;
+    const attachment_id = segments.next() orelse return null;
+    const filename = segments.next() orelse return null;
+    if (filename.len == 0) return null;
+    return if (validSnowflake(attachment_id)) attachment_id else null;
+}
+
 pub fn parse(object: std.json.ObjectMap) !Attachment {
-    const id = objectString(object, "id") orelse return error.InvalidAttachment;
-    if (!validSnowflake(id)) return error.InvalidAttachment;
+    const raw_id = objectString(object, "id") orelse return error.InvalidAttachment;
     const filename = objectString(object, "filename") orelse return error.InvalidAttachment;
     const size = (try optionalUnsigned(object, "size")) orelse return error.InvalidAttachment;
     const url = objectString(object, "url") orelse return error.InvalidAttachment;
     if (!isAllowedUrl(url)) return error.InvalidAttachmentUrl;
+    const id = if (validSnowflake(raw_id)) raw_id else attachmentIdFromUrl(url) orelse return error.InvalidAttachment;
     const proxy_url = objectString(object, "proxy_url");
     if (proxy_url) |proxy| if (!isAllowedUrl(proxy)) return error.InvalidAttachmentUrl;
     const content_type = objectString(object, "content_type");
-    if (content_type) |mime| if (!safeReceiptToken(mime)) return error.InvalidAttachment;
+    if (content_type) |mime| if (!validMetadataValue(mime)) return error.InvalidAttachment;
     return .{
         .id = id,
         .filename = filename,
@@ -267,9 +287,9 @@ pub fn appendReceipt(
     var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, out);
     const w = &aw.writer;
     if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try w.writeByte('\n');
-    try w.print("[Discord attachment: name={s}; declared_mime={s}; declared_bytes={d}; message_id={s}; attachment_id={s}", .{
-        sanitized_name,
-        attachment.content_type orelse "unknown",
+    try w.print("[Discord attachment: name={s}; declared_mime=", .{sanitized_name});
+    try writeReceiptValue(w, attachment.content_type orelse "unknown");
+    try w.print("; declared_bytes={d}; message_id={s}; attachment_id={s}", .{
         attachment.size,
         if (validSnowflake(message_id)) message_id else "unknown",
         attachment.id,
@@ -300,12 +320,14 @@ pub fn appendInvalidReceipt(
     const raw_attachment_id = if (object) |value| objectString(value, "id") orelse "unknown" else "unknown";
     const attachment_id = if (validSnowflake(raw_attachment_id)) raw_attachment_id else "unknown";
     const raw_declared_mime = if (object) |value| objectString(value, "content_type") orelse "unknown" else "unknown";
-    const declared_mime = if (safeReceiptToken(raw_declared_mime)) raw_declared_mime else "unknown";
+    const declared_mime = if (validMetadataValue(raw_declared_mime)) raw_declared_mime else "unknown";
     const declared_size = if (object) |value| optionalUnsigned(value, "size") catch null else null;
     var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, out);
     const w = &aw.writer;
     if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try w.writeByte('\n');
-    try w.print("[Discord attachment: name={s}; declared_mime={s}; declared_bytes=", .{ safe, declared_mime });
+    try w.print("[Discord attachment: name={s}; declared_mime=", .{safe});
+    try writeReceiptValue(w, declared_mime);
+    try w.writeAll("; declared_bytes=");
     if (declared_size) |size| try w.print("{d}", .{size}) else try w.writeAll("unknown");
     try w.print("; message_id={s}; attachment_id={s}; status=failed; reason={s}]", .{
         if (validSnowflake(message_id)) message_id else "unknown",
@@ -443,6 +465,25 @@ test "discord attachment parses retained metadata and validates CDN" {
     try std.testing.expectEqual(@as(u64, 7126536), attachment.size);
     try std.testing.expectEqual(@as(?u64, 3000), attachment.width);
     try std.testing.expect(!isAllowedUrl("https://example.com/image.png"));
+}
+
+test "discord attachment canonicalizes synthetic gateway card id from CDN path" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"id":"[CARD_1]","filename":"data.json","size":222,"content_type":"application/json; charset=utf-8","url":"https://cdn.discordapp.com/attachments/1475401568173162578/1544267611678974062/data.json?ex=123"}
+    , .{});
+    defer parsed.deinit();
+    const attachment = try parse(parsed.value.object);
+    try std.testing.expectEqualStrings("1544267611678974062", attachment.id);
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", attachment.content_type.?);
+}
+
+test "discord attachment rejects incomplete synthetic CDN paths" {
+    const invalid = [_][]const u8{
+        "https://cdn.discordapp.com/attachments/1/2",
+        "https://cdn.discordapp.com/attachments/1/not-numeric/data.json",
+        "https://cdn.discordapp.com/not-attachments/1/2/data.json",
+    };
+    for (invalid) |url| try std.testing.expect(attachmentIdFromUrl(url) == null);
 }
 
 test "discord attachment sanitizes traversal filename" {
