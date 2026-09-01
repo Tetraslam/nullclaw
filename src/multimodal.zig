@@ -33,6 +33,8 @@ pub const MultimodalConfig = struct {
     /// When true, skip the allowed_dirs check entirely (yolo mode).
     /// File size and MIME validation still apply.
     skip_dir_check: bool = false,
+    /// User message to process. Defaults to the latest user message.
+    user_message_index: ?usize = null,
 };
 
 pub const default_config = MultimodalConfig{};
@@ -278,19 +280,16 @@ pub fn prepareMessagesForProvider(
 ) ![]ChatMessage {
     const result = try arena.alloc(ChatMessage, messages.len);
 
-    // Only process the last user message — earlier images are already consumed
-    // and their temp files may be gone. This avoids re-encoding on every iteration.
-    var last_user_idx: ?usize = null;
-    for (0..messages.len) |j| {
-        const idx = messages.len - 1 - j;
-        if (messages[idx].role == .user) {
-            last_user_idx = idx;
-            break;
+    const user_idx = config.user_message_index orelse blk: {
+        for (0..messages.len) |j| {
+            const idx = messages.len - 1 - j;
+            if (messages[idx].role == .user) break :blk idx;
         }
-    }
+        break :blk messages.len;
+    };
 
     for (messages, 0..) |msg, i| {
-        if (msg.role != .user or msg.content.len == 0 or i != (last_user_idx orelse messages.len)) {
+        if (msg.role != .user or msg.content.len == 0 or i != user_idx) {
             result[i] = msg;
             continue;
         }
@@ -423,19 +422,22 @@ pub fn countImageMarkersInLastUser(messages: []const ChatMessage) usize {
 /// Strip image markers from messages and return modified copy.
 /// Used when the model does not support vision - images are replaced with placeholder text.
 pub fn stripImageMarkers(arena: std.mem.Allocator, messages: []const ChatMessage) ![]ChatMessage {
+    return stripImageMarkersAt(arena, messages, null);
+}
+
+pub fn stripImageMarkersAt(arena: std.mem.Allocator, messages: []const ChatMessage, user_message_index: ?usize) ![]ChatMessage {
     const result = try arena.alloc(ChatMessage, messages.len);
 
-    var last_user_idx: ?usize = null;
-    for (0..messages.len) |j| {
-        const idx = messages.len - 1 - j;
-        if (messages[idx].role == .user) {
-            last_user_idx = idx;
-            break;
+    const user_idx = user_message_index orelse blk: {
+        for (0..messages.len) |j| {
+            const idx = messages.len - 1 - j;
+            if (messages[idx].role == .user) break :blk idx;
         }
-    }
+        break :blk messages.len;
+    };
 
     for (messages, 0..) |msg, i| {
-        if (msg.role != .user or i != (last_user_idx orelse messages.len)) {
+        if (msg.role != .user or i != user_idx) {
             result[i] = msg;
             continue;
         }
@@ -466,7 +468,7 @@ pub fn stripImageMarkers(arena: std.mem.Allocator, messages: []const ChatMessage
     return result;
 }
 
-fn countImageMarkersInText(content: []const u8) usize {
+pub fn countImageMarkersInText(content: []const u8) usize {
     var count: usize = 0;
     var cursor: usize = 0;
     while (cursor < content.len) {
@@ -993,6 +995,23 @@ test "prepareMessagesForProvider only processes last user message" {
     try std.testing.expect(result[1].content_parts == null);
     // Last user message should be processed
     try std.testing.expect(result[2].content_parts != null);
+}
+
+test "prepareMessagesForProvider retains selected image through tool results" {
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user("Inspect [IMAGE:https://example.com/current.jpg]"),
+        ChatMessage.assistant("I will read the metadata."),
+        ChatMessage.user("Tool result: metadata loaded."),
+    };
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{ .user_message_index = 0 });
+    try std.testing.expect(result[0].content_parts != null);
+    try std.testing.expect(result[2].content_parts == null);
 }
 
 test "quick-check handles mixed case IMAGE markers" {

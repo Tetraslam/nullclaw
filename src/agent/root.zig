@@ -2150,6 +2150,7 @@ pub const Agent = struct {
 
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        const turn_user_content = enriched;
 
         var sys_bytes: usize = 0;
         var hist_bytes: usize = 0;
@@ -2226,7 +2227,7 @@ pub const Agent = struct {
             const priority_tool = self.priorityToolForSpecsMessage(turn_tool_specs, effective_user_message);
 
             // Build messages slice for provider (arena-owned; freed at end of iteration).
-            const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
+            const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool, turn_user_content);
             const request_max_tokens = self.effectiveMaxTokensForTurn(
                 messages,
                 if (native_tools_enabled) turn_tool_specs else null,
@@ -2268,7 +2269,7 @@ pub const Agent = struct {
                             log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
                         try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
+                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool, turn_user_content);
                         const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2342,7 +2343,7 @@ pub const Agent = struct {
                             log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
                         try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
+                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool, turn_user_content);
                         const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2381,7 +2382,7 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
+                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool, turn_user_content) catch |prep_err| return prep_err;
                         const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2444,7 +2445,7 @@ pub const Agent = struct {
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
+                            const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool, turn_user_content) catch |prep_err| return prep_err;
                             const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
                                 if (native_tools_enabled) turn_tool_specs else null,
@@ -3701,13 +3702,22 @@ pub const Agent = struct {
 
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
-    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator, model_name: []const u8) ![]ChatMessage {
+    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator, model_name: []const u8, turn_user_content: ?[]const u8) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             m[i] = msg.toChatMessage();
         }
 
-        const image_marker_count = multimodal.countImageMarkersInLastUser(m);
+        const user_message_index: ?usize = if (turn_user_content) |target| blk: {
+            for (m, 0..) |msg, i| {
+                if (msg.role == .user and msg.content.ptr == target.ptr and msg.content.len == target.len) break :blk i;
+            }
+            break :blk null;
+        } else null;
+        const image_marker_count = if (user_message_index) |i|
+            multimodal.countImageMarkersInText(m[i].content)
+        else
+            multimodal.countImageMarkersInLastUser(m);
         if (image_marker_count == 0) {
             return m;
         }
@@ -3717,7 +3727,7 @@ pub const Agent = struct {
             if (self.verbose_level == .on or self.verbose_level == .full) {
                 log.info("Vision disabled for model {s}, stripping image markers", .{model_name});
             }
-            return multimodal.stripImageMarkers(arena, m);
+            return multimodal.stripImageMarkersAt(arena, m, user_message_index);
         }
 
         // Check if provider supports vision for this model
@@ -3729,7 +3739,7 @@ pub const Agent = struct {
             if (self.auto_disable_vision_on_error) {
                 try self.markVisionDisabled(model_name);
             }
-            return multimodal.stripImageMarkers(arena, m);
+            return multimodal.stripImageMarkersAt(arena, m, user_message_index);
         }
 
         // Allow local multimodal reads from:
@@ -3750,6 +3760,7 @@ pub const Agent = struct {
             .allowed_dirs = allowed,
             .skip_dir_check = self.multimodal_unrestricted,
             .allow_remote_fetch = self.multimodal_unrestricted,
+            .user_message_index = user_message_index,
         });
     }
 
@@ -3758,9 +3769,10 @@ pub const Agent = struct {
         arena: std.mem.Allocator,
         model_name: []const u8,
         priority_tool: ?[]const u8,
+        turn_user_content: ?[]const u8,
     ) ![]ChatMessage {
         const raw: []ChatMessage = blk: {
-            const messages = try self.buildProviderMessages(arena, model_name);
+            const messages = try self.buildProviderMessages(arena, model_name, turn_user_content);
             const tool_name = priority_tool orelse break :blk messages;
 
             var i = messages.len;
@@ -4543,16 +4555,23 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const text_model_messages = try agent.buildProviderMessages(arena, agent.model_name);
+    const text_model_messages = try agent.buildProviderMessages(arena, agent.model_name, null);
     try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
     try std.testing.expect(text_model_messages[0].content_parts == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
-    const messages = try agent.buildProviderMessages(arena, agent.model_name);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name, null);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
+
+    const turn_user_content = agent.history.items[0].content;
+    try agent.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try allocator.dupe(u8, "Reading metadata") });
+    try agent.appendOwnedHistoryMessage(.{ .role = .user, .content = try allocator.dupe(u8, "Tool result: metadata loaded") });
+    const tool_loop_messages = try agent.buildProviderMessages(arena, agent.model_name, turn_user_content);
+    try std.testing.expect(tool_loop_messages[0].content_parts != null);
+    try std.testing.expect(tool_loop_messages[2].content_parts == null);
 }
 
 test "Agent buildProviderMessages allows workspace image paths" {
@@ -4635,7 +4654,7 @@ test "Agent buildProviderMessages allows workspace image paths" {
     var arena_impl = std.heap.ArenaAllocator.init(allocator);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    const messages = try agent.buildProviderMessages(arena, agent.model_name);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name, null);
 
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
@@ -11106,7 +11125,7 @@ test "buildProviderMessagesForTurn adds priority hint without mutating history" 
         .content = try allocator.dupe(u8, "please read this file"),
     });
 
-    const messages = try agent.buildProviderMessagesForTurn(arena, agent.model_name, "file_read");
+    const messages = try agent.buildProviderMessagesForTurn(arena, agent.model_name, "file_read", null);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "[PRIORITY: Please call the file_read tool immediately]") != null);
     try std.testing.expectEqualStrings("please read this file", agent.history.items[0].content);
