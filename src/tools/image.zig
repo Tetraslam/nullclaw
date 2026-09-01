@@ -6,15 +6,15 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
-/// Maximum image file size (5MB).
-const MAX_IMAGE_BYTES: u64 = 5_242_880;
+/// Keep metadata inspection aligned with direct provider image delivery.
+const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Tool to read image metadata (format, dimensions, size).
 pub const ImageInfoTool = struct {
     pub const tool_name = "image_info";
-    pub const tool_description = "Read image file metadata (format, dimensions, size).";
+    pub const tool_description = "Read image file metadata (format, dimensions, size). This does not inspect or describe pixels.";
     pub const tool_params =
-        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the image file"},"include_base64":{"type":"boolean","description":"Include base64-encoded data (default: false)"}},"required":["path"]}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the image file"}},"required":["path"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -387,11 +387,11 @@ test "JPEG non-FF byte returns null" {
     try std.testing.expect(dims == null);
 }
 
-test "image_info schema has include_base64" {
+test "image_info schema exposes metadata path only" {
     var it = ImageInfoTool{};
     const t = it.tool();
     const schema = t.parametersJson();
-    try std.testing.expect(std.mem.indexOf(u8, schema, "include_base64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "include_base64") == null);
 }
 
 test "image_info description mentions metadata" {
@@ -399,4 +399,20 @@ test "image_info description mentions metadata" {
     const t = it.tool();
     const desc = t.description();
     try std.testing.expect(std.mem.indexOf(u8, desc, "metadata") != null or std.mem.indexOf(u8, desc, "format") != null);
+}
+
+test "image_info accepts image above legacy 5 MiB limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try std_compat.fs.Dir.wrap(tmp.dir).createFile("large.jpg", .{});
+    try file.writeAll("\xff\xd8\xff\xe0");
+    try file.seekTo(7 * 1024 * 1024 - 1);
+    try file.writeAll(&.{0});
+    file.close();
+
+    const readable = try std_compat.fs.Dir.wrap(tmp.dir).openFile("large.jpg", .{});
+    const result = try ImageInfoTool.executeWithFile(readable, std.testing.allocator, "large.jpg");
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "7340032 bytes") != null);
 }

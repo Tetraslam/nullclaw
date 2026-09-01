@@ -272,6 +272,12 @@ fn isSupportedImageMime(mime: []const u8) bool {
         std.mem.eql(u8, mime, "image/bmp");
 }
 
+fn isProviderImage(actual_mime: ?[]const u8, actual_bytes: ?u64) bool {
+    return actual_mime != null and actual_bytes != null and
+        isSupportedImageMime(actual_mime.?) and
+        actual_bytes.? <= multimodal.default_config.max_image_size_bytes;
+}
+
 pub fn appendReceipt(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -299,9 +305,15 @@ pub fn appendReceipt(
     if (actual_mime) |mime| try w.print("; actual_mime={s}", .{mime});
     if (actual_bytes) |bytes| try w.print("; bytes={d}", .{bytes});
     if (path) |stored| try w.print("; path={s}", .{stored});
+    if (failure == null and path != null) {
+        if (isProviderImage(actual_mime, actual_bytes))
+            try w.writeAll("; delivery=provider_image_and_host_path")
+        else
+            try w.writeAll("; delivery=host_path");
+    }
     if (failure) |reason| try w.print("; status=failed; reason={s}", .{reason}) else try w.writeAll("; status=stored");
     try w.writeAll("]");
-    if (failure == null and actual_mime != null and path != null and isSupportedImageMime(actual_mime.?)) try w.print("\n[IMAGE:{s}]", .{path.?});
+    if (failure == null and path != null and isProviderImage(actual_mime, actual_bytes)) try w.print("\n[IMAGE:{s}]", .{path.?});
     out.* = aw.toArrayList();
     if (out.items.len - receipt_start > MAX_RECEIPT_BYTES) return error.ReceiptTooLarge;
 }
@@ -484,6 +496,34 @@ test "discord attachment rejects incomplete synthetic CDN paths" {
         "https://cdn.discordapp.com/not-attachments/1/2/data.json",
     };
     for (invalid) |url| try std.testing.expect(attachmentIdFromUrl(url) == null);
+}
+
+test "discord attachment represents image above provider limit as host path only" {
+    const attachment = Attachment{
+        .id = "300",
+        .filename = "large.png",
+        .size = 26 * 1024 * 1024,
+        .content_type = "image/png",
+        .url = "https://cdn.discordapp.com/attachments/100/300/large.png",
+        .proxy_url = null,
+        .width = null,
+        .height = null,
+    };
+    var receipt: std.ArrayListUnmanaged(u8) = .empty;
+    defer receipt.deinit(std.testing.allocator);
+    try appendReceipt(
+        &receipt,
+        std.testing.allocator,
+        attachment,
+        "large.png",
+        "200",
+        "/workspace/large.png",
+        26 * 1024 * 1024,
+        "image/png",
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, receipt.items, "delivery=host_path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt.items, "[IMAGE:") == null);
 }
 
 test "discord attachment sanitizes traversal filename" {

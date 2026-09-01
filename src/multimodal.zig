@@ -378,6 +378,7 @@ pub fn prepareMessagesForProvider(
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
+                log.info("provider image prepared mime={s} raw_bytes={d} encoded_bytes={d}", .{ img.mime_type, img.data.len, b64.len });
                 try parts.append(arena, .{ .image_base64 = .{
                     .data = b64,
                     .media_type = img.mime_type,

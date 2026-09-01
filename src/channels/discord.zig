@@ -3309,6 +3309,7 @@ test "discord attachment ingress streams 7 MiB image and retains successful atom
     defer message.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, message.content, "[IMAGE:") != null);
     try std.testing.expect(std.mem.indexOf(u8, message.content, "bytes=7126536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "delivery=provider_image_and_host_path") != null);
     const path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace, "attachments", "discord", "100", "200", "300-image.png" });
     defer std.testing.allocator.free(path);
     try std.testing.expectEqual(@as(u64, 7_126_536), (try fs_compat.statPath(path)).size);
