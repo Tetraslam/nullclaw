@@ -447,7 +447,7 @@ pub const Agent = struct {
 
     fn redactOwnedForHistory(self: *Agent, owned: []const u8) ![]const u8 {
         const r = self.redactor orelse return owned;
-        const redacted = r.redact(self.allocator, owned) catch |err| {
+        const redacted = redactStructuredContent(self.allocator, owned, r) catch |err| {
             self.allocator.free(owned);
             return err;
         };
@@ -456,8 +456,68 @@ pub const Agent = struct {
     }
 
     fn dupeForHistory(self: *Agent, content: []const u8) ![]const u8 {
-        if (self.redactor) |r| return r.redact(self.allocator, content);
+        if (self.redactor) |r| return redactStructuredContent(self.allocator, content, r);
         return self.allocator.dupe(u8, content);
+    }
+
+    fn redactStructuredContent(allocator: std.mem.Allocator, input: []const u8, redactor: *redaction.Redactor) ![]u8 {
+        const image_marker = "[IMAGE:";
+        const receipt_marker = "[Discord attachment:";
+        if (std.mem.indexOf(u8, input, image_marker) == null and std.mem.indexOf(u8, input, receipt_marker) == null) {
+            return redactor.redact(allocator, input);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var cursor: usize = 0;
+        while (cursor < input.len) {
+            const image_pos = std.mem.indexOfPos(u8, input, cursor, image_marker);
+            const receipt_pos = std.mem.indexOfPos(u8, input, cursor, receipt_marker);
+            const start = if (image_pos) |image|
+                if (receipt_pos) |receipt| @min(image, receipt) else image
+            else
+                receipt_pos orelse {
+                    const tail = try redactor.redact(allocator, input[cursor..]);
+                    defer allocator.free(tail);
+                    try out.appendSlice(allocator, tail);
+                    break;
+                };
+
+            const prefix = try redactor.redact(allocator, input[cursor..start]);
+            defer allocator.free(prefix);
+            try out.appendSlice(allocator, prefix);
+
+            const close = std.mem.indexOfScalarPos(u8, input, start, ']') orelse {
+                const tail = try redactor.redact(allocator, input[start..]);
+                defer allocator.free(tail);
+                try out.appendSlice(allocator, tail);
+                break;
+            };
+
+            if (image_pos != null and start == image_pos.?) {
+                try out.appendSlice(allocator, input[start .. close + 1]);
+            } else {
+                const receipt = input[start .. close + 1];
+                const path_key = "; path=";
+                if (std.mem.indexOf(u8, receipt, path_key)) |path_key_pos| {
+                    const path_start = path_key_pos + path_key.len;
+                    const path_end = std.mem.indexOfScalarPos(u8, receipt, path_start, ';') orelse receipt.len - 1;
+                    const before_path = try redactor.redact(allocator, receipt[0..path_start]);
+                    defer allocator.free(before_path);
+                    try out.appendSlice(allocator, before_path);
+                    try out.appendSlice(allocator, receipt[path_start..path_end]);
+                    const after_path = try redactor.redact(allocator, receipt[path_end..]);
+                    defer allocator.free(after_path);
+                    try out.appendSlice(allocator, after_path);
+                } else {
+                    const redacted_receipt = try redactor.redact(allocator, receipt);
+                    defer allocator.free(redacted_receipt);
+                    try out.appendSlice(allocator, redacted_receipt);
+                }
+            }
+            cursor = close + 1;
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn containsRedactionPlaceholder(text: []const u8) bool {
@@ -3812,7 +3872,7 @@ pub const Agent = struct {
         for (messages, 0..) |msg, i| {
             out[i] = msg;
             if (msg.content.len > 0) {
-                out[i].content = try redactor.redact(arena, msg.content);
+                out[i].content = try redactStructuredContent(arena, msg.content, redactor);
             }
             if (msg.content_parts) |parts| {
                 out[i].content_parts = try redactContentParts(arena, parts, redactor);
@@ -3829,7 +3889,7 @@ pub const Agent = struct {
         const out = try arena.alloc(ContentPart, parts.len);
         for (parts, 0..) |p, i| {
             out[i] = switch (p) {
-                .text => |t| ContentPart{ .text = try redactor.redact(arena, t) },
+                .text => |t| ContentPart{ .text = try redactStructuredContent(arena, t, redactor) },
                 .image_url => |img| try redactImageUrlPart(arena, img, redactor),
                 .image_base64 => p,
             };
@@ -11948,6 +12008,24 @@ test "Agent.redactMessagesForProvider preserves safe image URLs" {
     try std.testing.expectEqual(@as(usize, 1), out_parts.len);
     try std.testing.expect(std.meta.activeTag(out_parts[0]) == .image_url);
     try std.testing.expectEqualStrings("https://cdn.example.com/public/cat.png", out_parts[0].image_url.url);
+}
+
+test "Agent redaction preserves generated attachment paths and image markers" {
+    const allocator = std.testing.allocator;
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    const path = "/workspace/attachments/discord/1475401568173162578/1544413732644331641/1544413731352617010-photo.jpg";
+    const input = "contact alice@example.com" ++
+        "[Discord attachment: name=alice@example.com; attachment_id=1544413731352617010; path=" ++ path ++ "; delivery=provider_image_and_host_path; status=stored]\n" ++
+        "[IMAGE:" ++ path ++ "]";
+    const out = try Agent.redactStructuredContent(allocator, input, &redactor);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "; path=" ++ path ++ ";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[IMAGE:" ++ path ++ "]") != null);
 }
 
 test "Agent.executeTool does not rehydrate redactor placeholders in tool args" {
