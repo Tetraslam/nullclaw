@@ -447,15 +447,14 @@ pub fn buildSystemPrompt(
             try w.writeAll("## Group Chat Behavior\n\n");
             try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
             try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
-            try w.writeAll("- The message is casual chat between other members\n");
-            try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
+            try w.writeAll("- Other members are talking to each other and you do not have a genuinely funny, useful, or grounded contribution\n");
             try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
             try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
+            try w.writeAll("A question or @mention is not required. Participate sparingly when your contribution improves the conversation; otherwise stay quiet.\n\n");
             try w.writeAll("When you choose NOT to reply, include `[NO_REPLY]` anywhere in your response. The system will suppress the message.\n\n");
             try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
-            try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
             try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
-            try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
+            try w.writeAll("- General chit-chat where you would only repeat or explain the existing joke -> `[NO_REPLY]`\n\n");
 
             if (is_discord) {
                 try w.writeAll("Messages beginning with `[Discord reaction event]` report that a member reacted to one of your messages. Usually choose `[NO_REPLY]`; reply only when the reaction clearly warrants a conversational response.\n\n");
@@ -1515,6 +1514,8 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Member list: Shresht, William, Priime, tetrapod (bot)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Online now: Shresht (online), tetrapod (online)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Messages beginning with `[Discord reaction event]`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "A question or @mention is not required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "The message is not directed at you") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "not in the sender's DMs") != null);
 }
 
