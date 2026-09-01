@@ -2051,7 +2051,7 @@ pub const Agent = struct {
         var safe_user_message_owned: ?[]u8 = null;
         defer if (safe_user_message_owned) |msg| self.allocator.free(msg);
         const safe_user_message = if (self.redactor) |r| blk: {
-            safe_user_message_owned = try r.redact(self.allocator, effective_user_message);
+            safe_user_message_owned = try redactStructuredContent(self.allocator, effective_user_message, r);
             break :blk safe_user_message_owned.?;
         } else effective_user_message;
 
@@ -11482,6 +11482,33 @@ test "Agent: redactor enabled scrubs email before provider" {
     // Regression: email in user message must be replaced with a numbered placeholder.
     try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") == null);
+}
+
+test "Agent turn preserves generated Discord attachment path through redaction" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
+
+    var cfg = redactionBaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-attachment",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    const path = "/workspace/attachments/discord/1475401568173162578/1544424058672906310/1544424058169589770-file.bin";
+    const response = try agent.turn("email=user@example.com[Discord attachment: name=file.bin; path=" ++ path ++ "; delivery=host_path; status=stored]");
+    defer allocator.free(response);
+
+    const got = state.captured_user.?;
+    try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "; path=" ++ path ++ ";") != null);
 }
 
 test "Agent: redactor stores redacted user content in local history" {
