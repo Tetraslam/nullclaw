@@ -8,6 +8,10 @@ pub const TurnPersistenceState = struct {
     total_tokens: u64,
 };
 
+pub fn failedTurnMarker(buf: []u8, err: anyerror) []const u8 {
+    return std.fmt.bufPrint(buf, "[Turn failed: {s}]", .{@errorName(err)}) catch "[Turn failed]";
+}
+
 fn persistedAssistantReply(history: []const Agent.OwnedMessage, response: []const u8) []const u8 {
     if (history.len == 0) return response;
     const last = history[history.len - 1];
@@ -50,6 +54,18 @@ pub fn persistTurn(
         store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
         store.saveUsage(session_key, state.total_tokens) catch {};
     }
+}
+
+pub fn persistFailedTurn(
+    store: memory_mod.SessionStore,
+    session_key: []const u8,
+    content: []const u8,
+    total_tokens: u64,
+    err: anyerror,
+) void {
+    var marker_buf: [128]u8 = undefined;
+    const marker = failedTurnMarker(&marker_buf, err);
+    persistTurn(store, .{ .history = &.{}, .total_tokens = total_tokens }, session_key, content, marker);
 }
 
 test "persistTurn stores user and assistant messages in session history" {
@@ -171,4 +187,21 @@ test "persistTurn does not persist system prompt history entries" {
         try std.testing.expect(std.mem.indexOf(u8, message.content, "admin@example.com") == null);
         try std.testing.expect(std.mem.indexOf(u8, message.content, "sk-system-secret") == null);
     }
+}
+
+test "persistFailedTurn stores user input and assistant error marker" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    persistFailedTurn(store, "failed-session", "inspect this image", 0, error.ProviderDoesNotSupportVision);
+
+    const detailed = try store.loadMessagesDetailed(allocator, "failed-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings("inspect this image", detailed[0].content);
+    try std.testing.expectEqualStrings("assistant", detailed[1].role);
+    try std.testing.expectEqualStrings("[Turn failed: ProviderDoesNotSupportVision]", detailed[1].content);
 }

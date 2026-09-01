@@ -2169,7 +2169,35 @@ pub const SessionManager = struct {
         } };
         session.agent.observer.recordEvent(&start_event);
 
-        var response = try session.agent.turn(content);
+        var response = session.agent.turn(content) catch |err| {
+            var marker_buf: [128]u8 = undefined;
+            const marker = turn_persistence.failedTurnMarker(&marker_buf, err);
+            if (self.allocator.dupe(u8, marker)) |owned_marker| {
+                session.agent.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = owned_marker,
+                }) catch self.allocator.free(owned_marker);
+            } else |_| {}
+
+            if (session.agent.session_store) |store| {
+                const persisted_content = if (session.agent.redactor) |r|
+                    r.redact(self.allocator, content) catch null
+                else
+                    null;
+                defer if (persisted_content) |text| self.allocator.free(text);
+                turn_persistence.persistFailedTurn(
+                    store,
+                    session_key,
+                    persisted_content orelse content,
+                    session.agent.total_tokens,
+                    err,
+                );
+            }
+
+            session.turn_count += 1;
+            session.last_active = std_compat.time.timestamp();
+            return err;
+        };
         var completed_turns: u64 = 1;
 
         var late_drain_count: u32 = 0;
@@ -5248,6 +5276,51 @@ test "processMessage session persistence redacts PII" {
     }
     try testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
     try testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
+}
+
+test "processMessage persists failed provider turn in store and live history" {
+    var mock = MockProvider{
+        .response = "",
+        .chat_error = error.ProviderDoesNotSupportVision,
+    };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "discord:main:failed-image";
+    // Regression: provider failures used to return before session persistence,
+    // dropping the failed user turn from restored conversation history.
+    try testing.expectError(
+        error.ProviderDoesNotSupportVision,
+        sm.processMessage(session_key, "inspect this image", null),
+    );
+
+    const detailed = try sqlite_mem.sessionStore().loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    try testing.expectEqualStrings("user", detailed[0].role);
+    try testing.expectEqualStrings("inspect this image", detailed[0].content);
+    try testing.expectEqualStrings("assistant", detailed[1].role);
+    try testing.expectEqualStrings("[Turn failed: ProviderDoesNotSupportVision]", detailed[1].content);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 3), session.agent.history.items.len);
+    try testing.expect(session.agent.history.items[2].role == .assistant);
+    try testing.expectEqualStrings("[Turn failed: ProviderDoesNotSupportVision]", session.agent.history.items[2].content);
 }
 
 test "restored session token reconstruction ignores usage footer decorations" {
