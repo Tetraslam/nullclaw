@@ -872,7 +872,9 @@ pub const Agent = struct {
                 for (parts) |part| switch (part) {
                     .text => |text| total_chars +|= text.len,
                     .image_url => |img| total_chars +|= img.url.len + 32,
-                    .image_base64 => |img| total_chars +|= img.data.len + img.media_type.len + 32,
+                    // Base64 is transport encoding, not text-tokenized prompt content.
+                    // Use a conservative byte proxy for provider-side vision tokens.
+                    .image_base64 => |img| total_chars +|= (img.data.len + 31) / 32 + img.media_type.len + 32,
                 };
             } else {
                 total_chars +|= msg.content.len;
@@ -5278,7 +5280,7 @@ test "Agent effective max_tokens scales with image_base64 size" {
     defer allocator.free(small_base64);
     @memset(small_base64, 'a');
 
-    const large_base64 = try allocator.alloc(u8, 12_000);
+    const large_base64 = try allocator.alloc(u8, 400_000);
     defer allocator.free(large_base64);
     @memset(large_base64, 'b');
 
@@ -5309,6 +5311,46 @@ test "Agent effective max_tokens scales with image_base64 size" {
     const capped_small = agent.effectiveMaxTokensForMessages(&small_messages, false);
     const capped_large = agent.effectiveMaxTokensForMessages(&large_messages, false);
     try std.testing.expect(capped_large < capped_small);
+}
+
+test "Agent effective max_tokens leaves output budget for live Terra image" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-5.6-terra",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 1_050_000,
+        .max_tokens = 128_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const live_image_base64 = try allocator.alloc(u8, 10_341_720);
+    defer allocator.free(live_image_base64);
+    @memset(live_image_base64, 'a');
+    const parts = [_]providers.ContentPart{
+        .{ .text = "describe this image" },
+        .{ .image_base64 = .{ .data = live_image_base64, .media_type = "image/jpeg" } },
+    };
+    const messages = [_]ChatMessage{.{
+        .role = .user,
+        .content = "describe this image",
+        .content_parts = &parts,
+    }};
+
+    try std.testing.expect(agent.effectiveMaxTokensForMessages(&messages, false) > 100_000);
 }
 
 test "Agent effective max_tokens accounts for native tool schema overhead" {

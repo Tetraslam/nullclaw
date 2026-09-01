@@ -28,6 +28,7 @@ const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
     .{ .key = "claude-haiku-4-5", .tokens = 8192 },
     .{ .key = "gpt-5.2", .tokens = 8192 },
     .{ .key = "gpt-5.2-codex", .tokens = 8192 },
+    .{ .key = "gpt-5.6-terra", .tokens = 128_000 },
     .{ .key = "gpt-4.5-preview", .tokens = 8192 },
     .{ .key = "gpt-4.1", .tokens = 8192 },
     .{ .key = "gpt-4.1-mini", .tokens = 8192 },
@@ -214,6 +215,7 @@ test "lookupModelMaxTokens resolves model and nested provider refs" {
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4"));
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4.1-mini"));
+    try std.testing.expectEqual(@as(?u32, 128_000), lookupModelMaxTokens("openai/gpt-5.6-terra"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openrouter/anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));
