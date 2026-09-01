@@ -207,12 +207,20 @@ pub const ChannelManager = struct {
         }
     }
 
+    fn maybeAttachWorkspace(self: *ChannelManager, channel_ptr: anytype) void {
+        const ChannelType = @TypeOf(channel_ptr.*);
+        if (comptime @hasDecl(ChannelType, "setWorkspaceDir")) {
+            channel_ptr.setWorkspaceDir(self.config.workspace_dir);
+        }
+    }
+
     fn appendChannelFromConfig(self: *ChannelManager, comptime field_name: []const u8, cfg: anytype) !void {
         const channel_module = @field(channels_mod, field_name);
         const ChannelType = channelTypeForModule(channel_module, field_name);
 
         const ch_ptr = try self.allocator.create(ChannelType);
         ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
+        self.maybeAttachWorkspace(ch_ptr);
         if (comptime std.mem.eql(u8, field_name, "telegram")) {
             ch_ptr.text_debounce_secs = telegram.TelegramChannel.textDebounceSecsFromMs(
                 self.config.messages.inbound.debounce_ms,
@@ -1052,6 +1060,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             return error.TestUnexpectedResult;
         const discord_ptr: *discord.DiscordChannel = @ptrCast(@alignCast(discord_entry.channel.ptr));
         try std.testing.expect(discord_ptr.bus == &event_bus);
+        try std.testing.expectEqualStrings(config.workspace_dir, discord_ptr.workspace_dir);
     }
 
     if (channel_catalog.isBuildEnabled(.qq)) {

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const http_util = @import("../http_util.zig");
+const discord_attachment = @import("discord_attachment.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.discord_history);
@@ -97,6 +98,7 @@ pub fn fetchChannelHistory(
     channel_id: []const u8,
     limit: u32,
     bot_user_id: []const u8,
+    workspace_dir: []const u8,
 ) ![]HistoryMessage {
     const url = try std.fmt.allocPrint(
         allocator,
@@ -108,7 +110,17 @@ pub fn fetchChannelHistory(
     const resp = try apiGet(allocator, token, url);
     defer allocator.free(resp);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    return parseChannelHistory(allocator, resp, channel_id, bot_user_id, workspace_dir);
+}
+
+pub fn parseChannelHistory(
+    allocator: Allocator,
+    response_json: []const u8,
+    channel_id: []const u8,
+    bot_user_id: []const u8,
+    workspace_dir: []const u8,
+) ![]HistoryMessage {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_json, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return error.DiscordUnexpectedResponse;
 
@@ -148,7 +160,10 @@ pub fn fetchChannelHistory(
             .string => |s| s,
             else => "",
         };
-        if (content.len == 0) continue;
+        const attachments = obj.get("attachments");
+        const has_attachments = attachments != null and
+            (attachments.? != .array or attachments.?.array.items.len > 0);
+        if (content.len == 0 and !has_attachments) continue;
 
         const author = obj.get("author") orelse continue;
         if (author != .object) continue;
@@ -168,9 +183,14 @@ pub fn fetchChannelHistory(
             false;
         const role: []const u8 = if (is_bot) "assistant" else "user";
 
+        var represented: std.ArrayListUnmanaged(u8) = .empty;
+        defer represented.deinit(allocator);
+        try represented.appendSlice(allocator, content);
+        if (attachments) |value| try discord_attachment.appendHistoryReceipts(&represented, allocator, value, workspace_dir, channel_id, id);
+
         try out.append(allocator, .{
             .role = try allocator.dupe(u8, role),
-            .content = try allocator.dupe(u8, content),
+            .content = try represented.toOwnedSlice(allocator),
             .id = try allocator.dupe(u8, id),
             .author_id = try allocator.dupe(u8, author_id),
             .author_name = try allocator.dupe(u8, author_name),
@@ -179,6 +199,17 @@ pub fn fetchChannelHistory(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+pub fn deinitHistory(allocator: Allocator, messages: []HistoryMessage) void {
+    for (messages) |message| {
+        allocator.free(message.role);
+        allocator.free(message.content);
+        allocator.free(message.id);
+        allocator.free(message.author_id);
+        allocator.free(message.author_name);
+    }
+    allocator.free(messages);
 }
 
 /// Rough token estimate for a block of text (chars/4, the usual heuristic).
@@ -204,4 +235,58 @@ test "memberAuthorName includes server nickname and username" {
     const name = try memberAuthorName(allocator, message, message.get("author").?.object, "1");
     defer allocator.free(name);
     try std.testing.expectEqualStrings("Prime (@lucas)", name);
+}
+
+test "discord history keeps attachment-only messages and formats unavailable metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const json =
+        \\[{"id":"200","type":0,"content":"","author":{"id":"10","username":"user"},"attachments":[{"id":"300","filename":"image.png","size":68,"content_type":"image/png","url":"https://cdn.discordapp.com/attachments/100/300/image.png","proxy_url":"https://media.discordapp.net/attachments/100/300/image.png","width":1,"height":1}]}]
+    ;
+    const messages = try parseChannelHistory(std.testing.allocator, json, "100", "999", workspace);
+    defer deinitHistory(std.testing.allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "attachment_id=300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "reason=NotStoredLocally") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "[IMAGE:") == null);
+}
+
+test "discord history reuses deterministic receipt when durable image exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var store = try discord_attachment.openMessageStore(std.testing.allocator, workspace, "100", "200", true);
+    defer store.deinit();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ store.path, "300-image.png" });
+    defer std.testing.allocator.free(path);
+    const file = try store.dir.createFile("300-image.png", .{});
+    try file.writeAll("\x89PNG\x0d\x0a\x1a\x0a");
+    file.close();
+    try store.prepare();
+    try store.commitPublished();
+    const json =
+        \\[{"id":"200","type":0,"content":"caption","author":{"id":"10","username":"user"},"attachments":[{"id":"300","filename":"image.png","size":8,"content_type":"image/png","url":"https://cdn.discordapp.com/attachments/100/300/image.png","width":1,"height":1}]}]
+    ;
+    const messages = try parseChannelHistory(std.testing.allocator, json, "100", "999", workspace);
+    defer deinitHistory(std.testing.allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "[IMAGE:") != null);
+}
+
+test "discord history retains malformed attachment-only message with failure receipt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const json =
+        \\[{"id":"200","type":0,"content":"","author":{"id":"10","username":"user"},"attachments":{"bad":true}}]
+    ;
+    const messages = try parseChannelHistory(std.testing.allocator, json, "100", "999", workspace);
+    defer deinitHistory(std.testing.allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "reason=AttachmentsNotArray") != null);
 }

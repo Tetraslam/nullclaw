@@ -1673,6 +1673,7 @@ pub const SessionManager = struct {
             channel_id,
             HYDRATE_FETCH_LIMIT,
             if (conversation_context) |ctx| ctx.bot_user_id orelse "" else "",
+            self.config.workspace_dir,
         ) catch |err| {
             log.warn("hydration: fetch history failed for {s}: {}", .{ session_key, err });
             return;

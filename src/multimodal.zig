@@ -22,8 +22,8 @@ const log = std.log.scoped(.multimodal);
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const MultimodalConfig = struct {
-    max_images: u32 = 4,
-    max_image_size_bytes: u64 = 5_242_880, // 5 MB
+    max_images: u32 = 10,
+    max_image_size_bytes: u64 = 25 * 1024 * 1024,
     /// Allow passing remote image URLs (`https://...`) through to providers.
     /// Disabled by default for secure-by-default behavior.
     allow_remote_fetch: bool = false,
@@ -199,8 +199,10 @@ fn readFromFile(allocator: std.mem.Allocator, file: std_compat.fs.File, max_size
     if (stat.size > effective_max_size)
         return error.ImageTooLarge;
 
-    const data = try file.readToEndAlloc(allocator, @intCast(effective_max_size));
+    const read_limit = if (effective_max_size < max_usize_u64) effective_max_size + 1 else effective_max_size;
+    const data = try file.readToEndAlloc(allocator, @intCast(read_limit));
     errdefer allocator.free(data);
+    if (data.len > effective_max_size) return error.ImageTooLarge;
 
     const mime = detectMimeType(data) orelse return error.UnknownImageFormat;
 
@@ -701,8 +703,8 @@ test "isUrl relative path" {
 
 test "MultimodalConfig defaults" {
     const cfg = MultimodalConfig{};
-    try std.testing.expectEqual(@as(u32, 4), cfg.max_images);
-    try std.testing.expectEqual(@as(u64, 5_242_880), cfg.max_image_size_bytes);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_images);
+    try std.testing.expectEqual(@as(u64, 25 * 1024 * 1024), cfg.max_image_size_bytes);
 }
 
 test "prepareMessagesForProvider no markers passes through" {
@@ -876,6 +878,55 @@ test "readLocalImage allows any path when skip_dir_check is set" {
 
     try std.testing.expectEqualStrings("image/png", result.mime_type);
     try std.testing.expect(result.data.len > 0);
+}
+
+test "prepareMessagesForProvider preserves valid transparent 1x1 PNG bytes" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const png = "\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0bIDAT\x08\xd7c\x60\x00\x02\x00\x00\x05\x00\x01\xe2\x26\x05\x9b\x00\x00\x00\x00IEND\xaeB\x60\x82";
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "transparent.png", .data = png });
+    const dir_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir_path, "transparent.png" });
+    defer std.testing.allocator.free(file_path);
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "[IMAGE:{s}]", .{file_path});
+    defer std.testing.allocator.free(marker);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var messages = [_]ChatMessage{ChatMessage.user(marker)};
+    const prepared = try prepareMessagesForProvider(arena.allocator(), &messages, .{ .allowed_dirs = &.{dir_path} });
+    const part = prepared[0].content_parts.?[0].image_base64;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(part.data);
+    const decoded = try std.testing.allocator.alloc(u8, decoded_len);
+    defer std.testing.allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, part.data);
+    try std.testing.expectEqualStrings(png, decoded);
+    try std.testing.expectEqual(@as(u64, 25 * 1024 * 1024), default_config.max_image_size_bytes);
+}
+
+test "readLocalImage accepts 25 MiB and rejects the next byte" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const dir_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir_path, "boundary.png" });
+    defer std.testing.allocator.free(file_path);
+    const file = try std_compat.fs.Dir.wrap(tmp_dir.dir).createFile("boundary.png", .{});
+    try file.writeAll("\x89PNG\x0d\x0a\x1a\x0a");
+    try file.seekTo(25 * 1024 * 1024 - 1);
+    try file.writeAll(&.{0});
+    file.close();
+
+    const image = try readLocalImage(std.testing.allocator, file_path, .{ .allowed_dirs = &.{dir_path} });
+    defer std.testing.allocator.free(image.data);
+    try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), image.data.len);
+
+    const oversized = try std_compat.fs.openFileAbsolute(file_path, .{ .mode = .read_write });
+    try oversized.seekTo(25 * 1024 * 1024);
+    try oversized.writeAll(&.{0});
+    oversized.close();
+    try std.testing.expectError(error.ImageTooLarge, readLocalImage(std.testing.allocator, file_path, .{ .allowed_dirs = &.{dir_path} }));
 }
 
 test "prepareMessagesForProvider does not delete nullclaw temp image files" {

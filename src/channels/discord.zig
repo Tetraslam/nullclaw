@@ -8,6 +8,7 @@ const interaction_choices = @import("../interactions/choices.zig");
 const control_plane = @import("../control_plane.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const discord_attachment = @import("discord_attachment.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -102,6 +103,9 @@ pub const DiscordChannel = struct {
     guild_id: ?[]const u8,
     allow_bots: bool,
     account_id: []const u8 = "default",
+    workspace_dir: []const u8 = ".",
+    attachment_download_fn: discord_attachment.DownloadFn = discord_attachment.curlDownload,
+    attachment_download_ctx: ?*anyopaque = null,
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
@@ -237,6 +241,10 @@ pub const DiscordChannel = struct {
 
     pub fn setBus(self: *DiscordChannel, b: *bus_mod.Bus) void {
         self.bus = b;
+    }
+
+    pub fn setWorkspaceDir(self: *DiscordChannel, workspace_dir: []const u8) void {
+        self.workspace_dir = workspace_dir;
     }
 
     // ── Gateway liveness helpers ──────────────────────────────────────────
@@ -1944,71 +1952,136 @@ pub const DiscordChannel = struct {
             return;
         }
 
-        // Process attachments (if any)
+        // Build the complete atomic ingress body, including a truthful receipt for
+        // every attachment. Durable files survive only after bus publication.
         var content_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer content_buf.deinit(self.allocator);
+        var attachment_store: ?discord_attachment.MessageStore = null;
+        var published = false;
+        defer if (attachment_store) |*store| {
+            if (store.created and !published) store.cleanupCreated() catch |err|
+                log.err("Discord: failed to clean unpublished attachment directory message={s}: {}", .{ store.message_id, err });
+            store.deinit();
+        };
 
         const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
         if (guild_id != null and control_plane.parseSlashCommand(trimmed_content) == null) {
             const speaker = author_nickname orelse author_display_name orelse author_username orelse author_id;
-            content_buf.appendSlice(self.allocator, "[") catch {};
-            content_buf.appendSlice(self.allocator, speaker) catch {};
+            try content_buf.appendSlice(self.allocator, "[");
+            try content_buf.appendSlice(self.allocator, speaker);
             if (author_username) |username| {
                 if (!std.mem.eql(u8, speaker, username)) {
-                    content_buf.appendSlice(self.allocator, " (@") catch {};
-                    content_buf.appendSlice(self.allocator, username) catch {};
-                    content_buf.appendSlice(self.allocator, ")") catch {};
+                    try content_buf.appendSlice(self.allocator, " (@");
+                    try content_buf.appendSlice(self.allocator, username);
+                    try content_buf.appendSlice(self.allocator, ")");
                 }
             }
-            content_buf.appendSlice(self.allocator, "]: ") catch {};
+            try content_buf.appendSlice(self.allocator, "]: ");
         }
         if (content.len > 0) {
-            content_buf.appendSlice(self.allocator, content) catch {};
+            try content_buf.appendSlice(self.allocator, content);
         }
 
         if (d_obj.get("attachments")) |att_val| {
             if (att_val == .array) {
-                const rand = std_compat.crypto.random;
-                for (att_val.array.items) |att_item| {
-                    if (att_item == .object) {
-                        if (att_item.object.get("url")) |url_val| {
-                            if (url_val == .string) {
-                                const attach_url = url_val.string;
-
-                                // Download it
-                                if (root.http_util.curlGet(self.allocator, attach_url, &.{}, "30")) |img_data| {
-                                    defer self.allocator.free(img_data);
-
-                                    // Make temp file
-                                    const rand_id = rand.int(u64);
-                                    var path_buf: [1024]u8 = undefined;
-                                    const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
-
-                                    if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
-                                        file.writeAll(img_data) catch {
-                                            file.close();
-                                            continue;
-                                        };
-                                        file.close();
-
-                                        if (content_buf.items.len > 0) content_buf.appendSlice(self.allocator, "\n") catch {};
-                                        content_buf.appendSlice(self.allocator, "[IMAGE:") catch {};
-                                        content_buf.appendSlice(self.allocator, local_path) catch {};
-                                        content_buf.appendSlice(self.allocator, "]") catch {};
-                                    } else |_| {}
-                                } else |err| {
-                                    log.warn("Discord: failed to download attachment: {}", .{err});
-                                }
-                            }
-                        }
+                const attachment_count = @min(att_val.array.items.len, discord_attachment.MAX_ATTACHMENTS_PER_MESSAGE);
+                for (att_val.array.items[0..attachment_count]) |att_item| {
+                    const object = if (att_item == .object) att_item.object else null;
+                    const attachment = if (object) |value| discord_attachment.parse(value) catch |err| {
+                        log.warn("Discord: invalid attachment message={s}: {}", .{ message_id orelse "unknown", err });
+                        try discord_attachment.appendInvalidReceipt(&content_buf, self.allocator, value, message_id orelse "", @errorName(err));
+                        continue;
+                    } else {
+                        log.warn("Discord: invalid attachment item message={s}", .{message_id orelse "unknown"});
+                        try discord_attachment.appendInvalidReceipt(&content_buf, self.allocator, null, message_id orelse "", "InvalidAttachment");
+                        continue;
+                    };
+                    const safe_name = try discord_attachment.sanitizeFilename(self.allocator, attachment.filename);
+                    defer self.allocator.free(safe_name);
+                    if (attachment.size > discord_attachment.MAX_ATTACHMENT_BYTES) {
+                        log.warn("Discord: attachment exceeds declared limit message={s} attachment={s} bytes={d}", .{ message_id orelse "unknown", attachment.id, attachment.size });
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, message_id orelse "unknown", null, null, null, "DeclaredSizeExceedsLimit");
+                        continue;
                     }
+                    const mid = message_id orelse {
+                        log.warn("Discord: attachment missing message ID attachment={s}", .{attachment.id});
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, "unknown", null, null, null, "MissingMessageId");
+                        continue;
+                    };
+                    if (attachment_store == null) {
+                        attachment_store = discord_attachment.openMessageStore(self.allocator, self.workspace_dir, channel_id, mid, true) catch |err| {
+                            log.warn("Discord: failed to open attachment store message={s} attachment={s}: {}", .{ mid, attachment.id, err });
+                            try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, null, null, null, @errorName(err));
+                            continue;
+                        };
+                    }
+                    if (!attachment_store.?.writable) {
+                        try discord_attachment.appendStoredReceipt(&content_buf, self.allocator, &attachment_store.?, attachment, safe_name);
+                        continue;
+                    }
+
+                    const leaf = try discord_attachment.attachmentLeaf(self.allocator, attachment);
+                    defer self.allocator.free(leaf);
+                    const local_path = try std_compat.fs.path.join(self.allocator, &.{ attachment_store.?.path, leaf });
+                    defer self.allocator.free(local_path);
+                    var file = attachment_store.?.dir.createFile(leaf, .{
+                        .read = true,
+                        .exclusive = true,
+                        .permissions = std_compat.fs.permissionsFromMode(0o600),
+                        .resolve_beneath = true,
+                    }) catch |err| {
+                        log.warn("Discord: failed to create attachment file message={s} attachment={s}: {}", .{ mid, attachment.id, err });
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, null, null, null, @errorName(err));
+                        continue;
+                    };
+                    var download_error: ?anyerror = null;
+                    _ = self.attachment_download_fn(
+                        self.attachment_download_ctx,
+                        self.allocator,
+                        attachment.url,
+                        &file,
+                        discord_attachment.MAX_ATTACHMENT_BYTES,
+                    ) catch |err| {
+                        download_error = err;
+                    };
+                    if (download_error) |err| {
+                        file.close();
+                        attachment_store.?.dir.deleteFile(leaf) catch |cleanup_err|
+                            log.err("Discord: failed to clean attachment message={s} attachment={s}: {}", .{ mid, attachment.id, cleanup_err });
+                        log.warn("Discord: failed to download attachment message={s} attachment={s}: {}", .{ mid, attachment.id, err });
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, null, null, null, @errorName(err));
+                        continue;
+                    }
+                    const stat = file.stat() catch |err| {
+                        file.close();
+                        attachment_store.?.dir.deleteFile(leaf) catch |cleanup_err|
+                            log.err("Discord: failed to clean attachment message={s} attachment={s}: {}", .{ mid, attachment.id, cleanup_err });
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, null, null, null, @errorName(err));
+                        continue;
+                    };
+                    const actual_bytes = stat.size;
+                    if (actual_bytes > discord_attachment.MAX_ATTACHMENT_BYTES) {
+                        file.close();
+                        attachment_store.?.dir.deleteFile(leaf) catch |cleanup_err|
+                            log.err("Discord: failed to clean attachment message={s} attachment={s}: {}", .{ mid, attachment.id, cleanup_err });
+                        try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, null, null, null, "ActualSizeExceedsLimit");
+                        continue;
+                    }
+                    const actual_mime = discord_attachment.detectFileMime(file);
+                    file.close();
+                    try discord_attachment.appendReceipt(&content_buf, self.allocator, attachment, safe_name, mid, local_path, actual_bytes, actual_mime, null);
                 }
+                if (att_val.array.items.len > attachment_count) {
+                    log.warn("Discord: attachment count exceeds limit message={s} count={d}", .{ message_id orelse "unknown", att_val.array.items.len });
+                    try discord_attachment.appendInvalidReceipt(&content_buf, self.allocator, null, message_id orelse "", "TooManyAttachments");
+                }
+            } else {
+                log.warn("Discord: attachments field is not an array message={s}", .{message_id orelse "unknown"});
+                try discord_attachment.appendInvalidReceipt(&content_buf, self.allocator, null, message_id orelse "", "AttachmentsNotArray");
             }
         }
 
-        const final_content = content_buf.toOwnedSlice(self.allocator) catch blk: {
-            break :blk try self.allocator.dupe(u8, content);
-        };
+        const final_content = try content_buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(final_content);
 
         // Build account-aware session key fallback to prevent cross-account bleed
@@ -2066,11 +2139,19 @@ pub const DiscordChannel = struct {
         );
 
         if (self.bus) |b| {
+            if (attachment_store) |*store| store.prepare() catch |err| {
+                log.err("Discord: failed to prepare attachment directory message={s}: {}", .{ store.message_id, err });
+                msg.deinit(self.allocator);
+                return;
+            };
             b.publishInbound(msg) catch |err| {
                 log.warn("Discord: failed to publish inbound message: {}", .{err});
                 msg.deinit(self.allocator);
                 return;
             };
+            published = true;
+            if (attachment_store) |*store| store.commitPublished() catch |err|
+                log.err("Discord: failed to commit published attachment directory message={s}: {}", .{ store.message_id, err });
             log.info("discord gw msg published chat={s} bytes={d}", .{ channel_id, final_content.len });
         } else {
             // No bus configured — free the message
@@ -3153,4 +3234,293 @@ test "discord reconnect backoff clears session on exhaustion" {
     try std.testing.expect(ch.resume_gateway_url == null);
     try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
+}
+
+const DiscordFixtureDownloader = struct {
+    calls: usize = 0,
+
+    fn download(raw_ctx: ?*anyopaque, _: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File, max_bytes: u64) !u64 {
+        const self: *DiscordFixtureDownloader = @ptrCast(@alignCast(raw_ctx.?));
+        self.calls += 1;
+        if (std.mem.endsWith(u8, url, "fail.bin")) {
+            try file.writeAll("partial");
+            return error.SimulatedDownloadFailure;
+        }
+
+        const bytes: []const u8 = if (std.mem.endsWith(u8, url, "tiny.png"))
+            // Valid transparent 1x1 PNG, retained byte-for-byte.
+            "\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0bIDAT\x08\xd7c\x60\x00\x02\x00\x00\x05\x00\x01\xe2\x26\x05\x9b\x00\x00\x00\x00IEND\xaeB\x60\x82"
+        else if (std.mem.endsWith(u8, url, ".jpg"))
+            "\xff\xd8\xff\xe0jpeg"
+        else if (std.mem.endsWith(u8, url, ".webp"))
+            "RIFF\x04\x00\x00\x00WEBP"
+        else if (std.mem.endsWith(u8, url, ".gif"))
+            "GIF89a"
+        else if (std.mem.endsWith(u8, url, ".bmp"))
+            "BMfixture"
+        else if (std.mem.endsWith(u8, url, ".png"))
+            "\x89PNG\x0d\x0a\x1a\x0a"
+        else
+            "%PDF-document";
+        const target_size: u64 = if (std.mem.endsWith(u8, url, "large.png")) 7_126_536 else bytes.len;
+        if (target_size > max_bytes) return error.AttachmentTooLarge;
+        try file.writeAll(bytes);
+        var remaining = target_size - bytes.len;
+        const zeroes = [_]u8{0} ** (64 * 1024);
+        while (remaining > 0) {
+            const count: usize = @intCast(@min(remaining, zeroes.len));
+            try file.writeAll(zeroes[0..count]);
+            remaining -= count;
+        }
+        return target_size;
+    }
+};
+
+fn discordAttachmentTestEvent(allocator: std.mem.Allocator, attachments_json: []const u8) !std.json.Parsed(std.json.Value) {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"d\":{{\"id\":\"200\",\"channel_id\":\"100\",\"content\":\"\",\"author\":{{\"id\":\"10\",\"username\":\"user\"}},\"attachments\":{s}}}}}",
+        .{attachments_json},
+    );
+    defer allocator.free(payload);
+    return std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+}
+
+test "discord attachment ingress streams 7 MiB image and retains successful atomic publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"image.png\",\"size\":7126536,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/attachments/100/300/large.png\",\"proxy_url\":\"https://media.discordapp.net/attachments/100/300/large.png\",\"width\":3000,\"height\":4000}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    var message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "[IMAGE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "bytes=7126536") != null);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace, "attachments", "discord", "100", "200", "300-image.png" });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqual(@as(u64, 7_126_536), (try fs_compat.statPath(path)).size);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var messages = [_]@import("../providers/root.zig").ChatMessage{@import("../providers/root.zig").ChatMessage.user(message.content)};
+    const prepared = try @import("../multimodal.zig").prepareMessagesForProvider(
+        arena.allocator(),
+        &messages,
+        .{ .allowed_dirs = &.{workspace} },
+    );
+    const serialized = try @import("../providers/openrouter.zig").OpenRouterProvider.convertMessages(std.testing.allocator, prepared, null);
+    defer std.testing.allocator.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "data:image/png;base64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "[IMAGE:") == null);
+}
+
+test "discord attachment ingress classifies magic for PNG JPEG WebP GIF BMP and excludes documents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"301\",\"filename\":\"tiny.png\",\"size\":68,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/tiny.png\"},{\"id\":\"302\",\"filename\":\"photo.jpg\",\"size\":8,\"content_type\":\"image/jpeg\",\"url\":\"https://cdn.discordapp.com/photo.jpg\"},{\"id\":\"303\",\"filename\":\"a.webp\",\"size\":12,\"content_type\":\"image/webp\",\"url\":\"https://cdn.discordapp.com/a.webp\"},{\"id\":\"304\",\"filename\":\"a.gif\",\"size\":6,\"content_type\":\"image/gif\",\"url\":\"https://cdn.discordapp.com/a.gif\"},{\"id\":\"305\",\"filename\":\"a.bmp\",\"size\":9,\"content_type\":\"image/bmp\",\"url\":\"https://cdn.discordapp.com/a.bmp\"},{\"id\":\"306\",\"filename\":\"report.pdf\",\"size\":13,\"content_type\":\"application/pdf\",\"url\":\"https://cdn.discordapp.com/report.pdf\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    var message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, message.content, "[IMAGE:"));
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "name=report.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "actual_mime=image/png") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var messages = [_]@import("../providers/root.zig").ChatMessage{@import("../providers/root.zig").ChatMessage.user(message.content)};
+    const prepared = try @import("../multimodal.zig").prepareMessagesForProvider(
+        arena.allocator(),
+        &messages,
+        .{ .allowed_dirs = &.{workspace} },
+    );
+    var image_parts: usize = 0;
+    for (prepared[0].content_parts orelse &.{}) |part| switch (part) {
+        .image_base64 => image_parts += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 5), image_parts);
+}
+
+test "discord attachment ingress trusts magic over content type and extension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"pretend.png\",\"size\":13,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/document.bin\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    var message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "declared_mime=image/png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "actual_mime=application/pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "[IMAGE:") == null);
+}
+
+test "discord attachment ingress rejects declared oversize without invoking downloader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"huge.png\",\"size\":52428801,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/huge.png\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    var message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), downloader.calls);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "reason=DeclaredSizeExceedsLimit") != null);
+}
+
+test "discord attachment ingress removes partial download and new directory on failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"broken.bin\",\"size\":7,\"content_type\":\"application/octet-stream\",\"url\":\"https://cdn.discordapp.com/fail.bin\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    var message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, message.content, "reason=SimulatedDownloadFailure") != null);
+    const dir = try discord_attachment.messageDir(std.testing.allocator, workspace, "100", "200");
+    defer std.testing.allocator.free(dir);
+    const partial = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "300-broken.bin" });
+    defer std.testing.allocator.free(partial);
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(partial, .{}));
+}
+
+test "discord attachment ingress sanitizes traversal and cleans files without bus" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"../../evil.png\",\"size\":8,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/image.png\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), downloader.calls);
+    const dir = try discord_attachment.messageDir(std.testing.allocator, workspace, "100", "200");
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(dir, .{}));
+}
+
+test "discord attachment replay reuses published files without mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const attachments = "[{\"id\":\"300\",\"filename\":\"image.png\",\"size\":8,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/image.png\"}]";
+
+    const first = try discordAttachmentTestEvent(std.testing.allocator, attachments);
+    defer first.deinit();
+    try channel.handleMessageCreate(first.value);
+    var first_message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer first_message.deinit(std.testing.allocator);
+
+    const second = try discordAttachmentTestEvent(std.testing.allocator, attachments);
+    defer second.deinit();
+    try channel.handleMessageCreate(second.value);
+    var second_message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer second_message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), downloader.calls);
+    try std.testing.expect(std.mem.indexOf(u8, second_message.content, "status=stored") != null);
+}
+
+test "discord attachment ingress cleans files when publication fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var downloader = DiscordFixtureDownloader{};
+    var event_bus = bus_mod.Bus.init();
+    event_bus.close();
+    var channel = DiscordChannel.initFromConfig(std.testing.allocator, .{ .token = "token", .allow_from = &.{"10"} });
+    channel.setWorkspaceDir(workspace);
+    channel.attachment_download_fn = DiscordFixtureDownloader.download;
+    channel.attachment_download_ctx = &downloader;
+    channel.setBus(&event_bus);
+    const parsed = try discordAttachmentTestEvent(
+        std.testing.allocator,
+        "[{\"id\":\"300\",\"filename\":\"image.png\",\"size\":8,\"content_type\":\"image/png\",\"url\":\"https://cdn.discordapp.com/image.png\"}]",
+    );
+    defer parsed.deinit();
+    try channel.handleMessageCreate(parsed.value);
+    const dir = try discord_attachment.messageDir(std.testing.allocator, workspace, "100", "200");
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(dir, .{}));
 }
