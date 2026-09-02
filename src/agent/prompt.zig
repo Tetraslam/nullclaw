@@ -485,7 +485,10 @@ pub fn buildSystemPrompt(
     try w.writeAll("When using the `schedule` tool to create reminders:\n");
     try w.writeAll("- ALWAYS use double quotes (\") for the command string\n");
     try w.writeAll("- Example: `echo \"Time is up!\"`\n");
-    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
+    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n");
+    try w.writeAll("- Claim that a reminder, watcher, or future notification exists only after `schedule` succeeds and returns a job ID. If scheduling fails, say so plainly.\n");
+    try w.writeAll("- For asynchronous work, define the real completion condition. Queued, submitted, or downloading is not complete when the user asked for an imported or usable result.\n");
+    try w.writeAll("- Use a one-shot agent task for a future completion check. If the condition is still pending, that task should schedule the next check; notify only on verified success or terminal failure.\n\n");
 
     // Web Search guidance
     try w.writeAll("## External Information and Web Search\n\n");
@@ -1366,6 +1369,7 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "only after `schedule` succeeds and returns a job ID") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
 }
 

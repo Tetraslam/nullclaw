@@ -270,6 +270,11 @@ const ParsedAgentArgs = struct {
     skill_name: ?[]const u8 = null,
     origin_channel: ?[]const u8 = null,
     origin_account_id: ?[]const u8 = null,
+    origin_chat_id: ?[]const u8 = null,
+    origin_peer_kind: ?[]const u8 = null,
+    origin_peer_id: ?[]const u8 = null,
+    origin_thread_id: ?[]const u8 = null,
+    scheduler_local_store: bool = false,
     verbose: bool = false,
 };
 
@@ -325,6 +330,24 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.origin_account_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-chat-id")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_chat_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-peer-kind")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_peer_kind = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-peer-id")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_peer_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-thread-id")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_thread_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--scheduler-local-store")) {
+            parsed.scheduler_local_store = true;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
@@ -414,6 +437,29 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return;
         },
     };
+    tools_mod.schedule.setLocalStoreOnly(parsed_args.scheduler_local_store, cfg.scheduler.max_tasks);
+    defer tools_mod.schedule.setLocalStoreOnly(false, null);
+    var schedule_context = tools_mod.schedule.ScheduleTool{};
+    const origin_peer_kind: ?agent_routing.ChatType = if (parsed_args.origin_peer_kind) |kind|
+        if (std.mem.eql(u8, kind, "direct"))
+            .direct
+        else if (std.mem.eql(u8, kind, "group"))
+            .group
+        else if (std.mem.eql(u8, kind, "channel"))
+            .channel
+        else
+            null
+    else
+        null;
+    schedule_context.setContext(
+        parsed_args.origin_channel,
+        parsed_args.origin_account_id,
+        parsed_args.origin_chat_id,
+        origin_peer_kind,
+        parsed_args.origin_peer_id,
+        parsed_args.origin_thread_id,
+    );
+    defer schedule_context.setContext(null, null, null, null, null, null);
     if (parsed_args.provider_override) |provider| {
         if (parsed_args.agent_name == null) {
             cfg.default_provider = provider;
@@ -1318,6 +1364,15 @@ test "parseAgentArgs parses cron origin attribution" {
         "telegram",
         "--origin-account-id",
         "main",
+        "--origin-chat-id",
+        "chat-42",
+        "--origin-peer-kind",
+        "group",
+        "--origin-peer-id",
+        "group-42",
+        "--origin-thread-id",
+        "thread-7",
+        "--scheduler-local-store",
         "-m",
         "go",
     };
@@ -1327,6 +1382,11 @@ test "parseAgentArgs parses cron origin attribution" {
     };
     try std.testing.expectEqualStrings("telegram", parsed.origin_channel.?);
     try std.testing.expectEqualStrings("main", parsed.origin_account_id.?);
+    try std.testing.expectEqualStrings("chat-42", parsed.origin_chat_id.?);
+    try std.testing.expectEqualStrings("group", parsed.origin_peer_kind.?);
+    try std.testing.expectEqualStrings("group-42", parsed.origin_peer_id.?);
+    try std.testing.expectEqualStrings("thread-7", parsed.origin_thread_id.?);
+    try std.testing.expect(parsed.scheduler_local_store);
     try std.testing.expectEqualStrings("go", parsed.message_arg.?);
 }
 

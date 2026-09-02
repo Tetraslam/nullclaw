@@ -17,6 +17,11 @@ pub const AgentRunResult = struct {
 pub const AgentRunOptions = struct {
     origin_channel: ?[]const u8 = null,
     origin_account_id: ?[]const u8 = null,
+    origin_chat_id: ?[]const u8 = null,
+    origin_peer_kind: ?[]const u8 = null,
+    origin_peer_id: ?[]const u8 = null,
+    origin_thread_id: ?[]const u8 = null,
+    scheduler_local_store: bool = false,
 };
 
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -213,6 +218,23 @@ fn appendAgentArgv(
         try argv.append(allocator, "--origin-account-id");
         try argv.append(allocator, account_id);
     }
+    if (options.origin_chat_id) |chat_id| {
+        try argv.append(allocator, "--origin-chat-id");
+        try argv.append(allocator, chat_id);
+    }
+    if (options.origin_peer_kind) |peer_kind| {
+        try argv.append(allocator, "--origin-peer-kind");
+        try argv.append(allocator, peer_kind);
+    }
+    if (options.origin_peer_id) |peer_id| {
+        try argv.append(allocator, "--origin-peer-id");
+        try argv.append(allocator, peer_id);
+    }
+    if (options.origin_thread_id) |thread_id| {
+        try argv.append(allocator, "--origin-thread-id");
+        try argv.append(allocator, thread_id);
+    }
+    if (options.scheduler_local_store) try argv.append(allocator, "--scheduler-local-store");
     try argv.append(allocator, "-m");
     try argv.append(allocator, prompt);
 }
@@ -476,6 +498,11 @@ test "appendAgentArgv includes cron origin attribution" {
     try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "Summarize status", "test-model", .{
         .origin_channel = "telegram",
         .origin_account_id = "main",
+        .origin_chat_id = "chat-42",
+        .origin_peer_kind = "group",
+        .origin_peer_id = "group-42",
+        .origin_thread_id = "thread-7",
+        .scheduler_local_store = true,
     });
 
     const expected = [_][]const u8{
@@ -487,6 +514,15 @@ test "appendAgentArgv includes cron origin attribution" {
         "telegram",
         "--origin-account-id",
         "main",
+        "--origin-chat-id",
+        "chat-42",
+        "--origin-peer-kind",
+        "group",
+        "--origin-peer-id",
+        "group-42",
+        "--origin-thread-id",
+        "thread-7",
+        "--scheduler-local-store",
         "-m",
         "Summarize status",
     };

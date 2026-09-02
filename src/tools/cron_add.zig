@@ -72,7 +72,11 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            cron.saveJobs(&scheduler) catch |err| {
+                _ = scheduler.removeJob(job.id);
+                const msg = try std.fmt.allocPrint(allocator, "Failed to save scheduler state: {s}", .{@errorName(err)});
+                return .{ .success = false, .output = "", .error_msg = msg };
+            };
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,
@@ -88,7 +92,11 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            cron.saveJobs(&scheduler) catch |err| {
+                _ = scheduler.removeJob(job.id);
+                const msg = try std.fmt.allocPrint(allocator, "Failed to save scheduler state: {s}", .{@errorName(err)});
+                return .{ .success = false, .output = "", .error_msg = msg };
+            };
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,

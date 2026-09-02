@@ -107,6 +107,40 @@ pub const DeliveryConfig = struct {
     thread_id_owned: bool = false,
 };
 
+var live_scheduler: ?*CronScheduler = null;
+var live_scheduler_mutex: std_compat.sync.Mutex = .{};
+
+/// Holds exclusive access to the daemon-owned scheduler until `deinit`.
+pub const LiveSchedulerGuard = struct {
+    scheduler: ?*CronScheduler,
+    locked: bool = true,
+
+    pub fn deinit(self: *LiveSchedulerGuard) void {
+        if (!self.locked) return;
+        self.locked = false;
+        live_scheduler_mutex.unlock();
+    }
+};
+
+pub fn lockLiveScheduler() LiveSchedulerGuard {
+    live_scheduler_mutex.lock();
+    return .{ .scheduler = live_scheduler };
+}
+
+/// The scheduler thread owns the registered pointer and must clear it before
+/// destroying the scheduler.
+pub fn registerLiveScheduler(scheduler: *CronScheduler) void {
+    live_scheduler_mutex.lock();
+    defer live_scheduler_mutex.unlock();
+    live_scheduler = scheduler;
+}
+
+pub fn clearLiveScheduler(scheduler: *CronScheduler) void {
+    live_scheduler_mutex.lock();
+    defer live_scheduler_mutex.unlock();
+    if (live_scheduler == scheduler) live_scheduler = null;
+}
+
 fn chatTypeAsStr(kind: agent_routing.ChatType) []const u8 {
     return switch (kind) {
         .direct => "direct",
@@ -623,6 +657,49 @@ pub const CronScheduler = struct {
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 
+    fn duplicateDelivery(self: *CronScheduler, delivery: DeliveryConfig) !DeliveryConfig {
+        var owned = DeliveryConfig{
+            .mode = delivery.mode,
+            .peer_kind = delivery.peer_kind,
+            .best_effort = delivery.best_effort,
+        };
+        errdefer {
+            if (owned.channel) |value| self.allocator.free(value);
+            if (owned.account_id) |value| self.allocator.free(value);
+            if (owned.to) |value| self.allocator.free(value);
+            if (owned.peer_id) |value| self.allocator.free(value);
+            if (owned.thread_id) |value| self.allocator.free(value);
+        }
+
+        if (delivery.channel) |value| owned.channel = try self.allocator.dupe(u8, value);
+        if (delivery.account_id) |value| owned.account_id = try self.allocator.dupe(u8, value);
+        if (delivery.to) |value| owned.to = try self.allocator.dupe(u8, value);
+        if (delivery.peer_id) |value| owned.peer_id = try self.allocator.dupe(u8, value);
+        if (delivery.thread_id) |value| owned.thread_id = try self.allocator.dupe(u8, value);
+        owned.channel_owned = owned.channel != null;
+        owned.account_id_owned = owned.account_id != null;
+        owned.to_owned = owned.to != null;
+        owned.peer_id_owned = owned.peer_id != null;
+        owned.thread_id_owned = owned.thread_id != null;
+        return owned;
+    }
+
+    /// Add a recurring shell job and make the delivery routing scheduler-owned.
+    pub fn addShellJob(self: *CronScheduler, expression: []const u8, command: []const u8, delivery: DeliveryConfig) !*CronJob {
+        const job = try self.addJob(expression, command);
+        errdefer _ = self.removeJob(job.id);
+        job.delivery = try self.duplicateDelivery(delivery);
+        return job;
+    }
+
+    /// Add a one-shot shell job and make the delivery routing scheduler-owned.
+    pub fn addShellOnce(self: *CronScheduler, delay: []const u8, command: []const u8, delivery: DeliveryConfig) !*CronJob {
+        const job = try self.addOnce(delay, command);
+        errdefer _ = self.removeJob(job.id);
+        job.delivery = try self.duplicateDelivery(delivery);
+        return job;
+    }
+
     /// Add a recurring agent job.
     pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
@@ -1095,6 +1172,11 @@ fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOpt
     return .{
         .origin_channel = delivery.channel,
         .origin_account_id = delivery.account_id,
+        .origin_chat_id = delivery.to,
+        .origin_peer_kind = if (delivery.peer_kind) |kind| chatTypeAsStr(kind) else null,
+        .origin_peer_id = delivery.peer_id,
+        .origin_thread_id = delivery.thread_id,
+        .scheduler_local_store = true,
     };
 }
 
@@ -2637,6 +2719,23 @@ fn resetCronStoreForTest(allocator: std.mem.Allocator) !void {
     };
 }
 
+pub const TestCronStoreGuard = struct {
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !TestCronStoreGuard {
+        cron_store_test_mutex.lock();
+        errdefer cron_store_test_mutex.unlock();
+        try resetCronStoreForTest(allocator);
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *TestCronStoreGuard) void {
+        resetCronStoreForTest(self.allocator) catch {};
+        cron_store_test_mutex.unlock();
+        self.* = undefined;
+    }
+};
+
 test "parseDuration minutes" {
     try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
 }
@@ -3770,9 +3869,18 @@ test "agent run options preserve cron delivery attribution" {
     const options = agentRunOptionsForDelivery(.{
         .channel = "telegram",
         .account_id = "main",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "group-42",
+        .thread_id = "thread-7",
     });
     try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
     try std.testing.expectEqualStrings("main", options.origin_account_id.?);
+    try std.testing.expectEqualStrings("chat-42", options.origin_chat_id.?);
+    try std.testing.expectEqualStrings("group", options.origin_peer_kind.?);
+    try std.testing.expectEqualStrings("group-42", options.origin_peer_id.?);
+    try std.testing.expectEqualStrings("thread-7", options.origin_thread_id.?);
+    try std.testing.expect(options.scheduler_local_store);
 }
 
 test "DeliveryMode parse and asStr" {

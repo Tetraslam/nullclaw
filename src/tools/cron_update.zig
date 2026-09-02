@@ -93,7 +93,10 @@ pub const CronUpdateTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
-        cron.saveJobs(&scheduler) catch {};
+        cron.saveJobs(&scheduler) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to save scheduler state: {s}", .{@errorName(err)});
+            return .{ .success = false, .output = "", .error_msg = msg };
+        };
 
         // Build summary of what changed
         var buf: std.ArrayList(u8) = .empty;
@@ -155,7 +158,7 @@ test "cron_update_expression" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     const job = try scheduler.addJob("*/5 * * * *", "echo test");
-    cron.saveJobs(&scheduler) catch {};
+    try cron.saveJobs(&scheduler);
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"expression\": \"*/10 * * * *\"}}", .{job.id});
     defer std.testing.allocator.free(args);
@@ -176,7 +179,7 @@ test "cron_update_disable" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     const job = try scheduler.addJob("*/5 * * * *", "echo test");
-    cron.saveJobs(&scheduler) catch {};
+    try cron.saveJobs(&scheduler);
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"enabled\": false}}", .{job.id});
     defer std.testing.allocator.free(args);

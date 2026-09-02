@@ -517,8 +517,6 @@ fn mergeSchedulerTickChangesAndSave(
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
-    const gateway_mod = @import("gateway.zig");
-
     const runtime_observer = observability.RuntimeObserver.create(
         allocator,
         .{
@@ -542,7 +540,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
-    defer gateway_mod.clearSharedScheduler();
+    defer cron.clearLiveScheduler(&scheduler);
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
         clearSchedulerSnapshot(allocator, &before_tick);
@@ -554,17 +552,17 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // Initial load from disk (ignore errors — start empty if file missing/corrupt)
     cron.loadJobs(&scheduler) catch {};
 
-    // Register live scheduler pointer with the gateway for /cron HTTP endpoints.
-    gateway_mod.setSharedScheduler(&scheduler);
+    // Register the daemon-owned scheduler for in-process tools and HTTP handlers.
+    cron.registerLiveScheduler(&scheduler);
 
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
         var snapshot_ok = true;
-        gateway_mod.lockSharedScheduler();
+        var scheduler_guard = cron.lockLiveScheduler();
         {
-            defer gateway_mod.unlockSharedScheduler();
+            defer scheduler_guard.deinit();
 
             // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
             cron.reloadJobs(&scheduler) catch |err| {

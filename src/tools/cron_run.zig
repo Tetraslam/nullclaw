@@ -58,7 +58,10 @@ pub const CronRunTool = struct {
                 job.last_status = "error";
                 job.last_run_secs = std_compat.time.timestamp();
             }
-            cron.saveJobs(&scheduler) catch {};
+            cron.saveJobs(&scheduler) catch |save_err| {
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' execution failed and scheduler state could not be saved: {s}", .{ job_id, @errorName(save_err) });
+                return .{ .success = false, .output = "", .error_msg = msg };
+            };
 
             const msg = try std.fmt.allocPrint(allocator, "Job '{s}' execution failed: {s}", .{ job_id, @errorName(err) });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -78,7 +81,10 @@ pub const CronRunTool = struct {
             job.last_status = status_str;
             job.last_run_secs = std_compat.time.timestamp();
         }
-        cron.saveJobs(&scheduler) catch {};
+        cron.saveJobs(&scheduler) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to save scheduler state: {s}", .{@errorName(err)});
+            return .{ .success = false, .output = "", .error_msg = msg };
+        };
 
         const status_label: []const u8 = if (success) "ok" else "error";
         const output = if (result.stdout.len > 0) result.stdout else result.stderr;

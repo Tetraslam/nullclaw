@@ -3059,7 +3059,7 @@ fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
 
 fn cronObjectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
-    if (value == .string and value.string.len > 0) return value.string;
+    if (value == .string and std.mem.trim(u8, value.string, " \t\r\n").len > 0) return value.string;
     return null;
 }
 
@@ -3067,11 +3067,6 @@ fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     const value = obj.get(key) orelse return null;
     if (value == .bool) return value.bool;
     return null;
-}
-
-fn lockSharedSchedulerForRequest() ?*cron_mod.CronScheduler {
-    g_shared_scheduler_mutex.lock();
-    return g_shared_scheduler;
 }
 
 /// Serialize a single CronJob to a JSON object appended to `buf`.
@@ -3165,13 +3160,13 @@ fn handleCronList(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"method not allowed\"}";
         return;
     }
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     buf.appendSlice(ctx.req_allocator, "[") catch {
@@ -3264,13 +3259,13 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         return;
     }
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     const delivery = cron_mod.enrichDeliveryRouting(.{
         .mode = if (delivery_mode_opt) |raw|
@@ -3309,7 +3304,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing command or prompt\"}";
                 return;
             };
-            break :blk sched.addOnce(delay, cmd) catch |err| {
+            break :blk sched.addShellOnce(delay, cmd, delivery) catch |err| {
                 ctx.response_status = "400 Bad Request";
                 ctx.response_body = if (err == error.MaxTasksReached)
                     "{\"error\":\"max tasks reached\"}"
@@ -3337,7 +3332,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"missing command or prompt\"}";
             return;
         };
-        break :blk sched.addJob(expression_opt.?, cmd) catch |err| {
+        break :blk sched.addShellJob(expression_opt.?, cmd, delivery) catch |err| {
             ctx.response_status = "400 Bad Request";
             ctx.response_body = if (err == error.MaxTasksReached)
                 "{\"error\":\"max tasks reached\"}"
@@ -3350,7 +3345,12 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     };
 
     job_ptr.session_target = session_target;
-    cron_mod.saveJobs(sched) catch {};
+    cron_mod.saveJobs(sched) catch {
+        _ = sched.removeJob(job_ptr.id);
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
+        return;
+    };
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
@@ -3389,20 +3389,24 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     if (!sched.removeJob(id)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    cron_mod.saveJobs(sched) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"removed\"}";
 }
@@ -3434,20 +3438,25 @@ fn handleCronPause(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     if (!sched.pauseJob(id)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    cron_mod.saveJobs(sched) catch {
+        _ = sched.resumeJob(id);
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"paused\"}";
 }
@@ -3479,20 +3488,25 @@ fn handleCronResume(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     if (!sched.resumeJob(id)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    cron_mod.saveJobs(sched) catch {
+        _ = sched.pauseJob(id);
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"resumed\"}";
 }
@@ -3542,13 +3556,13 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const enabled_explicit = cronObjectBoolField(obj, "enabled");
     const enabled_opt = if (enabled_explicit) |enabled| enabled else if (paused_opt) |paused| !paused else null;
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    var scheduler_guard = cron_mod.lockLiveScheduler();
+    defer scheduler_guard.deinit();
+    const sched = scheduler_guard.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
 
     if (session_target != null) {
         const existing = sched.getJob(id) orelse {
@@ -3572,12 +3586,16 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .enabled = enabled_opt,
     };
 
-    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+    if (!sched.updateJob(sched.allocator, id, patch)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found or update failed\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    cron_mod.saveJobs(sched) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"updated\"}";
 }
@@ -5684,31 +5702,6 @@ fn spawnMediaTranscribeWorker(
     thread.detach();
 }
 
-// ── Shared scheduler state for cross-thread access ───────────────
-
-var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
-var g_shared_scheduler_mutex: std_compat.sync.Mutex = .{};
-
-pub fn lockSharedScheduler() void {
-    g_shared_scheduler_mutex.lock();
-}
-
-pub fn unlockSharedScheduler() void {
-    g_shared_scheduler_mutex.unlock();
-}
-
-pub fn setSharedScheduler(sched: *cron_mod.CronScheduler) void {
-    g_shared_scheduler_mutex.lock();
-    defer g_shared_scheduler_mutex.unlock();
-    g_shared_scheduler = sched;
-}
-
-pub fn clearSharedScheduler() void {
-    g_shared_scheduler_mutex.lock();
-    defer g_shared_scheduler_mutex.unlock();
-    g_shared_scheduler = null;
-}
-
 fn nextAcceptSleepMs(previous_sleep_ms: u64, err: anyerror) u64 {
     if (err == error.WouldBlock) return ACCEPT_POLL_INTERVAL_MS;
     const base = if (previous_sleep_ms < ACCEPT_POLL_INTERVAL_MS) ACCEPT_POLL_INTERVAL_MS else previous_sleep_ms;
@@ -6593,27 +6586,38 @@ test "cron auth matrix: paired phase requires valid token" {
     try std.testing.expect(!isAdminRouteAuthorized(&guard, null));
 }
 
+test "cron HTTP authorization boundary remains transport-owned" {
+    try std.testing.expect(isCronRouteAuthorized(null, null, false));
+    try std.testing.expect(!isCronRouteAuthorized(null, null, true));
+
+    const tokens = [_][]const u8{"zc_cron_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(isCronRouteAuthorized(&guard, "zc_cron_token", true));
+    try std.testing.expect(!isCronRouteAuthorized(&guard, null, true));
+}
+
 test "shared scheduler registration sets and clears global pointer" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 4, true);
     defer scheduler.deinit();
-    defer clearSharedScheduler();
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
-    setSharedScheduler(&scheduler);
-    lockSharedScheduler();
-    try std.testing.expect(g_shared_scheduler == &scheduler);
-    unlockSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    var registered = cron_mod.lockLiveScheduler();
+    try std.testing.expect(registered.scheduler == &scheduler);
+    registered.deinit();
 
-    clearSharedScheduler();
-    lockSharedScheduler();
-    try std.testing.expect(g_shared_scheduler == null);
-    unlockSharedScheduler();
+    cron_mod.clearLiveScheduler(&scheduler);
+    var cleared = cron_mod.lockLiveScheduler();
+    defer cleared.deinit();
+    try std.testing.expect(cleared.scheduler == null);
 }
 
 test "handleCronAdd preserves delivery routing fields" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6660,11 +6664,61 @@ test "handleCronAdd preserves delivery routing fields" {
     try std.testing.expectEqualStrings("main", parsed.value.object.get("session_target").?.string);
 }
 
+test "handleCronAdd preserves shell delivery routing" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/11 * * * *\",\"command\":\"echo routed\",\"delivery_mode\":\"always\",\"delivery_channel\":\"discord\",\"delivery_account_id\":\"main\",\"delivery_to\":\"channel-7\",\"delivery_peer_kind\":\"direct\",\"delivery_peer_id\":\"user-7\"}";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const job = scheduler.listJobs()[0];
+    try std.testing.expectEqual(cron_mod.JobType.shell, job.job_type);
+    try std.testing.expectEqualStrings("discord", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", job.delivery.account_id.?);
+    try std.testing.expectEqualStrings("channel-7", job.delivery.to.?);
+    try std.testing.expectEqualStrings("user-7", job.delivery.peer_id.?);
+}
+
+test "cron request parsing treats whitespace-only strings as absent" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"id\":\" \\t\\r\\n\",\"command\":\"echo ok\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expect(cronObjectStringField(parsed.value.object, "id") == null);
+    try std.testing.expectEqualStrings("echo ok", cronObjectStringField(parsed.value.object, "command").?);
+}
+
 test "handleCronAdd supports one-shot delay payloads" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6702,8 +6756,8 @@ test "handleCronAdd supports one-shot delay payloads" {
 test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6746,8 +6800,8 @@ test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
 test "handleCronAdd rejects session_target for shell jobs" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6781,8 +6835,8 @@ test "handleCronAdd rejects session_target for shell jobs" {
 test "handleCronAdd rejects invalid session_target" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6817,8 +6871,8 @@ test "handleCronUpdate accepts session_target" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
     const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6853,8 +6907,8 @@ test "handleCronUpdate rejects session_target for shell jobs" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
     const job = try scheduler.addJob("* * * * *", "echo hello");
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6889,8 +6943,8 @@ test "handleCronUpdate rejects invalid session_target" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
     const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
-    setSharedScheduler(&scheduler);
-    defer clearSharedScheduler();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
