@@ -451,6 +451,7 @@ pub fn buildSystemPrompt(
             try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
             try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
             try w.writeAll("A question or @mention is not required. Participate sparingly when your contribution improves the conversation; otherwise stay quiet.\n\n");
+            try w.writeAll("Never use `[NO_REPLY]` to end a directed request merely because you sent an intermediate message. Complete the requested work and deliver its result.\n\n");
             try w.writeAll("When you choose NOT to reply, include `[NO_REPLY]` anywhere in your response. The system will suppress the message.\n\n");
             try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
             try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
@@ -1515,6 +1516,7 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Online now: Shresht (online), tetrapod (online)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Messages beginning with `[Discord reaction event]`") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "A question or @mention is not required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `[NO_REPLY]` to end a directed request") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "The message is not directed at you") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "not in the sender's DMs") != null);
 }
