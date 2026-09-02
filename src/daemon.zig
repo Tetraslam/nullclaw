@@ -539,6 +539,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
+    scheduler.setShellPolicy(cron.shellPolicyFromConfig(config));
     defer scheduler.deinit();
     defer cron.clearLiveScheduler(&scheduler);
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;

@@ -107,6 +107,20 @@ pub const DeliveryConfig = struct {
     thread_id_owned: bool = false,
 };
 
+pub fn shellPolicyFromConfig(config: *const Config) security_policy.SecurityPolicy {
+    return .{
+        .autonomy = config.autonomy.level,
+        .workspace_dir = config.workspace_dir,
+        .workspace_only = config.autonomy.workspace_only,
+        .allowed_commands = security_policy.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
+        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .block_medium_risk_commands = config.autonomy.block_medium_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
+    };
+}
+
 var live_scheduler: ?*CronScheduler = null;
 var live_scheduler_mutex: std_compat.sync.Mutex = .{};
 
@@ -2496,6 +2510,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     if (cfg_opt) |cfg| {
         scheduler.setShellCwd(cfg.workspace_dir);
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+        scheduler.setShellPolicy(shellPolicyFromConfig(&cfg));
     }
     try loadJobs(&scheduler);
     const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
@@ -3881,6 +3896,24 @@ test "agent run options preserve cron delivery attribution" {
     try std.testing.expectEqualStrings("group-42", options.origin_peer_id.?);
     try std.testing.expectEqualStrings("thread-7", options.origin_thread_id.?);
     try std.testing.expect(options.scheduler_local_store);
+}
+
+test "scheduler shell policy follows configured autonomy" {
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .autonomy = .{
+            .level = .yolo,
+            .workspace_only = false,
+            .allowed_commands = &.{"*"},
+        },
+    };
+    var scheduler = CronScheduler.init(std.testing.allocator, 1, true);
+    defer scheduler.deinit();
+    scheduler.setShellPolicy(shellPolicyFromConfig(&config));
+
+    _ = try scheduler.addShellOnce("1m", "printf scheduler-policy", .{});
 }
 
 test "DeliveryMode parse and asStr" {

@@ -6,6 +6,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const agent_routing = @import("../agent_routing.zig");
+const security_policy = @import("../security/policy.zig");
 const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
@@ -17,10 +18,12 @@ threadlocal var tls_schedule_peer_id: ?[]const u8 = null;
 threadlocal var tls_schedule_thread_id: ?[]const u8 = null;
 threadlocal var tls_schedule_local_store = false;
 threadlocal var tls_schedule_max_tasks: ?usize = null;
+threadlocal var tls_schedule_shell_policy: ?security_policy.SecurityPolicy = null;
 
-pub fn setLocalStoreOnly(enabled: bool, max_tasks: ?usize) void {
+pub fn setLocalStoreOnly(enabled: bool, max_tasks: ?usize, shell_policy: ?security_policy.SecurityPolicy) void {
     tls_schedule_local_store = enabled;
     tls_schedule_max_tasks = if (enabled) max_tasks else null;
+    tls_schedule_shell_policy = if (enabled) shell_policy else null;
 }
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
@@ -121,6 +124,7 @@ pub const ScheduleTool = struct {
 
 fn loadSchedulerWithMaxTasks(allocator: std.mem.Allocator, max_tasks: usize) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, max_tasks, true);
+    if (tls_schedule_shell_policy) |policy| scheduler.setShellPolicy(policy);
     cron.loadJobs(&scheduler) catch {};
     return scheduler;
 }

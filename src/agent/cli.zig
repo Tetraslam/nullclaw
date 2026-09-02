@@ -10,6 +10,7 @@ const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const config_types = @import("../config_types.zig");
 const agent_routing = @import("../agent_routing.zig");
+const cron = @import("../cron.zig");
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const http_util = @import("../http_util.zig");
@@ -437,8 +438,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return;
         },
     };
-    tools_mod.schedule.setLocalStoreOnly(parsed_args.scheduler_local_store, cfg.scheduler.max_tasks);
-    defer tools_mod.schedule.setLocalStoreOnly(false, null);
+    tools_mod.schedule.setLocalStoreOnly(parsed_args.scheduler_local_store, cfg.scheduler.max_tasks, cron.shellPolicyFromConfig(&cfg));
+    defer tools_mod.schedule.setLocalStoreOnly(false, null, null);
     var schedule_context = tools_mod.schedule.ScheduleTool{};
     const origin_peer_kind: ?agent_routing.ChatType = if (parsed_args.origin_peer_kind) |kind|
         if (std.mem.eql(u8, kind, "direct"))
