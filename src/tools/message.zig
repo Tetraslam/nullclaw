@@ -17,6 +17,11 @@ threadlocal var turn_default_chat_id: ?[]const u8 = null;
 threadlocal var turn_message_sent: bool = false;
 threadlocal var turn_context_active: bool = false;
 
+fn getNonEmptyString(args: JsonObjectMap, key: []const u8) ?[]const u8 {
+    const value = root.getString(args, key) orelse return null;
+    return if (std.mem.trim(u8, value, " \t\n\r").len > 0) value else null;
+}
+
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
     event_bus: ?*bus.Bus = null,
@@ -90,12 +95,12 @@ pub const MessageTool = struct {
         if (std.mem.trim(u8, content, " \t\n\r").len == 0)
             return ToolResult.fail("'content' must not be empty");
 
-        const explicit_channel = root.getString(args, "channel");
+        const explicit_channel = getNonEmptyString(args, "channel");
         const channel = explicit_channel orelse
             (turn_default_channel orelse self.default_channel orelse
                 return ToolResult.fail("No channel specified and no default channel set"));
 
-        const chat_id = root.getString(args, "chat_id") orelse blk: {
+        const chat_id = getNonEmptyString(args, "chat_id") orelse blk: {
             if (explicit_channel != null) {
                 const default_channel = turn_default_channel orelse self.default_channel;
                 if (default_channel == null or !std.mem.eql(u8, channel, default_channel.?)) {
@@ -109,10 +114,7 @@ pub const MessageTool = struct {
         const event_bus = self.event_bus orelse
             return ToolResult.fail("Message tool not connected to event bus");
 
-        const explicit_account_id: ?[]const u8 = if (root.getString(args, "account_id")) |value|
-            if (std.mem.trim(u8, value, " \t\n\r").len > 0) value else null
-        else
-            null;
+        const explicit_account_id = getNonEmptyString(args, "account_id");
         const account_id = explicit_account_id orelse blk: {
             if (turn_default_channel) |default_channel| {
                 if (std.mem.eql(u8, channel, default_channel)) break :blk turn_default_account_id;
@@ -254,14 +256,14 @@ test "MessageTool setContext and hasMessageBeenSent" {
     try testing.expectEqualStrings("main", msg.account_id.?);
 }
 
-test "MessageTool empty account id inherits current account" {
+test "MessageTool empty routing fields inherit current conversation" {
     var event_bus = bus.Bus.init();
     defer event_bus.close();
     var mt = MessageTool{ .event_bus = &event_bus };
     const previous = mt.setContext("discord", "default", "room1");
     defer MessageTool.restoreContext(previous);
 
-    const parsed = try root.parseTestArgs("{\"content\":\"done [FILE:/tmp/report.md]\",\"channel\":\"discord\",\"account_id\":\"\",\"chat_id\":\"room1\"}");
+    const parsed = try root.parseTestArgs("{\"content\":\"done [FILE:/tmp/report.md]\",\"channel\":\"  \",\"account_id\":\"\",\"chat_id\":\"\"}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
     defer testing.allocator.free(result.output);
@@ -269,7 +271,9 @@ test "MessageTool empty account id inherits current account" {
 
     var msg = event_bus.consumeOutbound().?;
     defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("discord", msg.channel);
     try testing.expectEqualStrings("default", msg.account_id.?);
+    try testing.expectEqualStrings("room1", msg.chat_id);
     try testing.expectEqualStrings("done [FILE:/tmp/report.md]", msg.content);
 }
 
