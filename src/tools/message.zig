@@ -109,7 +109,11 @@ pub const MessageTool = struct {
         const event_bus = self.event_bus orelse
             return ToolResult.fail("Message tool not connected to event bus");
 
-        const account_id = root.getString(args, "account_id") orelse blk: {
+        const explicit_account_id: ?[]const u8 = if (root.getString(args, "account_id")) |value|
+            if (std.mem.trim(u8, value, " \t\n\r").len > 0) value else null
+        else
+            null;
+        const account_id = explicit_account_id orelse blk: {
             if (turn_default_channel) |default_channel| {
                 if (std.mem.eql(u8, channel, default_channel)) break :blk turn_default_account_id;
             }
@@ -248,6 +252,25 @@ test "MessageTool setContext and hasMessageBeenSent" {
     var msg = event_bus.consumeOutbound().?;
     defer msg.deinit(testing.allocator);
     try testing.expectEqualStrings("main", msg.account_id.?);
+}
+
+test "MessageTool empty account id inherits current account" {
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus };
+    const previous = mt.setContext("discord", "default", "room1");
+    defer MessageTool.restoreContext(previous);
+
+    const parsed = try root.parseTestArgs("{\"content\":\"done [FILE:/tmp/report.md]\",\"channel\":\"discord\",\"account_id\":\"\",\"chat_id\":\"room1\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+
+    var msg = event_bus.consumeOutbound().?;
+    defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("default", msg.account_id.?);
+    try testing.expectEqualStrings("done [FILE:/tmp/report.md]", msg.content);
 }
 
 test "MessageTool sent_in_round is set after successful send" {
