@@ -46,7 +46,7 @@ pub const CronAddTool = struct {
                 return ToolResult.fail("Invalid delay format");
         }
 
-        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, command, null, null, null, null) catch null;
+        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, null, command, null, null, null, null) catch null;
         if (gateway_body) |json_body| {
             defer allocator.free(json_body);
             switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
@@ -191,7 +191,7 @@ test "cron_add schema has command" {
 }
 
 test "cron_add gateway request body preserves delay and command" {
-    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null, null);
+    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", null, "echo later", null, null, null, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

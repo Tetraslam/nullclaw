@@ -92,6 +92,10 @@ curl -X POST \
 
 `/cron/add` also accepts one-shot payloads such as `{"delay":"10m","command":"echo later"}` and agent payloads such as `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`.
 
+To create a durable watcher, send a one-shot agent payload with `repeat_delay`, for example `{"delay":"1m","repeat_delay":"5m","prompt":"Check whether the import completed"}`. `repeat_delay` is valid only with `delay` and `prompt`, without `command`. The daemon scheduler reruns an incomplete or failed check after that positive duration. The child must finish with an exact trailing `WATCHER_PENDING`, `WATCHER_SUCCESS`, or `WATCHER_FAILURE` marker. Pending, missing/malformed markers, empty or marker-only output, execution failures, and failed expected delivery stay silent and rearm. A nonempty success or terminal failure strips the marker and removes the job after delivery succeeds; removal without delivery is valid when the configured delivery mode intentionally filters that outcome or is `none`. `/cron` responses expose `watcher` and parsed `repeat_delay_secs` fields, which persist across daemon restarts.
+
+Watcher child agents cannot use the supported `schedule` tool path; only the daemon scheduler owns rearming. This is a capability boundary, not a sandbox: with permissive/yolo shell access, a child could still edit `cron.json` directly. Terminal markers are also model-authored and therefore forgeable by the watcher model; exact trailing-token parsing and rejection of earlier marker text reduce accidental matches but do not provide independent attestation.
+
 ### 6) Max webhook delivery
 
 Single-account example:

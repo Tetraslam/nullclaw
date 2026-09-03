@@ -19,6 +19,10 @@ const log = std.log.scoped(.cron);
 const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
 const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
+const WATCHER_INSTRUCTIONS =
+    "This is a scheduler-owned watcher run. Perform the requested check now; do not merely acknowledge it and do not schedule another job.\n" ++
+    "Finish with exactly one status marker as the final whitespace-delimited token: WATCHER_PENDING if the condition is not complete, WATCHER_SUCCESS if it completed successfully, or WATCHER_FAILURE if it reached a terminal failure.\n" ++
+    "Do not use any WATCHER_ marker elsewhere in the response.";
 
 pub const JobType = enum {
     shell,
@@ -246,7 +250,61 @@ pub const CronJob = struct {
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
+    repeat_delay_secs: ?i64 = null,
+
+    pub fn isWatcher(self: CronJob) bool {
+        return self.one_shot and self.job_type == .agent and self.repeat_delay_secs != null;
+    }
 };
+
+pub const WatcherOutcome = enum { pending, success, failure };
+
+pub const WatcherOutput = struct {
+    outcome: WatcherOutcome,
+    cleaned_output: []const u8,
+};
+
+/// Classify only an exact marker at the end of trimmed output. Marker-like text
+/// with punctuation or embedded in another token is incomplete and rearms.
+pub fn classifyWatcherOutput(output: []const u8) WatcherOutput {
+    const trimmed = std_compat.mem.trimRight(u8, output, " \t\r\n");
+    const markers = [_]struct { text: []const u8, outcome: WatcherOutcome }{
+        .{ .text = "WATCHER_PENDING", .outcome = .pending },
+        .{ .text = "WATCHER_SUCCESS", .outcome = .success },
+        .{ .text = "WATCHER_FAILURE", .outcome = .failure },
+    };
+    for (markers) |entry| {
+        const marker = entry.text;
+        if (!std.mem.endsWith(u8, trimmed, marker)) continue;
+        const marker_start = trimmed.len - marker.len;
+        if (marker_start > 0 and !std.ascii.isWhitespace(trimmed[marker_start - 1])) continue;
+        const cleaned = std_compat.mem.trimRight(u8, trimmed[0..marker_start], " \t\r\n");
+        if (std.mem.indexOf(u8, cleaned, "WATCHER_") != null) {
+            return .{ .outcome = .pending, .cleaned_output = trimmed };
+        }
+        if (entry.outcome != .pending and cleaned.len == 0) {
+            return .{ .outcome = .pending, .cleaned_output = trimmed };
+        }
+        return .{
+            .outcome = entry.outcome,
+            .cleaned_output = cleaned,
+        };
+    }
+    return .{ .outcome = .pending, .cleaned_output = trimmed };
+}
+
+fn watcherNextRun(now: i64, repeat_delay_secs: i64) i64 {
+    return std.math.add(i64, now, repeat_delay_secs) catch std.math.maxInt(i64);
+}
+
+fn watcherDeliveryExpected(delivery: DeliveryConfig, success: bool) bool {
+    return switch (delivery.mode) {
+        .none => false,
+        .always => true,
+        .on_error => !success,
+        .on_success => success,
+    };
+}
 
 /// Duration unit for "once" delay parsing.
 pub const DurationUnit = enum {
@@ -532,6 +590,9 @@ pub const CronScheduler = struct {
     shell_max_output_bytes: usize = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
     shell_policy: security_policy.SecurityPolicy = .{},
     observer: ?observability.Observer = null,
+    test_agent_output: ?[]const u8 = null,
+    test_agent_success: bool = true,
+    test_agent_execution_failure: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -754,8 +815,11 @@ pub const CronScheduler = struct {
     }
 
     /// Add a one-shot delayed agent task.
-    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
+    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, repeat_delay_secs: ?i64) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        if (repeat_delay_secs) |secs| {
+            if (secs <= 0) return error.InvalidRepeatDelay;
+        }
 
         const delay_secs = try parseDuration(delay);
         const now = std_compat.time.timestamp();
@@ -775,6 +839,7 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .repeat_delay_secs = repeat_delay_secs,
             .delivery = .{
                 .mode = delivery.mode,
                 .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
@@ -1055,38 +1120,81 @@ pub const CronScheduler = struct {
                     }
                 },
                 .agent => {
-                    const agent_output = job.prompt orelse job.command;
-                    if (builtin.is_test) {
-                        // Keep unit tests deterministic: no subprocess or network side effects.
-                        job.last_run_secs = now;
-                        job.last_status = "ok";
-
-                        if (job.last_output) |old| self.allocator.free(old);
-                        job.last_output = self.allocator.dupe(u8, agent_output) catch null;
-
-                        if (out_bus) |b| {
-                            if (job.session_target == .main) {
-                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
-                            } else {
-                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
-                            }
-                        }
-                    } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, job.delivery) catch |err| {
-                            log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
+                    const raw_prompt = job.prompt orelse job.command;
+                    var watcher_prompt: ?[]u8 = null;
+                    if (job.isWatcher()) {
+                        watcher_prompt = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ raw_prompt, WATCHER_INSTRUCTIONS }) catch {
                             job.last_run_secs = now;
-                            job.last_status = "error";
+                            job.last_status = "pending";
+                            job.next_run_secs = watcherNextRun(now, job.repeat_delay_secs.?);
                             if (job.last_output) |old| self.allocator.free(old);
                             job.last_output = null;
+                            continue;
+                        };
+                    }
+                    defer if (watcher_prompt) |value| self.allocator.free(value);
+                    const agent_prompt = watcher_prompt orelse raw_prompt;
+
+                    const exec_result = self.runScheduledAgent(agent_prompt, job.model, job.delivery, job.isWatcher()) catch |err| {
+                        job.last_run_secs = now;
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = null;
+                        if (job.isWatcher()) {
+                            log.warn("cron watcher '{s}' execution failed and will rearm: {s}", .{ job.id, @errorName(err) });
+                            job.last_status = "pending";
+                            job.next_run_secs = watcherNextRun(now, job.repeat_delay_secs.?);
+                        } else {
+                            log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
+                            job.last_status = "error";
                             if (out_bus) |b| {
                                 _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
                             }
-                            continue;
-                        };
+                        }
+                        continue;
+                    };
+                    var output_owned = true;
+                    defer if (output_owned) self.allocator.free(exec_result.output);
 
-                        job.last_run_secs = now;
+                    job.last_run_secs = now;
+                    if (job.last_output) |old| self.allocator.free(old);
+                    job.last_output = null;
+
+                    if (job.isWatcher()) {
+                        const watcher_output = if (exec_result.success)
+                            classifyWatcherOutput(exec_result.output)
+                        else
+                            WatcherOutput{ .outcome = .pending, .cleaned_output = exec_result.output };
+
+                        if (watcher_output.outcome == .pending) {
+                            job.last_status = "pending";
+                            job.next_run_secs = watcherNextRun(now, job.repeat_delay_secs.?);
+                            if (exec_result.output.len > 0) {
+                                job.last_output = exec_result.output;
+                                output_owned = false;
+                            }
+                            continue;
+                        }
+
+                        const success = watcher_output.outcome == .success;
+                        job.last_status = if (success) "ok" else "error";
+                        if (watcherDeliveryExpected(job.delivery, success)) {
+                            const delivered = if (out_bus) |b|
+                                if (job.session_target == .main)
+                                    deliverViaMainAgent(self.allocator, job.delivery, watcher_output.cleaned_output, success, b, job.name orelse job.id) catch false
+                                else
+                                    deliverResult(self.allocator, job.delivery, watcher_output.cleaned_output, success, b) catch false
+                            else
+                                false;
+                            if (!delivered) {
+                                job.last_status = "pending";
+                                job.next_run_secs = watcherNextRun(now, job.repeat_delay_secs.?);
+                                job.last_output = exec_result.output;
+                                output_owned = false;
+                                continue;
+                            }
+                        }
+                    } else {
                         job.last_status = if (exec_result.success) "ok" else "error";
-                        if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
                             if (job.session_target == .main) {
                                 _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
@@ -1094,11 +1202,10 @@ pub const CronScheduler = struct {
                                 _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
                             }
                         }
-
-                        job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
-                            self.allocator.free(exec_result.output);
-                            break :blk null;
-                        };
+                        if (exec_result.output.len > 0) {
+                            job.last_output = exec_result.output;
+                            output_owned = false;
+                        }
                     }
                 },
             }
@@ -1129,6 +1236,18 @@ pub const CronScheduler = struct {
         }
 
         return changed;
+    }
+
+    fn runScheduledAgent(self: *CronScheduler, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, scheduler_disabled: bool) !AgentRunResult {
+        if (builtin.is_test) {
+            // Deterministic injection covers watcher completion and crash boundaries.
+            if (self.test_agent_execution_failure) return error.TestAgentExecutionFailure;
+            return .{
+                .success = self.test_agent_success,
+                .output = try self.allocator.dupe(u8, self.test_agent_output orelse prompt),
+            };
+        }
+        return runAgentJob(self.allocator, self.shell_cwd, prompt, model, self.agent_timeout_secs, delivery, scheduler_disabled);
     }
 };
 
@@ -1178,11 +1297,12 @@ fn runAgentJob(
     model: ?[]const u8,
     timeout_secs: u64,
     delivery: DeliveryConfig,
+    scheduler_disabled: bool,
 ) !AgentRunResult {
-    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery));
+    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery, scheduler_disabled));
 }
 
-fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOptions {
+fn agentRunOptionsForDelivery(delivery: DeliveryConfig, scheduler_disabled: bool) agent_runner.AgentRunOptions {
     return .{
         .origin_channel = delivery.channel,
         .origin_account_id = delivery.account_id,
@@ -1191,6 +1311,7 @@ fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOpt
         .origin_peer_id = delivery.peer_id,
         .origin_thread_id = delivery.thread_id,
         .scheduler_local_store = true,
+        .scheduler_disabled = scheduler_disabled,
     };
 }
 
@@ -1273,6 +1394,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 if (v == .string and v.string.len > 0) {
                     if (std.mem.eql(u8, v.string, "ok")) break :blk "ok";
                     if (std.mem.eql(u8, v.string, "error")) break :blk "error";
+                    if (std.mem.eql(u8, v.string, "pending")) break :blk "pending";
                     // Backward-compat aliases from older payloads.
                     if (std.mem.eql(u8, v.string, "success")) break :blk "ok";
                     if (std.mem.eql(u8, v.string, "failed")) break :blk "error";
@@ -1343,6 +1465,21 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 if (v == .bool) break :blk v.bool;
             }
             break :blk false;
+        };
+        const repeat_delay_secs: ?i64 = blk: {
+            if (obj.get("repeat_delay_secs")) |v| {
+                if (v == .null) break :blk null;
+                if (v == .integer and v.integer > 0) break :blk v.integer;
+                switch (policy) {
+                    .best_effort => continue,
+                    .strict => return error.InvalidCronStoreFormat,
+                }
+            }
+            break :blk null;
+        };
+        if (repeat_delay_secs != null and (!one_shot or job_type != .agent)) switch (policy) {
+            .best_effort => continue,
+            .strict => return error.InvalidCronStoreFormat,
         };
 
         // Load delivery config
@@ -1426,6 +1563,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
+            .repeat_delay_secs = repeat_delay_secs,
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
@@ -1734,6 +1872,12 @@ fn appendCronJobJson(
     try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "watcher");
+    try buf.appendSlice(allocator, if (job.isWatcher()) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "repeat_delay_secs");
+    try appendNullableInt(buf, allocator, job.repeat_delay_secs);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "delivery_mode");
     try json_util.appendJsonString(buf, allocator, job.delivery.mode.asStr());
@@ -2139,6 +2283,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator, as_json: bool) !void {
     log.info("Scheduled jobs ({d}):", .{jobs.len});
     for (jobs) |job| {
         const flags: []const u8 = blk: {
+            if (job.paused and job.isWatcher()) break :blk " [paused, watcher]";
+            if (job.isWatcher()) break :blk " [watcher]";
             if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
             if (job.paused) break :blk " [paused]";
             if (job.one_shot) break :blk " [one-shot]";
@@ -2154,6 +2300,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, as_json: bool) !void {
             flags,
             job.command,
         });
+        if (job.repeat_delay_secs) |secs| log.info("  repeat_delay_secs={d}", .{secs});
     }
 }
 
@@ -2227,6 +2374,7 @@ pub fn buildGatewayAddBody(
     allocator: std.mem.Allocator,
     expression: ?[]const u8,
     delay: ?[]const u8,
+    repeat_delay: ?[]const u8,
     command: ?[]const u8,
     prompt: ?[]const u8,
     model: ?[]const u8,
@@ -2241,6 +2389,7 @@ pub fn buildGatewayAddBody(
 
     if (expression) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "expression", value);
     if (delay) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delay", value);
+    if (repeat_delay) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "repeat_delay", value);
     if (command) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "command", value);
     if (prompt) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "prompt", value);
     if (model) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "model", value);
@@ -2290,7 +2439,7 @@ fn appendGatewayBodyLiteral(
 pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        const body = buildGatewayAddBody(allocator, expression, null, command, null, null, null, null) catch null;
+        const body = buildGatewayAddBody(allocator, expression, null, null, command, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
             if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
@@ -2327,6 +2476,7 @@ pub fn cliAddAgentJob(
             expression,
             null,
             null,
+            null,
             prompt,
             model,
             enriched_delivery,
@@ -2356,7 +2506,7 @@ pub fn cliAddAgentJob(
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        const body = buildGatewayAddBody(allocator, null, delay, command, null, null, null, null) catch null;
+        const body = buildGatewayAddBody(allocator, null, delay, null, command, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
             if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
@@ -2392,6 +2542,7 @@ pub fn cliAddAgentOnce(
             null,
             delay,
             null,
+            null,
             prompt,
             model,
             enriched_delivery,
@@ -2407,7 +2558,7 @@ pub fn cliAddAgentOnce(
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery);
+    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery, null);
     job.session_target = session_target;
     try saveJobs(&scheduler);
 
@@ -2519,6 +2670,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     }
 
     if (scheduler.getMutableJob(id)) |job| {
+        if (job.isWatcher()) {
+            log.warn("Watcher '{s}' cannot be run manually; its lifecycle is owned by the scheduler", .{id});
+            return error.ManualWatcherRunUnsupported;
+        }
         log.info("Running job '{s}': {s}", .{ id, job.command });
         const run_at = std_compat.time.timestamp();
         switch (job.job_type) {
@@ -2557,7 +2712,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, job.delivery) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, job.delivery, job.isWatcher()) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
@@ -2817,6 +2972,24 @@ test "parseDuration unknown unit" {
     try std.testing.expectError(error.UnknownDurationUnit, parseDuration("5x"));
 }
 
+test "watcher output classification requires one exact trailing marker" {
+    const success = classifyWatcherOutput("import complete\nWATCHER_SUCCESS  \n");
+    try std.testing.expectEqual(WatcherOutcome.success, success.outcome);
+    try std.testing.expectEqualStrings("import complete", success.cleaned_output);
+
+    const failure = classifyWatcherOutput("terminal error WATCHER_FAILURE");
+    try std.testing.expectEqual(WatcherOutcome.failure, failure.outcome);
+    try std.testing.expectEqualStrings("terminal error", failure.cleaned_output);
+
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("still running\nWATCHER_PENDING").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("WATCHER_SUCCESS.").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("prefixWATCHER_SUCCESS").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("WATCHER_PENDING\ndone\nWATCHER_SUCCESS").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("WATCHER_SUCCESS").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("  WATCHER_FAILURE  \n").outcome);
+    try std.testing.expectEqual(WatcherOutcome.pending, classifyWatcherOutput("").outcome);
+}
+
 test "normalizeExpression 5 fields" {
     const result = try normalizeExpression("*/5 * * * *");
     try std.testing.expect(result.needs_second_prefix);
@@ -3031,6 +3204,37 @@ test "load agent job without prompt field falls back to command" {
     try std.testing.expectEqualStrings("Summarize incidents", jobs[0].prompt.?);
 }
 
+test "invalid persisted repeat delay skips best effort and fails strict load" {
+    var store_guard = try TestCronStoreGuard.init(std.testing.allocator);
+    defer store_guard.deinit();
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    const invalid_values = [_][]const u8{ "\"5m\"", "0", "-1" };
+    for (invalid_values) |invalid_value| {
+        const json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "[{{\"id\":\"watcher-bad\",\"expression\":\"@once:1m\",\"command\":\"check\",\"prompt\":\"check\",\"job_type\":\"agent\",\"one_shot\":true,\"repeat_delay_secs\":{s}}}]",
+            .{invalid_value},
+        );
+        defer std.testing.allocator.free(json);
+        {
+            const file = try std_compat.fs.createFileAbsolute(path, .{});
+            defer file.close();
+            try file.writeAll(json);
+        }
+
+        var best_effort = CronScheduler.init(std.testing.allocator, 64, true);
+        defer best_effort.deinit();
+        try loadJobs(&best_effort);
+        try std.testing.expectEqual(@as(usize, 0), best_effort.listJobs().len);
+
+        var strict = CronScheduler.init(std.testing.allocator, 64, true);
+        defer strict.deinit();
+        try std.testing.expectError(error.InvalidCronStoreFormat, loadJobsStrict(&strict));
+    }
+}
+
 test "trimOwnedRight duplicates trimmed allocation" {
     const raw = try std.testing.allocator.dupe(u8, "zc_token\n");
     const trimmed = trimOwnedRight(std.testing.allocator, raw) orelse return error.TestUnexpectedResult;
@@ -3104,6 +3308,31 @@ test "cliRunJob persists last status and timestamp" {
     try std.testing.expect(loaded_job.last_run_secs != null);
     try std.testing.expect(loaded_job.last_status != null);
     try std.testing.expectEqualStrings("ok", loaded_job.last_status.?);
+}
+
+test "cliRunJob rejects scheduler-owned watchers without mutation" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentOnce("1m", "Check import", null, .{}, 300);
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    const next_run_secs = job.next_run_secs;
+    try saveJobs(&scheduler);
+
+    try std.testing.expectError(error.ManualWatcherRunUnsupported, cliRunJob(std.testing.allocator, job_id));
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loaded_job.isWatcher());
+    try std.testing.expectEqual(next_run_secs, loaded_job.next_run_secs);
+    try std.testing.expect(loaded_job.last_run_secs == null);
 }
 
 test "resolveRunnableCwd keeps valid cwd" {
@@ -3218,6 +3447,40 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
     try std.testing.expect(!job.delivery.best_effort);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+}
+
+test "save and load roundtrip keeps watcher state and routing" {
+    var store_guard = try TestCronStoreGuard.init(std.testing.allocator);
+    defer store_guard.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    const watcher = try scheduler.addAgentOnce("30s", "Check import", "test-model", .{
+        .mode = .always,
+        .channel = "discord",
+        .account_id = "main",
+        .to = "channel-42",
+        .peer_kind = .direct,
+        .peer_id = "user-42",
+    }, 300);
+    watcher.session_target = .main;
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 64, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    const job = loaded.listJobs()[0];
+    try std.testing.expect(job.isWatcher());
+    try std.testing.expectEqual(@as(?i64, 300), job.repeat_delay_secs);
+    try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expectEqualStrings("discord", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", job.delivery.account_id.?);
+    try std.testing.expectEqualStrings("channel-42", job.delivery.to.?);
+
+    const json = try buildJobsJson(std.testing.allocator, loaded.listJobs());
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"watcher\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repeat_delay_secs\":300") != null);
 }
 
 test "cliAddAgentOnce persists delivery routing" {
@@ -3503,7 +3766,7 @@ test "tick removes more than 64 one-shot jobs in one pass" {
 
     var i: usize = 0;
     while (i < 80) : (i += 1) {
-        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
+        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{}, null);
     }
 
     const now = std_compat.time.timestamp();
@@ -3821,6 +4084,209 @@ test "agent job delivers result via bus" {
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
 }
 
+test "watcher pending marker rearms without delivery" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "channel-42",
+    }, 300);
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "still importing\nWATCHER_PENDING";
+
+    _ = scheduler.tick(1_000, &test_bus);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(i64, 1_300), scheduler.listJobs()[0].next_run_secs);
+    try std.testing.expectEqualStrings("pending", scheduler.listJobs()[0].last_status.?);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), test_bus.inboundDepth());
+}
+
+test "watcher acknowledgment without marker rearms silently" {
+    // Regression: an acknowledgment-only child must not delete agent-once-1.
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "channel-42",
+    }, 60);
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "i’m checking the actual import path now.";
+
+    _ = scheduler.tick(2_000, &test_bus);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(i64, 2_060), scheduler.listJobs()[0].next_run_secs);
+    try std.testing.expectEqualStrings("i’m checking the actual import path now.", scheduler.listJobs()[0].last_output.?);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), test_bus.inboundDepth());
+}
+
+test "watcher prompt appends immediate execution protocol" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentOnce("1s", "Inspect now", null, .{}, 60);
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(3_000, null);
+    const output = scheduler.listJobs()[0].last_output.?;
+    try std.testing.expect(std.mem.startsWith(u8, output, "Inspect now\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "Perform the requested check now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "do not schedule another job") != null);
+}
+
+test "watcher execution failure and empty output rearm silently" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const failed = try scheduler.addAgentOnce("1s", "Crash check", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "channel-42",
+    }, 45);
+    failed.next_run_secs = 0;
+    scheduler.test_agent_execution_failure = true;
+    _ = scheduler.tick(4_000, &test_bus);
+    try std.testing.expectEqual(@as(i64, 4_045), scheduler.listJobs()[0].next_run_secs);
+
+    scheduler.test_agent_execution_failure = false;
+    scheduler.test_agent_output = "";
+    scheduler.jobs.items[0].next_run_secs = 0;
+    _ = scheduler.tick(5_000, &test_bus);
+    try std.testing.expectEqual(@as(i64, 5_045), scheduler.listJobs()[0].next_run_secs);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), test_bus.inboundDepth());
+}
+
+test "watcher marker-only terminal output rearms" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{}, 30);
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "WATCHER_SUCCESS\n";
+
+    _ = scheduler.tick(5_500, null);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(i64, 5_530), scheduler.listJobs()[0].next_run_secs);
+    try std.testing.expectEqualStrings("pending", scheduler.listJobs()[0].last_status.?);
+}
+
+test "watcher failed expected delivery rearms for both best effort modes" {
+    for ([_]bool{ true, false }) |best_effort| {
+        var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+        defer scheduler.deinit();
+        var test_bus = bus.Bus.init();
+        test_bus.close();
+
+        const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+            .mode = .always,
+            .channel = "discord",
+            .to = "channel-42",
+            .best_effort = best_effort,
+        }, 75);
+        job.next_run_secs = 0;
+        scheduler.test_agent_output = "Import is ready.\nWATCHER_SUCCESS";
+
+        _ = scheduler.tick(5_600, &test_bus);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+        try std.testing.expectEqual(@as(i64, 5_675), scheduler.listJobs()[0].next_run_secs);
+        try std.testing.expectEqualStrings("pending", scheduler.listJobs()[0].last_status.?);
+    }
+}
+
+test "watcher terminal outcome filtered by delivery mode removes job" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .to = "channel-42",
+    }, 60);
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "Import failed permanently.\nWATCHER_FAILURE";
+
+    _ = scheduler.tick(5_700, null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "watcher success delivers cleaned output once and removes job" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "channel-42",
+    }, 60);
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "Import is ready.\nWATCHER_SUCCESS\n";
+
+    _ = scheduler.tick(6_000, &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Import is ready.", msg.content);
+}
+
+test "watcher terminal failure uses main route once and removes job" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .account_id = "main",
+        .to = "channel-42",
+    }, 60);
+    job.session_target = .main;
+    job.next_run_secs = 0;
+    scheduler.test_agent_output = "Import failed permanently.\nWATCHER_FAILURE";
+
+    _ = scheduler.tick(7_000, &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(usize, 1), test_bus.inboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "[FAILED]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Import failed permanently.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "WATCHER_FAILURE") == null);
+}
+
+test "non-watcher one-shot agent behavior remains unchanged" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "ordinary result", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "channel-42",
+    }, null);
+    job.next_run_secs = 0;
+    _ = scheduler.tick(8_000, &test_bus);
+
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ordinary result", msg.content);
+}
+
 test "one-shot isolated agent delivery outlives removed job" {
     // Regression (#941): the outbound queue must not retain freed job delivery routing.
     const allocator = std.testing.allocator;
@@ -3835,7 +4301,7 @@ test "one-shot isolated agent delivery outlives removed job" {
         .channel = "telegram",
         .account_id = "main",
         .to = "chat-42",
-    });
+    }, null);
     job.next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
@@ -3863,7 +4329,7 @@ test "one-shot main agent delivery outlives removed job" {
         .channel = "telegram",
         .account_id = "main",
         .to = "chat-42",
-    });
+    }, null);
     job.session_target = .main;
     job.next_run_secs = 0;
 
@@ -3888,7 +4354,7 @@ test "agent run options preserve cron delivery attribution" {
         .peer_kind = .group,
         .peer_id = "group-42",
         .thread_id = "thread-7",
-    });
+    }, false);
     try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
     try std.testing.expectEqualStrings("main", options.origin_account_id.?);
     try std.testing.expectEqualStrings("chat-42", options.origin_chat_id.?);
@@ -3896,6 +4362,8 @@ test "agent run options preserve cron delivery attribution" {
     try std.testing.expectEqualStrings("group-42", options.origin_peer_id.?);
     try std.testing.expectEqualStrings("thread-7", options.origin_thread_id.?);
     try std.testing.expect(options.scheduler_local_store);
+    try std.testing.expect(!options.scheduler_disabled);
+    try std.testing.expect(agentRunOptionsForDelivery(.{}, true).scheduler_disabled);
 }
 
 test "scheduler shell policy follows configured autonomy" {
@@ -4230,7 +4698,7 @@ test "cron register + cancel leaks zero bytes for every job kind" {
         .peer_id = "guild-42",
         .thread_id = null,
         .best_effort = true,
-    });
+    }, null);
     const agent_once_id = try alloc.dupe(u8, agent_once.id);
     defer alloc.free(agent_once_id);
     try std.testing.expect(sched.removeJob(agent_once_id));

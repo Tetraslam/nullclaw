@@ -16,13 +16,14 @@ pub fn buildAddBody(
     allocator: std.mem.Allocator,
     expression: ?[]const u8,
     delay: ?[]const u8,
+    repeat_delay: ?[]const u8,
     command: ?[]const u8,
     prompt: ?[]const u8,
     model: ?[]const u8,
     delivery: ?cron.DeliveryConfig,
     session_target: ?cron.SessionTarget,
 ) ![]u8 {
-    return cron.buildGatewayAddBody(allocator, expression, delay, command, prompt, model, delivery, session_target);
+    return cron.buildGatewayAddBody(allocator, expression, delay, repeat_delay, command, prompt, model, delivery, session_target);
 }
 
 pub fn buildUpdateBody(
@@ -110,6 +111,7 @@ test "buildAddBody includes delivery fields" {
         std.testing.allocator,
         "*/15 * * * *",
         null,
+        null,
         "echo hello",
         null,
         null,
@@ -149,6 +151,7 @@ test "buildAddBody preserves explicit disabled delivery" {
         null,
         "5m",
         null,
+        null,
         "Summarize status",
         null,
         .{ .mode = .none, .channel = "telegram", .to = "chat-42" },
@@ -161,6 +164,28 @@ test "buildAddBody preserves explicit disabled delivery" {
     try std.testing.expectEqualStrings("none", parsed.value.object.get("delivery_mode").?.string);
     try std.testing.expectEqualStrings("telegram", parsed.value.object.get("delivery_channel").?.string);
     try std.testing.expectEqualStrings("chat-42", parsed.value.object.get("delivery_to").?.string);
+}
+
+test "buildAddBody includes watcher repeat delay" {
+    const body = try buildAddBody(
+        std.testing.allocator,
+        null,
+        "1m",
+        "5m",
+        null,
+        "Check import",
+        null,
+        .{ .mode = .always, .channel = "discord", .to = "channel-42" },
+        .main,
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("1m", parsed.value.object.get("delay").?.string);
+    try std.testing.expectEqualStrings("5m", parsed.value.object.get("repeat_delay").?.string);
+    try std.testing.expectEqualStrings("Check import", parsed.value.object.get("prompt").?.string);
+    try std.testing.expect(parsed.value.object.get("command") == null);
 }
 
 test "buildUpdateBody includes enabled flag" {

@@ -3101,6 +3101,14 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     try appendJsonStringBuf(buf, allocator, job.job_type.asStr());
     try buf.appendSlice(allocator, ",\"session_target\":");
     try appendJsonStringBuf(buf, allocator, job.session_target.asStr());
+    try buf.appendSlice(allocator, ",\"watcher\":");
+    try buf.appendSlice(allocator, if (job.isWatcher()) "true" else "false");
+    try buf.appendSlice(allocator, ",\"repeat_delay_secs\":");
+    if (job.repeat_delay_secs) |secs| {
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{secs}) catch "0");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",\"enabled\":");
     try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
     try buf.appendSlice(allocator, ",\"delete_after_run\":");
@@ -3228,6 +3236,24 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const prompt_opt = cronObjectStringField(obj, "prompt");
     const command_opt = cronObjectStringField(obj, "command");
     const model_opt = cronObjectStringField(obj, "model");
+    var repeat_delay_secs: ?i64 = null;
+    if (obj.get("repeat_delay")) |value| {
+        if (value != .string or std.mem.trim(u8, value.string, " \t\r\n").len == 0) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid repeat_delay\"}";
+            return;
+        }
+        repeat_delay_secs = cron_mod.parseDuration(value.string) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid repeat_delay\"}";
+            return;
+        };
+        if (delay_opt == null or prompt_opt == null or command_opt != null) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"repeat_delay requires a one-shot agent prompt and no command\"}";
+            return;
+        }
+    }
     const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
         cron_mod.SessionTarget.parseStrict(raw) catch {
             ctx.response_status = "400 Bad Request";
@@ -3288,7 +3314,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
 
     const job_ptr = if (delay_opt) |delay|
         if (prompt_opt != null)
-            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery) catch |err| {
+            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery, repeat_delay_secs) catch |err| {
                 ctx.response_status = "400 Bad Request";
                 ctx.response_body = if (err == error.MaxTasksReached)
                     "{\"error\":\"max tasks reached\"}"
@@ -6795,6 +6821,93 @@ test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
     try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.to.?);
     try std.testing.expectEqual(agent_routing.ChatType.group, jobs[0].delivery.peer_kind.?);
     try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.peer_id.?);
+}
+
+test "handleCronAdd creates and exposes durable watcher state" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"1m\",\"repeat_delay\":\"5m\",\"prompt\":\"Check import\",\"session_target\":\"main\",\"delivery_mode\":\"always\",\"delivery_channel\":\"discord\",\"delivery_to\":\"channel-42\"}";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const job = scheduler.listJobs()[0];
+    try std.testing.expect(job.isWatcher());
+    try std.testing.expectEqual(@as(?i64, 300), job.repeat_delay_secs);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, job.session_target);
+
+    const created = try std.json.parseFromSlice(std.json.Value, req_allocator, ctx.response_body, .{});
+    defer created.deinit();
+    try std.testing.expect(created.value.object.get("watcher").?.bool);
+    try std.testing.expectEqual(@as(i64, 300), created.value.object.get("repeat_delay_secs").?.integer);
+
+    ctx.method = "GET";
+    ctx.target = "/cron";
+    handleCronList(&ctx);
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const listed = try std.json.parseFromSlice(std.json.Value, req_allocator, ctx.response_body, .{});
+    defer listed.deinit();
+    try std.testing.expect(listed.value.array.items[0].object.get("watcher").?.bool);
+    try std.testing.expectEqual(@as(i64, 300), listed.value.array.items[0].object.get("repeat_delay_secs").?.integer);
+}
+
+test "handleCronAdd rejects repeat delay outside one-shot agent jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const payloads = [_][]const u8{
+        "{\"expression\":\"* * * * *\",\"repeat_delay\":\"5m\",\"prompt\":\"check\"}",
+        "{\"delay\":\"1m\",\"repeat_delay\":\"5m\",\"command\":\"echo check\"}",
+        "{\"delay\":\"1m\",\"repeat_delay\":\"0s\",\"prompt\":\"check\"}",
+        "{\"delay\":\"1m\",\"repeat_delay\":5,\"prompt\":\"check\"}",
+    };
+    for (payloads) |payload| {
+        const raw = try std.fmt.allocPrint(req_allocator, "POST /cron/add HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{s}", .{payload});
+        var ctx = WebhookHandlerContext{
+            .root_allocator = req_allocator,
+            .req_allocator = req_allocator,
+            .raw_request = raw,
+            .method = "POST",
+            .target = "/cron/add",
+            .config_opt = null,
+            .state = &state,
+            .session_mgr_opt = null,
+        };
+        handleCronAdd(&ctx);
+        try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "repeat_delay") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
 
 test "handleCronAdd rejects session_target for shell jobs" {

@@ -276,6 +276,7 @@ const ParsedAgentArgs = struct {
     origin_peer_id: ?[]const u8 = null,
     origin_thread_id: ?[]const u8 = null,
     scheduler_local_store: bool = false,
+    scheduler_disabled: bool = false,
     verbose: bool = false,
 };
 
@@ -349,6 +350,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             parsed.origin_thread_id = args[i];
         } else if (std.mem.eql(u8, arg, "--scheduler-local-store")) {
             parsed.scheduler_local_store = true;
+        } else if (std.mem.eql(u8, arg, "--scheduler-disabled")) {
+            parsed.scheduler_disabled = true;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
@@ -438,8 +441,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return;
         },
     };
-    tools_mod.schedule.setLocalStoreOnly(parsed_args.scheduler_local_store, cfg.scheduler.max_tasks, cron.shellPolicyFromConfig(&cfg));
-    defer tools_mod.schedule.setLocalStoreOnly(false, null, null);
+    tools_mod.schedule.setSchedulerCapabilities(parsed_args.scheduler_local_store, parsed_args.scheduler_disabled, cfg.scheduler.max_tasks, cron.shellPolicyFromConfig(&cfg));
+    defer tools_mod.schedule.clearSchedulerCapabilities();
     var schedule_context = tools_mod.schedule.ScheduleTool{};
     const origin_peer_kind: ?agent_routing.ChatType = if (parsed_args.origin_peer_kind) |kind|
         if (std.mem.eql(u8, kind, "direct"))
@@ -1374,6 +1377,7 @@ test "parseAgentArgs parses cron origin attribution" {
         "--origin-thread-id",
         "thread-7",
         "--scheduler-local-store",
+        "--scheduler-disabled",
         "-m",
         "go",
     };
@@ -1388,6 +1392,7 @@ test "parseAgentArgs parses cron origin attribution" {
     try std.testing.expectEqualStrings("group-42", parsed.origin_peer_id.?);
     try std.testing.expectEqualStrings("thread-7", parsed.origin_thread_id.?);
     try std.testing.expect(parsed.scheduler_local_store);
+    try std.testing.expect(parsed.scheduler_disabled);
     try std.testing.expectEqualStrings("go", parsed.message_arg.?);
 }
 

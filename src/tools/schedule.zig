@@ -17,22 +17,31 @@ threadlocal var tls_schedule_peer_kind: ?agent_routing.ChatType = null;
 threadlocal var tls_schedule_peer_id: ?[]const u8 = null;
 threadlocal var tls_schedule_thread_id: ?[]const u8 = null;
 threadlocal var tls_schedule_local_store = false;
+threadlocal var tls_schedule_disabled = false;
 threadlocal var tls_schedule_max_tasks: ?usize = null;
 threadlocal var tls_schedule_shell_policy: ?security_policy.SecurityPolicy = null;
 
-pub fn setLocalStoreOnly(enabled: bool, max_tasks: ?usize, shell_policy: ?security_policy.SecurityPolicy) void {
-    tls_schedule_local_store = enabled;
-    tls_schedule_max_tasks = if (enabled) max_tasks else null;
-    tls_schedule_shell_policy = if (enabled) shell_policy else null;
+pub fn setSchedulerCapabilities(local_store: bool, disabled: bool, max_tasks: ?usize, shell_policy: ?security_policy.SecurityPolicy) void {
+    tls_schedule_local_store = local_store;
+    tls_schedule_disabled = disabled;
+    tls_schedule_max_tasks = if (local_store) max_tasks else null;
+    tls_schedule_shell_policy = if (local_store) shell_policy else null;
+}
+
+pub fn clearSchedulerCapabilities() void {
+    tls_schedule_local_store = false;
+    tls_schedule_disabled = false;
+    tls_schedule_max_tasks = null;
+    tls_schedule_shell_policy = null;
 }
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Use 'command' for shell jobs or 'prompt' (with optional 'model') for agent jobs. Optional delivery params: channel, account_id, chat_id. Set session_target to 'main' for agent jobs to route results through the main agent.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Use 'command' for shell jobs or 'prompt' (with optional 'model') for agent jobs. For a durable watcher, use action='once', prompt, delay, and repeat_delay; the scheduler rearms it until the agent returns a terminal WATCHER marker. Optional delivery params: channel, account_id, chat_id. Set session_target to 'main' for agent jobs to route results through the main agent.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"prompt":{"type":"string","description":"Agent prompt for an agent job"},"model":{"type":"string","description":"Optional model override for agent jobs"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent jobs: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"repeat_delay":{"type":"string","description":"Positive delay between watcher checks; only valid with action='once' and prompt (e.g. '5m')"},"command":{"type":"string","description":"Shell command to execute"},"prompt":{"type":"string","description":"Agent prompt for an agent job"},"model":{"type":"string","description":"Optional model override for agent jobs"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent jobs: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -65,7 +74,20 @@ pub const ScheduleTool = struct {
 
     pub fn execute(self: *ScheduleTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         _ = self;
+        if (tls_schedule_disabled) return ToolResult.fail("The schedule tool is disabled for this agent run");
         const action = stringArg(args, "action") orelse return ToolResult.fail("Missing 'action' parameter");
+        const repeat_delay = stringArg(args, "repeat_delay");
+        if (args.get("repeat_delay") != null and repeat_delay == null) {
+            return ToolResult.fail("Invalid 'repeat_delay': expected a positive duration string");
+        }
+        var repeat_delay_secs: ?i64 = null;
+        if (repeat_delay) |value| {
+            if (!std.mem.eql(u8, action, "once") or stringArg(args, "prompt") == null or stringArg(args, "command") != null) {
+                return ToolResult.fail("'repeat_delay' is only supported for action='once' agent jobs created with 'prompt' and no 'command'");
+            }
+            repeat_delay_secs = cron.parseDuration(value) catch
+                return ToolResult.fail("Invalid 'repeat_delay': expected a positive duration string");
+        }
         const explicit_channel = stringArg(args, "channel");
         const explicit_account_id = stringArg(args, "account_id");
         const explicit_chat_id = stringArg(args, "chat_id");
@@ -105,12 +127,12 @@ pub const ScheduleTool = struct {
         var live = cron.lockLiveScheduler();
         defer live.deinit();
         if (live.scheduler) |scheduler| {
-            return executeWithScheduler(allocator, args, scheduler, action, session_target, delivery);
+            return executeWithScheduler(allocator, args, scheduler, action, session_target, delivery, repeat_delay_secs);
         }
 
         live.deinit();
         if (!tls_schedule_local_store) {
-            if (try executeViaGateway(allocator, args, action, session_target, delivery)) |result| return result;
+            if (try executeViaGateway(allocator, args, action, session_target, delivery, repeat_delay)) |result| return result;
         }
 
         var scheduler = if (tls_schedule_max_tasks) |max_tasks|
@@ -118,7 +140,7 @@ pub const ScheduleTool = struct {
         else
             loadScheduler(allocator) catch return ToolResult.fail("Failed to load scheduler state");
         defer scheduler.deinit();
-        return executeWithScheduler(allocator, args, &scheduler, action, session_target, delivery);
+        return executeWithScheduler(allocator, args, &scheduler, action, session_target, delivery, repeat_delay_secs);
     }
 };
 
@@ -153,6 +175,7 @@ fn executeViaGateway(
     action: []const u8,
     session_target: cron.SessionTarget,
     delivery: cron.DeliveryConfig,
+    repeat_delay: ?[]const u8,
 ) !?ToolResult {
     if (std.mem.eql(u8, action, "list")) {
         return switch (cron.requestGatewayGet(allocator, "/cron")) {
@@ -196,6 +219,7 @@ fn executeViaGateway(
             allocator,
             expression,
             delay,
+            repeat_delay,
             command,
             prompt,
             model,
@@ -240,6 +264,7 @@ fn executeWithScheduler(
     action: []const u8,
     session_target: cron.SessionTarget,
     delivery: cron.DeliveryConfig,
+    repeat_delay_secs: ?i64,
 ) !ToolResult {
     if (std.mem.eql(u8, action, "list")) {
         const jobs = scheduler.listJobs();
@@ -249,7 +274,11 @@ fn executeWithScheduler(
         defer buf.deinit(allocator);
         try buf.print(allocator, "Scheduled jobs ({d}):\n", .{jobs.len});
         for (jobs) |job| {
-            const flags: []const u8 = if (job.paused and job.one_shot)
+            const flags: []const u8 = if (job.paused and job.isWatcher())
+                " [paused, watcher]"
+            else if (job.isWatcher())
+                " [watcher]"
+            else if (job.paused and job.one_shot)
                 " [paused, one-shot]"
             else if (job.paused)
                 " [paused]"
@@ -257,13 +286,24 @@ fn executeWithScheduler(
                 " [one-shot]"
             else
                 "";
-            try buf.print(allocator, "- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
-                job.id,
-                job.expression,
-                job.last_status orelse "pending",
-                flags,
-                job.command,
-            });
+            if (job.isWatcher()) {
+                try buf.print(allocator, "- {s} | {s} | status={s}{s} | repeat_delay_secs={d} | cmd: {s}\n", .{
+                    job.id,
+                    job.expression,
+                    job.last_status orelse "pending",
+                    flags,
+                    job.repeat_delay_secs.?,
+                    job.command,
+                });
+            } else {
+                try buf.print(allocator, "- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
+                    job.id,
+                    job.expression,
+                    job.last_status orelse "pending",
+                    flags,
+                    job.command,
+                });
+            }
         }
         return .{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
@@ -274,7 +314,11 @@ fn executeWithScheduler(
             const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
             return .{ .success = false, .output = "", .error_msg = msg };
         };
-        const flags: []const u8 = if (job.paused and job.one_shot)
+        const flags: []const u8 = if (job.paused and job.isWatcher())
+            " [paused, watcher]"
+        else if (job.isWatcher())
+            " [watcher]"
+        else if (job.paused and job.one_shot)
             " [paused, one-shot]"
         else if (job.paused)
             " [paused]"
@@ -282,14 +326,25 @@ fn executeWithScheduler(
             " [one-shot]"
         else
             "";
-        const msg = try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s}\n  cmd: {s}", .{
-            job.id,
-            job.expression,
-            job.next_run_secs,
-            job.last_status orelse "pending",
-            flags,
-            job.command,
-        });
+        const msg = if (job.isWatcher())
+            try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s} | repeat_delay_secs={d}\n  cmd: {s}", .{
+                job.id,
+                job.expression,
+                job.next_run_secs,
+                job.last_status orelse "pending",
+                flags,
+                job.repeat_delay_secs.?,
+                job.command,
+            })
+        else
+            try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s}\n  cmd: {s}", .{
+                job.id,
+                job.expression,
+                job.next_run_secs,
+                job.last_status orelse "pending",
+                flags,
+                job.command,
+            });
         return .{ .success = true, .output = msg };
     }
 
@@ -311,7 +366,7 @@ fn executeWithScheduler(
 
         const job = if (prompt) |job_prompt|
             if (one_shot)
-                scheduler.addAgentOnce(schedule, job_prompt, model, delivery) catch |err|
+                scheduler.addAgentOnce(schedule, job_prompt, model, delivery, repeat_delay_secs) catch |err|
                     return mutationFailure(allocator, "create one-shot agent task", err)
             else
                 scheduler.addAgentJob(schedule, job_prompt, model, delivery) catch |err|
@@ -330,7 +385,9 @@ fn executeWithScheduler(
         };
 
         const msg = if (prompt) |job_prompt|
-            if (one_shot)
+            if (one_shot and job.isWatcher())
+                try std.fmt.allocPrint(allocator, "Created watcher {s} | runs at {d} | repeat_delay_secs={d} | prompt: {s}", .{ job.id, job.next_run_secs, job.repeat_delay_secs.?, job_prompt })
+            else if (one_shot)
                 try std.fmt.allocPrint(allocator, "Created one-shot agent task {s} | runs at {d} | prompt: {s}", .{ job.id, job.next_run_secs, job_prompt })
             else
                 try std.fmt.allocPrint(allocator, "Created agent job {s} | {s} | prompt: {s}", .{ job.id, job.expression, job_prompt })
@@ -386,6 +443,25 @@ test "schedule schema has action" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "action") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "repeat_delay") != null);
+}
+
+test "schedule disabled capability blocks calls and TLS cleanup restores access" {
+    clearSchedulerCapabilities();
+    defer clearSchedulerCapabilities();
+    var st = ScheduleTool{};
+    const args = try root.parseTestArgs("{\"action\":\"list\"}");
+    defer args.deinit();
+
+    setSchedulerCapabilities(true, true, 64, .{});
+    const blocked = try st.execute(std.testing.allocator, args.value.object);
+    try std.testing.expect(!blocked.success);
+    try std.testing.expectEqualStrings("The schedule tool is disabled for this agent run", blocked.error_msg.?);
+
+    clearSchedulerCapabilities();
+    const allowed = try st.execute(std.testing.allocator, args.value.object);
+    defer if (allowed.output.len > 0) std.testing.allocator.free(allowed.output);
+    try std.testing.expect(allowed.success);
 }
 
 test "schedule list returns success" {
@@ -729,4 +805,56 @@ test "schedule treats required blank strings as missing" {
         const result = try st.execute(std.testing.allocator, args.value.object);
         try std.testing.expect(!result.success);
     }
+}
+
+test "schedule validates repeat_delay watcher shape and duration" {
+    var st = ScheduleTool{};
+    const payloads = [_][]const u8{
+        "{\"action\":\"create\",\"expression\":\"* * * * *\",\"prompt\":\"check\",\"repeat_delay\":\"5m\"}",
+        "{\"action\":\"once\",\"delay\":\"1m\",\"command\":\"echo check\",\"repeat_delay\":\"5m\"}",
+        "{\"action\":\"once\",\"delay\":\"1m\",\"prompt\":\"check\",\"repeat_delay\":\"0s\"}",
+        "{\"action\":\"once\",\"delay\":\"1m\",\"prompt\":\"check\",\"repeat_delay\":5}",
+    };
+    for (payloads) |payload| {
+        const args = try root.parseTestArgs(payload);
+        defer args.deinit();
+        const result = try st.execute(std.testing.allocator, args.value.object);
+        try std.testing.expect(!result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "repeat_delay") != null);
+    }
+}
+
+test "schedule creates durable watcher and exposes repeat state" {
+    var store_guard = try cron.TestCronStoreGuard.init(std.testing.allocator);
+    defer store_guard.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+    defer scheduler.deinit();
+    cron.registerLiveScheduler(&scheduler);
+    defer cron.clearLiveScheduler(&scheduler);
+
+    var st = ScheduleTool{};
+    const args = try root.parseTestArgs(
+        "{\"action\":\"once\",\"delay\":\"1m\",\"repeat_delay\":\"5m\",\"prompt\":\"Check import\",\"session_target\":\"main\"}",
+    );
+    defer args.deinit();
+    const result = try st.execute(std.testing.allocator, args.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Created watcher") != null);
+
+    const job = scheduler.listJobs()[0];
+    try std.testing.expect(job.isWatcher());
+    try std.testing.expectEqual(@as(?i64, 300), job.repeat_delay_secs);
+    try std.testing.expectEqual(cron.SessionTarget.main, job.session_target);
+
+    const get_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"action\":\"get\",\"id\":\"{s}\"}}", .{job.id});
+    defer std.testing.allocator.free(get_json);
+    const get_args = try root.parseTestArgs(get_json);
+    defer get_args.deinit();
+    const got = try st.execute(std.testing.allocator, get_args.value.object);
+    defer if (got.output.len > 0) std.testing.allocator.free(got.output);
+    try std.testing.expect(got.success);
+    try std.testing.expect(std.mem.indexOf(u8, got.output, "[watcher]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.output, "repeat_delay_secs=300") != null);
 }

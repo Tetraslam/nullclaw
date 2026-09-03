@@ -22,6 +22,7 @@ pub const AgentRunOptions = struct {
     origin_peer_id: ?[]const u8 = null,
     origin_thread_id: ?[]const u8 = null,
     scheduler_local_store: bool = false,
+    scheduler_disabled: bool = false,
 };
 
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -235,6 +236,7 @@ fn appendAgentArgv(
         try argv.append(allocator, thread_id);
     }
     if (options.scheduler_local_store) try argv.append(allocator, "--scheduler-local-store");
+    if (options.scheduler_disabled) try argv.append(allocator, "--scheduler-disabled");
     try argv.append(allocator, "-m");
     try argv.append(allocator, prompt);
 }
@@ -503,6 +505,7 @@ test "appendAgentArgv includes cron origin attribution" {
         .origin_peer_id = "group-42",
         .origin_thread_id = "thread-7",
         .scheduler_local_store = true,
+        .scheduler_disabled = true,
     });
 
     const expected = [_][]const u8{
@@ -523,6 +526,7 @@ test "appendAgentArgv includes cron origin attribution" {
         "--origin-thread-id",
         "thread-7",
         "--scheduler-local-store",
+        "--scheduler-disabled",
         "-m",
         "Summarize status",
     };

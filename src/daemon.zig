@@ -416,6 +416,7 @@ fn upsertSchedulerRuntimeJob(
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
         dst.session_target = runtime_job.session_target;
+        dst.repeat_delay_secs = runtime_job.repeat_delay_secs;
         // Update delivery config
         dst.delivery.mode = runtime_job.delivery.mode;
         if (dst.delivery.channel_owned) {
@@ -465,6 +466,7 @@ fn upsertSchedulerRuntimeJob(
         .enabled = runtime_job.enabled,
         .delete_after_run = runtime_job.delete_after_run,
         .created_at_s = runtime_job.created_at_s,
+        .repeat_delay_secs = runtime_job.repeat_delay_secs,
         .delivery = .{
             .mode = runtime_job.delivery.mode,
             .channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null,
@@ -3392,7 +3394,7 @@ test "heartbeatDeliveryConfig enriches routing" {
     try std.testing.expectEqualStrings("backup", options.origin_account_id.?);
 }
 
-test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+test "mergeSchedulerTickChangesAndSave preserves runtime watcher fields" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const c = @cImport({
         @cInclude("stdlib.h");
@@ -3427,7 +3429,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
-    const runtime_job = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{
+    const runtime_job = try runtime.addAgentOnce("1s", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{
         .mode = .always,
         .channel = "telegram",
         .account_id = "backup",
@@ -3435,7 +3437,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
         .peer_kind = .group,
         .peer_id = "-100123",
         .thread_id = "77",
-    });
+    }, 90);
     runtime_job.session_target = .main;
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
@@ -3457,7 +3459,8 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     defer external.deinit();
     try cron.saveJobs(&external);
 
-    _ = loaded.tick(std_compat.time.timestamp(), null);
+    const tick_now = std_compat.time.timestamp();
+    _ = loaded.tick(tick_now, null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 32, true);
@@ -3467,6 +3470,10 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
 
     const job = merged.listJobs()[0];
     try std.testing.expectEqual(cron.JobType.agent, job.job_type);
+    try std.testing.expect(job.isWatcher());
+    try std.testing.expectEqual(@as(?i64, 90), job.repeat_delay_secs);
+    try std.testing.expectEqual(tick_now + 90, job.next_run_secs);
+    try std.testing.expectEqualStrings("pending", job.last_status.?);
     try std.testing.expect(job.prompt != null);
     try std.testing.expectEqualStrings("summarize merge state", job.prompt.?);
     try std.testing.expect(job.model != null);
