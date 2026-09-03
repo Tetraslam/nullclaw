@@ -33,11 +33,19 @@ const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 const redaction = @import("../redaction.zig");
+const agent_runner = @import("../agent_runner.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
 const commands = @import("commands.zig");
 const cost_mod = @import("../cost.zig");
+
+fn emitWatcherReceipt(successful_tool_calls: u32) void {
+    var stderr_buf: [128]u8 = undefined;
+    var stderr_writer = std_compat.fs.File.stderr().writer(&stderr_buf);
+    stderr_writer.interface.print("{s}{d}\n", .{ agent_runner.WATCHER_RECEIPT_PREFIX, successful_tool_calls }) catch return;
+    stderr_writer.interface.flush() catch {};
+}
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -739,6 +747,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return err;
         };
         defer allocator.free(response);
+        if (parsed_args.scheduler_disabled) emitWatcherReceipt(agent.successful_tool_calls);
 
         persistCliTurn(&agent, message, response);
 
@@ -933,6 +942,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             continue;
         };
         defer allocator.free(response);
+        if (parsed_args.scheduler_disabled) emitWatcherReceipt(agent.successful_tool_calls);
 
         persistCliTurn(&agent, debounced_input.current, response);
 

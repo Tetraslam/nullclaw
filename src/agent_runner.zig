@@ -12,7 +12,10 @@ const platform = @import("platform.zig");
 pub const AgentRunResult = struct {
     success: bool,
     output: []const u8,
+    successful_tool_calls: u32 = 0,
 };
+
+pub const WATCHER_RECEIPT_PREFIX = "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=";
 
 pub const AgentRunOptions = struct {
     origin_channel: ?[]const u8 = null,
@@ -183,6 +186,24 @@ fn buildAgentOutput(
     return allocator.dupe(u8, stdout);
 }
 
+pub fn parseWatcherReceipt(stderr: []const u8) u32 {
+    var receipt: ?u32 = null;
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, WATCHER_RECEIPT_PREFIX)) continue;
+        const raw_count = line[WATCHER_RECEIPT_PREFIX.len..];
+        if (raw_count.len == 0 or (raw_count.len > 1 and raw_count[0] == '0')) continue;
+        for (raw_count) |char| {
+            if (!std.ascii.isDigit(char)) break;
+        } else {
+            const count = std.fmt.parseInt(u32, raw_count, 10) catch continue;
+            if (receipt != null) return 0;
+            receipt = count;
+        }
+    }
+    return receipt orelse 0;
+}
+
 fn isSuccessfulAgentRun(timed_out: bool, exited_zero: bool, stdout: []const u8) bool {
     if (timed_out or !exited_zero) return false;
     return std.mem.trim(u8, stdout, " \t\r\n").len > 0;
@@ -348,7 +369,11 @@ pub fn runWithOptions(
     };
     const success = isSuccessfulAgentRun(timed_out, exited_zero, stdout.items);
     const output = try buildAgentOutput(allocator, stdout.items, timeout_secs, timed_out, success);
-    return .{ .success = success, .output = output };
+    return .{
+        .success = success,
+        .output = output,
+        .successful_tool_calls = if (options.scheduler_disabled) parseWatcherReceipt(stderr.items) else 0,
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -474,6 +499,33 @@ test "isSuccessfulAgentRun rejects timeout exit failure and empty stdout" {
     try std.testing.expect(!isSuccessfulAgentRun(true, true, "response\n"));
     try std.testing.expect(!isSuccessfulAgentRun(false, false, "response\n"));
     try std.testing.expect(!isSuccessfulAgentRun(false, true, "\n"));
+}
+
+test "parseWatcherReceipt accepts one exact machine line" {
+    const stderr = "[agent] starting\nNULLCLAW_WATCHER_RECEIPT successful_tool_calls=3\n[agent] done\n";
+    try std.testing.expectEqual(@as(u32, 3), parseWatcherReceipt(stderr));
+}
+
+test "parseWatcherReceipt ignores malformed and spoof-like lines" {
+    const malformed = [_][]const u8{
+        " NULLCLAW_WATCHER_RECEIPT successful_tool_calls=1\n",
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=\n",
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=+1\n",
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=01\n",
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=1 extra\n",
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=4294967296\n",
+        "prefix NULLCLAW_WATCHER_RECEIPT successful_tool_calls=1\n",
+    };
+    for (malformed) |stderr| {
+        try std.testing.expectEqual(@as(u32, 0), parseWatcherReceipt(stderr));
+    }
+}
+
+test "parseWatcherReceipt rejects multiple valid receipt lines" {
+    const stderr =
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=1\n" ++
+        "NULLCLAW_WATCHER_RECEIPT successful_tool_calls=2\n";
+    try std.testing.expectEqual(@as(u32, 0), parseWatcherReceipt(stderr));
 }
 
 test "preferExecPath keeps regular executable path" {

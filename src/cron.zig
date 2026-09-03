@@ -21,7 +21,8 @@ const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
 const WATCHER_INSTRUCTIONS =
     "This is a scheduler-owned watcher run. Perform the requested check now; do not merely acknowledge it and do not schedule another job.\n" ++
-    "Finish with exactly one status marker as the final whitespace-delimited token: WATCHER_PENDING if the condition is not complete, WATCHER_SUCCESS if it completed successfully, or WATCHER_FAILURE if it reached a terminal failure.\n" ++
+    "WATCHER_SUCCESS and WATCHER_FAILURE require at least one successful verification tool call in this run. If you cannot perform the check, a tool is unsupported, or every tool call fails, report WATCHER_PENDING unless a successful tool call verified a terminal result.\n" ++
+    "Finish with exactly one status marker as the final whitespace-delimited token: WATCHER_PENDING if the condition is not complete or unverified, WATCHER_SUCCESS if a successful tool call verified completion, or WATCHER_FAILURE if a successful tool call verified a terminal failure.\n" ++
     "Do not use any WATCHER_ marker elsewhere in the response.";
 
 pub const JobType = enum {
@@ -593,6 +594,7 @@ pub const CronScheduler = struct {
     test_agent_output: ?[]const u8 = null,
     test_agent_success: bool = true,
     test_agent_execution_failure: bool = false,
+    test_agent_successful_tool_calls: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -1160,10 +1162,13 @@ pub const CronScheduler = struct {
                     job.last_output = null;
 
                     if (job.isWatcher()) {
-                        const watcher_output = if (exec_result.success)
+                        var watcher_output = if (exec_result.success)
                             classifyWatcherOutput(exec_result.output)
                         else
                             WatcherOutput{ .outcome = .pending, .cleaned_output = exec_result.output };
+                        if (watcher_output.outcome != .pending and exec_result.successful_tool_calls == 0) {
+                            watcher_output = .{ .outcome = .pending, .cleaned_output = exec_result.output };
+                        }
 
                         if (watcher_output.outcome == .pending) {
                             job.last_status = "pending";
@@ -1245,6 +1250,7 @@ pub const CronScheduler = struct {
             return .{
                 .success = self.test_agent_success,
                 .output = try self.allocator.dupe(u8, self.test_agent_output orelse prompt),
+                .successful_tool_calls = self.test_agent_successful_tool_calls,
             };
         }
         return runAgentJob(self.allocator, self.shell_cwd, prompt, model, self.agent_timeout_secs, delivery, scheduler_disabled);
@@ -4178,6 +4184,35 @@ test "watcher marker-only terminal output rearms" {
     try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
     try std.testing.expectEqual(@as(i64, 5_530), scheduler.listJobs()[0].next_run_secs);
     try std.testing.expectEqualStrings("pending", scheduler.listJobs()[0].last_status.?);
+}
+
+test "watcher terminal markers without successful tool evidence rearm silently" {
+    const outputs = [_][]const u8{
+        "I cannot run the requested filesystem check from this channel.\nWATCHER_FAILURE",
+        "The import is complete.\nWATCHER_SUCCESS",
+    };
+    for (outputs) |output| {
+        var scheduler = CronScheduler.init(std.testing.allocator, 64, true);
+        defer scheduler.deinit();
+        var test_bus = bus.Bus.init();
+        defer test_bus.close();
+
+        const job = try scheduler.addAgentOnce("1s", "Check import", null, .{
+            .mode = .always,
+            .channel = "discord",
+            .to = "channel-42",
+        }, 90);
+        job.next_run_secs = 0;
+        scheduler.test_agent_output = output;
+        scheduler.test_agent_successful_tool_calls = 0;
+
+        _ = scheduler.tick(5_550, &test_bus);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+        try std.testing.expectEqual(@as(i64, 5_640), scheduler.listJobs()[0].next_run_secs);
+        try std.testing.expectEqualStrings("pending", scheduler.listJobs()[0].last_status.?);
+        try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+        try std.testing.expectEqual(@as(usize, 0), test_bus.inboundDepth());
+    }
 }
 
 test "watcher failed expected delivery rearms for both best effort modes" {

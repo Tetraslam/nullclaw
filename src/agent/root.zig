@@ -336,6 +336,8 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    attempted_tool_calls: u32 = 0,
+    successful_tool_calls: u32 = 0,
     last_system_prompt_bytes: usize = 0,
     last_history_bytes: usize = 0,
     status_show_emojis: bool = true,
@@ -2032,6 +2034,8 @@ pub const Agent = struct {
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        self.attempted_tool_calls = 0;
+        self.successful_tool_calls = 0;
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
@@ -3226,6 +3230,7 @@ pub const Agent = struct {
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        self.attempted_tool_calls +|= 1;
         if (self.isInterruptRequested()) {
             return .{
                 .name = call.name,
@@ -3321,6 +3326,7 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
+                if (result.success) self.successful_tool_calls +|= 1;
                 const was_interrupted = !result.success and
                     ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
                         std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
@@ -7752,6 +7758,8 @@ test "exec security deny blocks shell tool execution" {
     const result = agent.executeTool(allocator, call);
 
     try std.testing.expect(!result.success);
+    try std.testing.expectEqual(@as(u32, 1), agent.attempted_tool_calls);
+    try std.testing.expectEqual(@as(u32, 0), agent.successful_tool_calls);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "security=deny") != null);
 }
 
@@ -8777,6 +8785,14 @@ test "Agent turn skips replayed tool_call_id across iterations" {
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(usize, 1), probe_count);
     try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(u32, 1), agent.attempted_tool_calls);
+    try std.testing.expectEqual(@as(u32, 1), agent.successful_tool_calls);
+
+    const second_response = try agent.turn("no probe needed");
+    defer allocator.free(second_response);
+    try std.testing.expectEqualStrings("done", second_response);
+    try std.testing.expectEqual(@as(u32, 0), agent.attempted_tool_calls);
+    try std.testing.expectEqual(@as(u32, 0), agent.successful_tool_calls);
 }
 
 test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same batch" {
