@@ -50,7 +50,7 @@ pub const CronUpdateTool = struct {
                 return ToolResult.fail("Invalid cron expression");
         }
 
-        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, prompt, model, enabled, session_target) catch null;
+        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, prompt, model, enabled, session_target, null) catch null;
         if (gateway_body) |json_body| {
             defer allocator.free(json_body);
             switch (cron.requestGatewayPost(allocator, "/cron/update", json_body)) {
@@ -226,7 +226,7 @@ test "cron_update rejects invalid session_target" {
 }
 
 test "cron_update gateway request body keeps enabled false" {
-    const body = try cron_gateway.buildUpdateBody(std.testing.allocator, "job-42", null, "echo hi", null, null, false, .main);
+    const body = try cron_gateway.buildUpdateBody(std.testing.allocator, "job-42", null, "echo hi", null, null, false, .main, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

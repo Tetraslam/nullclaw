@@ -630,30 +630,44 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         bootstrap_provider,
     );
 
-    // Create tools (with agents config for delegate depth enforcement)
-    const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
-        .http_enabled = cfg.http_request.enabled,
-        .http_allowed_domains = cfg.http_request.allowed_domains,
-        .http_max_response_size = cfg.http_request.max_response_size,
-        .http_timeout_secs = cfg.http_request.timeout_secs,
-        .web_search_base_url = cfg.http_request.search_base_url,
-        .web_search_provider = cfg.http_request.search_provider,
-        .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
-        .browser_enabled = cfg.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_server_configs = cfg.mcp_servers,
-        .agents = cfg.agents,
-        .configured_providers = cfg.providers,
-        .fallback_api_key = resolved_api_key,
-        .tools_config = cfg.tools,
-        .allowed_paths = cfg.autonomy.allowed_paths,
-        .policy = &policy,
-        .subagent_manager = &subagent_manager,
-        .bootstrap_provider = bootstrap_provider,
-        .backend_name = cfg.memory.backend,
-        .sandbox_backend = cfg.security.sandbox.backend,
-        .sandbox_enabled = cfg.sandboxEnabled(),
-    });
+    // Scheduler-owned watchers retain verification tools but do not receive
+    // direct scheduling, delegation, or delivery tools.
+    const tools = if (parsed_args.scheduler_disabled)
+        try tools_mod.subagentTools(allocator, cfg.workspace_dir, .{
+            .http_enabled = cfg.http_request.enabled,
+            .http_allowed_domains = cfg.http_request.allowed_domains,
+            .http_max_response_size = cfg.http_request.max_response_size,
+            .http_timeout_secs = cfg.http_request.timeout_secs,
+            .tools_config = cfg.tools,
+            .allowed_paths = cfg.autonomy.allowed_paths,
+            .policy = &policy,
+            .bootstrap_provider = bootstrap_provider,
+            .backend_name = cfg.memory.backend,
+        })
+    else
+        try tools_mod.allTools(allocator, cfg.workspace_dir, .{
+            .http_enabled = cfg.http_request.enabled,
+            .http_allowed_domains = cfg.http_request.allowed_domains,
+            .http_max_response_size = cfg.http_request.max_response_size,
+            .http_timeout_secs = cfg.http_request.timeout_secs,
+            .web_search_base_url = cfg.http_request.search_base_url,
+            .web_search_provider = cfg.http_request.search_provider,
+            .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
+            .browser_enabled = cfg.browser.enabled,
+            .screenshot_enabled = true,
+            .mcp_server_configs = cfg.mcp_servers,
+            .agents = cfg.agents,
+            .configured_providers = cfg.providers,
+            .fallback_api_key = resolved_api_key,
+            .tools_config = cfg.tools,
+            .allowed_paths = cfg.autonomy.allowed_paths,
+            .policy = &policy,
+            .subagent_manager = &subagent_manager,
+            .bootstrap_provider = bootstrap_provider,
+            .backend_name = cfg.memory.backend,
+            .sandbox_backend = cfg.security.sandbox.backend,
+            .sandbox_enabled = cfg.sandboxEnabled(),
+        });
     defer tools_mod.deinitTools(allocator, tools);
 
     // Bind memory backend once for this tool set before creating agents.

@@ -3069,6 +3069,11 @@ fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     return null;
 }
 
+fn cronObjectFieldHasType(obj: std.json.ObjectMap, key: []const u8, expected: std.meta.Tag(std.json.Value)) bool {
+    const value = obj.get(key) orelse return true;
+    return std.meta.activeTag(value) == expected;
+}
+
 /// Serialize a single CronJob to a JSON object appended to `buf`.
 fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
     try buf.appendSlice(allocator, "{");
@@ -3429,6 +3434,7 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
         return;
     }
     cron_mod.saveJobs(sched) catch {
+        cron_mod.reloadJobs(sched) catch {};
         ctx.response_status = "500 Internal Server Error";
         ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
         return;
@@ -3560,6 +3566,20 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     }
 
     const obj = parsed.value.object;
+    for ([_][]const u8{ "expression", "command", "prompt", "model", "session_target", "repeat_delay" }) |key| {
+        if (!cronObjectFieldHasType(obj, key, .string)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid update field type\"}";
+            return;
+        }
+    }
+    for ([_][]const u8{ "paused", "enabled" }) |key| {
+        if (!cronObjectFieldHasType(obj, key, .bool)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid update field type\"}";
+            return;
+        }
+    }
     const id = cronObjectStringField(obj, "id") orelse {
         ctx.response_status = "400 Bad Request";
         ctx.response_body = "{\"error\":\"missing id\"}";
@@ -3570,6 +3590,19 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const command = cronObjectStringField(obj, "command");
     const prompt = cronObjectStringField(obj, "prompt");
     const model = cronObjectStringField(obj, "model");
+    var repeat_delay_secs: ?i64 = null;
+    if (obj.get("repeat_delay")) |value| {
+        if (value != .string or std.mem.trim(u8, value.string, " \t\r\n").len == 0) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid repeat_delay\"}";
+            return;
+        }
+        repeat_delay_secs = cron_mod.parseDuration(value.string) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid repeat_delay\"}";
+            return;
+        };
+    }
     const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
         cron_mod.SessionTarget.parseStrict(raw) catch {
             ctx.response_status = "400 Bad Request";
@@ -3581,6 +3614,11 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const paused_opt = cronObjectBoolField(obj, "paused");
     const enabled_explicit = cronObjectBoolField(obj, "enabled");
     const enabled_opt = if (enabled_explicit) |enabled| enabled else if (paused_opt) |paused| !paused else null;
+    if (expression == null and command == null and prompt == null and model == null and session_target == null and repeat_delay_secs == null and enabled_opt == null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"nothing to update\"}";
+        return;
+    }
 
     var scheduler_guard = cron_mod.lockLiveScheduler();
     defer scheduler_guard.deinit();
@@ -3590,7 +3628,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    if (session_target != null) {
+    if (session_target != null or repeat_delay_secs != null) {
         const existing = sched.getJob(id) orelse {
             ctx.response_status = "404 Not Found";
             ctx.response_body = "{\"error\":\"job not found\"}";
@@ -3599,6 +3637,11 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         if (existing.job_type != .agent) {
             ctx.response_status = "400 Bad Request";
             ctx.response_body = "{\"error\":\"session_target requires agent job\"}";
+            return;
+        }
+        if (repeat_delay_secs != null and !existing.isWatcher()) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"repeat_delay requires watcher job\"}";
             return;
         }
     }
@@ -3610,6 +3653,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .model = model,
         .session_target = session_target,
         .enabled = enabled_opt,
+        .repeat_delay_secs = repeat_delay_secs,
     };
 
     if (!sched.updateJob(sched.allocator, id, patch)) {
@@ -3618,6 +3662,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         return;
     }
     cron_mod.saveJobs(sched) catch {
+        cron_mod.reloadJobs(sched) catch {};
         ctx.response_status = "500 Internal Server Error";
         ctx.response_body = "{\"error\":\"failed to save scheduler state\"}";
         return;
@@ -7014,6 +7059,80 @@ test "handleCronUpdate accepts session_target" {
 
     try std.testing.expectEqualStrings("200 OK", ctx.response_status);
     try std.testing.expectEqual(cron_mod.SessionTarget.main, scheduler.listJobs()[0].session_target);
+}
+
+test "handleCronUpdate changes watcher repeat delay" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentOnce("1m", "Check import", null, .{}, 300);
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"repeat_delay\":\"10m\"}}",
+        .{job.id},
+    );
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqual(@as(?i64, 600), scheduler.listJobs()[0].repeat_delay_secs);
+}
+
+test "handleCronUpdate rejects malformed and empty patches" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    cron_mod.registerLiveScheduler(&scheduler);
+    defer cron_mod.clearLiveScheduler(&scheduler);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const patches = [_][]const u8{
+        "\"enabled\":\"false\"",
+        "\"prompt\":123",
+        "\"prompt\":\"\",\"model\":\"\"",
+    };
+    for (patches) |patch| {
+        const raw = try std.fmt.allocPrint(
+            req_allocator,
+            "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",{s}}}",
+            .{ job.id, patch },
+        );
+        var ctx = WebhookHandlerContext{
+            .root_allocator = req_allocator,
+            .req_allocator = req_allocator,
+            .raw_request = raw,
+            .method = "POST",
+            .target = "/cron/update",
+            .config_opt = null,
+            .state = &state,
+            .session_mgr_opt = null,
+        };
+        handleCronUpdate(&ctx);
+        try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+        try std.testing.expectEqualStrings("Summarize incidents", scheduler.listJobs()[0].prompt.?);
+    }
 }
 
 test "handleCronUpdate rejects session_target for shell jobs" {

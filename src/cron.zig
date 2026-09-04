@@ -21,6 +21,7 @@ const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
 const WATCHER_INSTRUCTIONS =
     "This is a scheduler-owned watcher run. Perform the requested check now; do not merely acknowledge it and do not schedule another job.\n" ++
+    "Do not send messages, notifications, reactions, or delegate/spawn other agents. Return the result only here; the scheduler alone owns terminal delivery.\n" ++
     "WATCHER_SUCCESS and WATCHER_FAILURE require at least one successful verification tool call in this run. If you cannot perform the check, a tool is unsupported, or every tool call fails, report WATCHER_PENDING unless a successful tool call verified a terminal result.\n" ++
     "Finish with exactly one status marker as the final whitespace-delimited token: WATCHER_PENDING if the condition is not complete or unverified, WATCHER_SUCCESS if a successful tool call verified completion, or WATCHER_FAILURE if a successful tool call verified a terminal failure.\n" ++
     "Do not use any WATCHER_ marker elsewhere in the response.";
@@ -229,6 +230,7 @@ pub const CronJobPatch = struct {
     model: ?[]const u8 = null,
     delete_after_run: ?bool = null,
     session_target: ?SessionTarget = null,
+    repeat_delay_secs: ?i64 = null,
 };
 
 /// A scheduled cron job.
@@ -884,46 +886,57 @@ pub const CronScheduler = struct {
     }
 
     /// Update a job's fields from a patch.
-    pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
+    pub fn updateJob(self: *CronScheduler, _: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
         const job = self.getMutableJob(id) orelse return false;
-        if (patch.expression) |expr| {
-            const next_run_secs = nextRunForCronExpression(expr, std_compat.time.timestamp()) catch return false;
-            const new_expr = allocator.dupe(u8, expr) catch return false;
-            allocator.free(job.expression);
-            job.expression = new_expr;
-            job.next_run_secs = next_run_secs;
+        const allocator = self.allocator;
+
+        const next_run_secs = if (patch.expression) |expr|
+            nextRunForCronExpression(expr, std_compat.time.timestamp()) catch return false
+        else
+            null;
+        if (patch.repeat_delay_secs) |secs| {
+            if (!job.isWatcher() or secs <= 0) return false;
         }
         if (patch.command) |cmd| {
             if (job.job_type == .shell) self.validateShellCommand(cmd) catch return false;
-            const new_cmd = allocator.dupe(u8, cmd) catch return false;
+        }
+
+        const effective_command = if (job.job_type == .agent and patch.prompt != null) patch.prompt else patch.command;
+        const effective_prompt = patch.prompt orelse if (job.job_type == .agent) patch.command else null;
+        const new_expression = if (patch.expression) |value| allocator.dupe(u8, value) catch return false else null;
+        var committed = false;
+        defer if (!committed) {
+            if (new_expression) |value| allocator.free(value);
+        };
+        const new_command = if (effective_command) |value| allocator.dupe(u8, value) catch return false else null;
+        defer if (!committed) {
+            if (new_command) |value| allocator.free(value);
+        };
+        const new_prompt = if (effective_prompt) |value| allocator.dupe(u8, value) catch return false else null;
+        defer if (!committed) {
+            if (new_prompt) |value| allocator.free(value);
+        };
+        const new_model = if (patch.model) |value| allocator.dupe(u8, value) catch return false else null;
+        defer if (!committed) {
+            if (new_model) |value| allocator.free(value);
+        };
+
+        if (new_expression) |value| {
+            allocator.free(job.expression);
+            job.expression = value;
+            job.next_run_secs = next_run_secs.?;
+        }
+        if (new_command) |value| {
             allocator.free(job.command);
-            job.command = new_cmd;
-
-            // Back-compat behavior: for agent jobs, --command should still update
-            // the effective prompt if --prompt was not provided explicitly.
-            if (job.job_type == .agent and patch.prompt == null) {
-                const new_prompt = allocator.dupe(u8, cmd) catch return false;
-                if (job.prompt) |old_prompt| allocator.free(old_prompt);
-                job.prompt = new_prompt;
-            }
+            job.command = value;
         }
-        if (patch.prompt) |prompt| {
-            const new_prompt = allocator.dupe(u8, prompt) catch return false;
+        if (new_prompt) |value| {
             if (job.prompt) |old_prompt| allocator.free(old_prompt);
-            job.prompt = new_prompt;
-
-            // Keep command text aligned with prompt for agent jobs so display/list
-            // and fallback behavior stay coherent.
-            if (job.job_type == .agent) {
-                const new_cmd = allocator.dupe(u8, prompt) catch return false;
-                allocator.free(job.command);
-                job.command = new_cmd;
-            }
+            job.prompt = value;
         }
-        if (patch.model) |model| {
-            const new_model = allocator.dupe(u8, model) catch return false;
+        if (new_model) |value| {
             if (job.model) |old_model| allocator.free(old_model);
-            job.model = new_model;
+            job.model = value;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -936,6 +949,8 @@ pub const CronScheduler = struct {
         if (patch.session_target) |st| {
             job.session_target = st;
         }
+        if (patch.repeat_delay_secs) |secs| job.repeat_delay_secs = secs;
+        committed = true;
         return true;
     }
 
@@ -2110,30 +2125,17 @@ pub fn requestGatewayPost(allocator: std.mem.Allocator, path: []const u8, json_b
     return .{ .response = resp };
 }
 
-/// Issue an HTTP GET to the live gateway and print the JSON response.
-/// Returns true on success (2xx), false if gateway not reachable or non-2xx.
-fn gatewayGet(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) bool {
-    _ = base_url;
-    switch (requestGatewayGet(allocator, path)) {
-        .unavailable => return false,
-        .response => |resp| {
-            defer allocator.free(resp.body);
-            log.info("{s}", .{resp.body});
-            return resp.status_code >= 200 and resp.status_code < 300;
-        },
-    }
-}
+const GatewayMutation = enum { unavailable, success, rejected };
 
-/// Issue an HTTP POST to the live gateway with a JSON body.
-/// Returns true on success (2xx).
-fn gatewayPost(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8, json_body: []const u8) bool {
-    _ = base_url;
+/// A responding gateway remains authoritative even when it rejects a request;
+/// callers must not then race the daemon by mutating cron.json directly.
+fn gatewayPost(allocator: std.mem.Allocator, path: []const u8, json_body: []const u8) GatewayMutation {
     switch (requestGatewayPost(allocator, path, json_body)) {
-        .unavailable => return false,
+        .unavailable => return .unavailable,
         .response => |resp| {
             defer allocator.free(resp.body);
             log.info("{s}", .{resp.body});
-            return resp.status_code >= 200 and resp.status_code < 300;
+            return if (resp.status_code >= 200 and resp.status_code < 300) .success else .rejected;
         },
     }
 }
@@ -2244,6 +2246,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator, as_json: bool) !void {
                     }
                     return;
                 }
+                log.err("cron gateway rejected list request ({d}): {s}", .{ resp.status_code, resp.body });
+                return error.GatewayRequestRejected;
             },
         }
     }
@@ -2448,7 +2452,11 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         const body = buildGatewayAddBody(allocator, expression, null, null, command, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
-            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+            switch (gatewayPost(allocator, "/cron/add", json_body)) {
+                .success => return,
+                .rejected => return error.GatewayRequestRejected,
+                .unavailable => {},
+            }
         }
     }
 
@@ -2490,7 +2498,11 @@ pub fn cliAddAgentJob(
         ) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
-            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+            switch (gatewayPost(allocator, "/cron/add", json_body)) {
+                .success => return,
+                .rejected => return error.GatewayRequestRejected,
+                .unavailable => {},
+            }
         }
     }
 
@@ -2515,7 +2527,11 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
         const body = buildGatewayAddBody(allocator, null, delay, null, command, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
-            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+            switch (gatewayPost(allocator, "/cron/add", json_body)) {
+                .success => return,
+                .rejected => return error.GatewayRequestRejected,
+                .unavailable => {},
+            }
         }
     }
 
@@ -2556,7 +2572,11 @@ pub fn cliAddAgentOnce(
         ) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
-            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+            switch (gatewayPost(allocator, "/cron/add", json_body)) {
+                .success => return,
+                .rejected => return error.GatewayRequestRejected,
+                .unavailable => {},
+            }
         }
     }
 
@@ -2583,7 +2603,11 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
         body_buf.appendSlice(allocator, "{") catch {};
         json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
         body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/remove", body_buf.items)) return;
+        switch (gatewayPost(allocator, "/cron/remove", body_buf.items)) {
+            .success => return,
+            .rejected => return error.GatewayRequestRejected,
+            .unavailable => {},
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2607,7 +2631,11 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
         body_buf.appendSlice(allocator, "{") catch {};
         json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
         body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/pause", body_buf.items)) return;
+        switch (gatewayPost(allocator, "/cron/pause", body_buf.items)) {
+            .success => return,
+            .rejected => return error.GatewayRequestRejected,
+            .unavailable => {},
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2631,7 +2659,11 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
         body_buf.appendSlice(allocator, "{") catch {};
         json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
         body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/resume", body_buf.items)) return;
+        switch (gatewayPost(allocator, "/cron/resume", body_buf.items)) {
+            .success => return,
+            .rejected => return error.GatewayRequestRejected,
+            .unavailable => {},
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2780,7 +2812,11 @@ pub fn cliUpdateJob(
             json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", value.asStr()) catch {};
         }
         body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
+        switch (gatewayPost(allocator, "/cron/update", body_buf.items)) {
+            .success => return,
+            .rejected => return error.GatewayRequestRejected,
+            .unavailable => {},
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);

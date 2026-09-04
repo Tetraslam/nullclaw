@@ -78,9 +78,9 @@ curl -X POST \
 
 `/cron/add` 也支持一次性任务，例如 `{"delay":"10m","command":"echo later"}`，以及 agent 任务，例如 `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`。
 
-如需创建持久 watcher，可发送带 `repeat_delay` 的一次性 agent 负载，例如 `{"delay":"1m","repeat_delay":"5m","prompt":"Check whether the import completed"}`。`repeat_delay` 仅可与 `delay` 和 `prompt` 一起使用，且不能提供 `command`。daemon scheduler 会在该正时长后重新执行未完成或执行失败的检查。子 agent 的输出必须以准确的 `WATCHER_PENDING`、`WATCHER_SUCCESS` 或 `WATCHER_FAILURE` 标记结尾。只有同一子 agent 回合至少成功完成一次工具调用，终止成功或失败标记才会被接受。pending、未经验证或缺失/格式错误的终止标记、空输出、仅含标记的输出、执行失败及预期投递失败都会静默重排。经验证的非空成功或终止失败输出会去掉标记，并在投递成功后删除任务；如果投递模式为 `none` 或有意过滤该结果，则无需投递即可删除。`/cron` 响应会公开 `watcher` 和解析后的 `repeat_delay_secs` 字段，并在 daemon 重启后保留。
+如需创建持久 watcher，可发送带 `repeat_delay` 的一次性 agent 负载，例如 `{"delay":"1m","repeat_delay":"5m","prompt":"Check whether the import completed"}`。`repeat_delay` 仅可与 `delay` 和 `prompt` 一起使用，且不能提供 `command`。daemon scheduler 会在该正时长后重新执行未完成或执行失败的检查；`/cron/update` 可通过 `repeat_delay` 修改现有 watcher 的检查间隔。子 agent 的输出必须以准确的 `WATCHER_PENDING`、`WATCHER_SUCCESS` 或 `WATCHER_FAILURE` 标记结尾。只有同一子 agent 回合至少成功完成一次工具调用，终止成功或失败标记才会被接受。pending、未经验证或缺失/格式错误的终止标记、空输出、仅含标记的输出、执行失败及预期投递失败都会静默重排。经验证的非空成功或终止失败输出会去掉标记，并在投递成功后删除任务；如果投递模式为 `none` 或有意过滤该结果，则无需投递即可删除。`/cron` 响应会公开 `watcher` 和解析后的 `repeat_delay_secs` 字段，并在 daemon 重启后保留。
 
-watcher 子 agent 无法使用受支持的 `schedule` 工具路径；只有 daemon scheduler 负责重排。这是能力边界而不是沙箱：如果 shell 采用宽松/yolo 权限，子 agent 仍可直接编辑 `cron.json`。终止标记和验证工具的选择仍由模型控制，因此成功但无关的工具调用也能满足证据门槛。严格的尾部 token 解析、对更早标记文本的拒绝以及可信的子进程工具计数回执只能减少误接受，不能独立证明结果。
+watcher 子 agent 使用受限的 subagent 工具集，不包含直接调度、委派、生成子 agent 或投递消息的工具。子 agent 只能把结果返回给 scheduler，不得自行发送通知；只有 daemon scheduler 负责重排和终止投递。这是能力边界而不是沙箱：如果 shell 采用宽松/yolo 权限，子 agent 仍可直接编辑 `cron.json` 或调用外部投递 API。终止标记和验证工具的选择仍由模型控制，因此成功但无关的工具调用也能满足证据门槛。严格的尾部 token 解析、对更早标记文本的拒绝以及可信的子进程工具计数回执只能减少误接受，不能独立证明结果。
 
 ### 6) Max webhook 投递
 

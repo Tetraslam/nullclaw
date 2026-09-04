@@ -488,8 +488,8 @@ pub fn buildSystemPrompt(
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n");
     try w.writeAll("- Claim that a reminder, watcher, or future notification exists only after `schedule` succeeds and returns a job ID. If scheduling fails, say so plainly.\n");
     try w.writeAll("- For asynchronous work, define the real completion condition. Queued, submitted, or downloading is not complete when the user asked for an imported or usable result.\n");
-    try w.writeAll("- For a durable completion watcher, use `action=once` with an agent `prompt`, initial `delay`, and `repeat_delay`. The scheduler owns every retry; never ask the watcher agent to create its successor.\n");
-    try w.writeAll("- Watchers run the check immediately when due and stay silent while pending or incomplete. They notify once and stop only after verified success or terminal failure.\n\n");
+    try w.writeAll("- For a durable completion watcher, use `action=once` with an agent `prompt`, initial `delay`, `repeat_delay`, and `session_target=isolated`. The scheduler owns every retry and notification; never ask the watcher agent to schedule a successor or send a message itself.\n");
+    try w.writeAll("- A watcher returns only its check result and final WATCHER marker. Pending or incomplete checks stay silent; verified terminal output is delivered once by the scheduler, then the job is removed.\n\n");
 
     // Web Search guidance
     try w.writeAll("## External Information and Web Search\n\n");

@@ -35,6 +35,7 @@ pub fn buildUpdateBody(
     model: ?[]const u8,
     enabled: ?bool,
     session_target: ?cron.SessionTarget,
+    repeat_delay: ?[]const u8,
 ) ![]u8 {
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_buf.deinit(allocator);
@@ -60,6 +61,9 @@ pub fn buildUpdateBody(
     }
     if (session_target) |value| {
         try appendBodyField(&body_buf, allocator, &wrote_field, "session_target", value.asStr());
+    }
+    if (repeat_delay) |value| {
+        try appendBodyField(&body_buf, allocator, &wrote_field, "repeat_delay", value);
     }
 
     try body_buf.appendSlice(allocator, "}");
@@ -189,7 +193,7 @@ test "buildAddBody includes watcher repeat delay" {
 }
 
 test "buildUpdateBody includes enabled flag" {
-    const body = try buildUpdateBody(std.testing.allocator, "job-9", "*/5 * * * *", "echo updated", null, null, false, .main);
+    const body = try buildUpdateBody(std.testing.allocator, "job-9", "*/5 * * * *", "echo updated", null, null, false, .main, "10m");
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -199,6 +203,7 @@ test "buildUpdateBody includes enabled flag" {
     try std.testing.expectEqualStrings("echo updated", parsed.value.object.get("command").?.string);
     try std.testing.expect(!parsed.value.object.get("enabled").?.bool);
     try std.testing.expectEqualStrings("main", parsed.value.object.get("session_target").?.string);
+    try std.testing.expectEqualStrings("10m", parsed.value.object.get("repeat_delay").?.string);
 }
 
 test "findJobByIdJson returns matching job object" {
