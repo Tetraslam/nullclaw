@@ -2849,7 +2849,7 @@ pub const Agent = struct {
 
                 const tool_timer = std_compat.time.milliTimestamp();
                 const result = blk: {
-                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
+                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call, iteration)) |cached_result| {
                         break :blk ToolExecutionResult{
                             .name = call.name,
                             .output = cached_result.output,
@@ -2866,7 +2866,7 @@ pub const Agent = struct {
                         }
                     else
                         self.executeTool(arena, call);
-                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
+                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, iteration, executed_result);
                     break :blk executed_result;
                 };
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
@@ -3131,7 +3131,7 @@ pub const Agent = struct {
         return false;
     }
 
-    fn toolCallDedupFingerprint(call: ParsedToolCall) u64 {
+    fn toolCallDedupFingerprint(call: ParsedToolCall, iteration: u32) u64 {
         var hasher = std.hash.Wyhash.init(0);
         if (call.tool_call_id) |tool_call_id| {
             if (tool_call_id.len > 0) {
@@ -3142,6 +3142,7 @@ pub const Agent = struct {
         }
 
         hasher.update("sig:");
+        hasher.update(std.mem.asBytes(&iteration));
         hasher.update(call.name);
         hasher.update("\n");
         hasher.update(call.arguments_json);
@@ -3167,14 +3168,16 @@ pub const Agent = struct {
     fn cachedToolCallResultInTurn(
         seen_tool_call_results: *const std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
         call: ParsedToolCall,
+        iteration: u32,
     ) ?CachedToolCallResult {
-        return seen_tool_call_results.get(toolCallDedupFingerprint(call));
+        return seen_tool_call_results.get(toolCallDedupFingerprint(call, iteration));
     }
 
     fn rememberToolCallResultInTurn(
         allocator: std.mem.Allocator,
         seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
         call: ParsedToolCall,
+        iteration: u32,
         result: ToolExecutionResult,
     ) void {
         // Only cache successful results, unless it's a native tool call with an ID.
@@ -3185,7 +3188,7 @@ pub const Agent = struct {
         const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
         if (!result.success and !has_id) return;
 
-        const fingerprint = toolCallDedupFingerprint(call);
+        const fingerprint = toolCallDedupFingerprint(call, iteration);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
         const output_copy = if (result.output.len == 0)
@@ -8572,7 +8575,7 @@ test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
         .arguments_json = "{\"command\":\"ls\"}",
         .tool_call_id = "call_abc",
     };
-    try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a), Agent.toolCallDedupFingerprint(call_b));
+    try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a, 0), Agent.toolCallDedupFingerprint(call_b, 1));
 }
 
 test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
@@ -8596,19 +8599,20 @@ test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
         .tool_call_id = null,
     };
 
-    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a) == null);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a, 0) == null);
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, .{
+    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, 0, .{
         .name = call_a.name,
         .output = "first result",
         .success = true,
         .tool_call_id = null,
     });
 
-    const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b).?;
+    const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b, 0).?;
     try std.testing.expect(cached_b.success);
     try std.testing.expectEqualStrings("first result", cached_b.output);
-    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c) == null);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_b, 1) == null);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c, 0) == null);
 }
 
 test "rememberToolCallResultInTurn preserves failed result for replayed tool_call_id" {
@@ -8627,14 +8631,14 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
         .tool_call_id = "call_retry_me",
     };
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, .{
+    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, 0, .{
         .name = original_call.name,
         .output = "Rate limit exceeded",
         .success = false,
         .tool_call_id = original_call.tool_call_id,
     });
 
-    const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
+    const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call, 1).?;
     try std.testing.expect(!cached_replay.success);
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
@@ -8650,14 +8654,14 @@ test "rememberToolCallResultInTurn skips failed signature-only calls" {
         .tool_call_id = null,
     };
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, 0, .{
         .name = failed_call.name,
         .output = "FileNotFound",
         .success = false,
         .tool_call_id = null,
     });
 
-    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call, 0) == null);
 }
 
 test "Agent turn skips replayed tool_call_id across iterations" {
